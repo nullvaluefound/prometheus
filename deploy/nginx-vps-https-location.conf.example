@@ -1,0 +1,19 @@
+# Include inside the existing public HTTPS server after loading nginx-vps-http.conf.
+location = /prometheus { return 308 /prometheus/; }
+
+location ^~ /prometheus/ {
+    limit_req zone=prometheus_forge burst=6 nodelay;
+    limit_req_status 429;
+    client_max_body_size 1k;
+
+    proxy_pass https://192.0.2.40;
+    proxy_bind 192.0.2.1;
+    proxy_set_header Host forge.internal.example;
+    proxy_set_header X-Forge-Operator "";
+    proxy_set_header Authorization $http_authorization;
+    proxy_ssl_verify on;
+    proxy_ssl_server_name on;
+    proxy_ssl_name forge.internal.example;
+    proxy_ssl_trusted_certificate /etc/nginx/ssl/prometheus-backend-ca.crt;
+    proxy_read_timeout 200s;
+}

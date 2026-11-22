@@ -1,0 +1,34 @@
+# Interception and containment
+
+The control plane applies the task-scoped admission and pre-dispatch review pattern documented by ARTEX to offline artifact analysis. Here the target is an exact SHA-256 in a case manifest and the decision is deterministic. Missing policy state, expired grants, audit errors, provider errors and invalid outputs stop the affected request. [ARTEX interception and operation-review changelog](https://github.com/BaaRai/ARTEX/blob/main/CHANGELOG.md#0313---2026-09-19).
+
+```mermaid
+flowchart LR
+    M[Case model or MCP client] --> B[Case broker]
+    O[Operator CLI] --> P[Case policy and audit]
+    P --> B
+    B --> D[Apprentice in offline Docker]
+    E[Named case evidence volume] -->|read-only for model tools| D
+    D --> G[Ghidra MCP and static REA]
+    D --> F[Typed result projection]
+    F --> B
+```
+
+| Interception point | Enforced behavior |
+| --- | --- |
+| MCP request | Bounded JSON lines, duplicate-key rejection, exact tool and field names, bounded numeric selectors and per-session call budget |
+| Scope | One case, pinned local Linux image, labeled case volume, checked artifact membership and SHA-256, and a fresh pause check |
+| Provider | Fixed subprocess arguments and static operations only. No arbitrary provider tool name, command, URL, path or script can be supplied by a model |
+| Container | No external network, ports, host bind mounts, Docker socket, elevated privileges, ambient capabilities or proxy credentials. The root filesystem is read-only. Scratch is bounded and disposable |
+| Disclosure | An independent host-side projection validates structured results. Approved excerpts have exact audience and expiry, a data label, and a hard size limit |
+| Audit | A durable pre-dispatch record is mandatory. Audit keeps validated selectors, versioned scope decisions and outcomes. It omits sample text, model prompts and credentials |
+
+Published capabilities do not include execution, emulation, debugger attachment, shell commands, arbitrary scripts, program mutation, C2 traffic, scanning or upload. Treat parser responses as data. The broker admits only a closed set of static operations and carries no model API keys in the analysis container. Docker seccomp is left at its engine default and `no-new-privileges` and dropped capabilities apply to all workers.
+
+## Residual trust and recovery
+
+Docker isolation shares the Linux kernel. Use an independently isolated guest to host the harness when the case warrants a separate kernel boundary. Docker daemon and WSL operator privileges are trusted. A generic MCP client that has unrelated tools can make requests outside this harness. Use the built-in local client to keep the model's tool surface bounded by construction.
+
+The local case administrator can read or alter case policy and logs. Restrict the operator account and retain copies of case audit and evidence for stronger custody. Each provider import uses a bounded disposable scratch environment. The evidence volume is read-only for model tools. Operator-mode `ingest`, `derive` and persisted `triage` write the case volume, and parser faults in those manual modes have a larger evidence-integrity impact. Verify artifacts and work from reviewed copies where higher custody assurance is needed.
+
+An image snapshot restores the verified tooling state. Container shutdown and scratch disposal leave named evidence volumes available. A revoked grant prevents later releases from that grant. Information already delivered belongs to the receiving client and its data-handling policy.

@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+*.tar
+*.bin
+*.ovpn
+*.pem
+*.key
+*.htpasswd
+*.pfx
+*.tar.gz
+.static-re-harness/
+forge.env

@@ -1,0 +1,29 @@
+[Unit]
+Description=Prometheus Forge
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=prometheus
+Group=www-data
+SupplementaryGroups=docker
+WorkingDirectory=/opt/prometheus
+EnvironmentFile=/etc/prometheus-forge/forge.env
+Environment=STATIC_RE_STATE_DIR=/var/lib/prometheus-forge
+Environment=PYTHONDONTWRITEBYTECODE=1
+RuntimeDirectory=prometheus-forge
+RuntimeDirectoryMode=0750
+StateDirectory=prometheus-forge
+StateDirectoryMode=0700
+ExecStart=/usr/bin/python3 -m re_harness.forge --socket /run/prometheus-forge/forge.sock --origin ${FORGE_ORIGIN} --prefix ${FORGE_PREFIX}
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

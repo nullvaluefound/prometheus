@@ -1,0 +1,14 @@
+**
+!docker/
+!docker/Dockerfile
+!docker/package.json
+!docker/package-lock.json
+!docker/requirements.lock
+!re_harness/
+!re_harness/*.py
+re_harness/cli.py
+re_harness/forge.py
+re_harness/local_model.py
+re_harness/projection.py
+re_harness/runtime.py
+re_harness/server.py

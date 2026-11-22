@@ -1,0 +1,69 @@
+"""Closed tool contract shared by the host broker and offline worker."""
+
+import re
+
+DIGEST = r"[a-f0-9]{64}"
+ADDRESS = r"0x[0-9a-f]{1,16}"
+CASE_ID = r"[a-z0-9][a-z0-9-]{0,47}"
+MAX_ARTIFACT = 128 * 1024 * 1024
+MAX_EXCERPT = 8192
+MAX_TOOL_CALLS = 32
+MAX_LINE = 128 * 1024
+
+TOOLS = {
+    "artifact_summary": "Verify one artifact and summarize its headers and string count.",
+    "artifact_strings": "Page string offsets and lengths. String contents require an operator grant.",
+    "ghidra_functions": "List Ghidra function entry addresses. Symbol names require an operator grant.",
+    "ghidra_xrefs": "Inspect cross-references to an address in Ghidra.",
+    "ghidra_decompile": "Produce a bounded Ghidra decompilation excerpt under an operator grant.",
+    "rea_inspect": "Inspect a native binary with REA's static Ghidra provider.",
+    "rea_decompile": "Produce a bounded REA decompilation excerpt under an operator grant.",
+}
+ADDRESSED = {"ghidra_xrefs", "ghidra_decompile", "rea_decompile"}
+PAGED = {"artifact_strings", "ghidra_functions", "ghidra_xrefs"}
+EXCERPT_ONLY = {"ghidra_decompile", "rea_decompile"}
+
+
+class Denied(ValueError):
+    """An intent outside the tool contract."""
+
+
+def tool_schema(name):
+    properties = {"artifact": {"type": "string", "pattern": "^" + DIGEST + "$"}}
+    required = ["artifact"]
+    if name in ADDRESSED:
+        properties["address"] = {"type": "string", "pattern": "^" + ADDRESS + "$"}
+        required.append("address")
+    if name in PAGED:
+        properties["offset"] = {"type": "integer", "minimum": 0, "maximum": 10000, "default": 0}
+        properties["limit"] = {"type": "integer", "minimum": 1, "maximum": 50, "default": 20}
+    return {"type": "object", "properties": properties, "required": required,
+            "additionalProperties": False}
+
+
+def match(value, pattern):
+    return isinstance(value, str) and re.fullmatch(pattern, value) is not None
+
+
+def validate(name, arguments):
+    if not isinstance(name, str) or name not in TOOLS:
+        raise Denied("unknown_tool")
+    if not isinstance(arguments, dict):
+        raise Denied("invalid_arguments")
+    schema = tool_schema(name)
+    properties = schema["properties"]
+    if arguments.keys() - properties.keys() or set(schema["required"]) - arguments.keys():
+        raise Denied("invalid_fields")
+    values = {}
+    for field, spec in properties.items():
+        value = arguments.get(field, spec.get("default"))
+        if spec["type"] == "string":
+            valid = match(value, spec["pattern"])
+        else:
+            valid = type(value) is int and spec["minimum"] <= value <= spec["maximum"]
+        if not valid:
+            raise Denied("invalid_" + field)
+        values[field] = value
+    if "address" in values:
+        values["address"] = hex(int(values["address"], 16))
+    return values
