@@ -7,16 +7,45 @@ import io
 import json
 import os
 from pathlib import Path
+import struct
 import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from re_harness import case, policy, providers, worker
+from re_harness import case, policy, projection, providers, worker
+
+try:
+    import pefile
+except ImportError:
+    pefile = None
 
 SAMPLE = b"\x7fELF" + b"\x00" * 16 + b" visible_marker_text " + b"\x00" * 8
 RULES = b'rule a { condition: true }\n'
+
+
+def elf_bytes(bits, encoding):
+    """A complete ELF header: ET_DYN, x86-64 machine, 9 program headers and 31 section headers."""
+    order, width = ("little" if encoding == 1 else "big"), bits // 8
+    field = lambda value, size: value.to_bytes(size, order)
+    entry = 0x401000 if bits == 32 else 0x7F0000401000
+    return (b"\x7fELF" + bytes([bits // 32, encoding, 1]) + bytes(9) + field(3, 2) + field(62, 2) + field(1, 4) +
+            field(entry, width) + field(width * 16, width) + field(0x2000, width) + field(0, 4) +
+            field(52 if bits == 32 else 64, 2) + field(32 if bits == 32 else 56, 2) + field(9, 2) +
+            field(40 if bits == 32 else 64, 2) + field(31, 2) + field(30, 2))
+
+
+def pe_bytes():
+    """A minimal PE32 with one .text section of maximal entropy and a 16-byte overlay at 0x400."""
+    dos = b"MZ" + bytes(58) + struct.pack("<I", 0x40)
+    coff = struct.pack("<HHIIIHH", 0x14C, 1, 0, 0, 0, 0xE0, 0x0102)
+    optional = struct.pack("<HBBIIIIIIIIIHHHHHHIIIIHHIIIIII", 0x10B, 14, 0, 0x200, 0, 0, 0x1000, 0x1000, 0x2000,
+                           0x400000, 0x1000, 0x200, 6, 0, 0, 0, 6, 0, 0, 0x2000, 0x200, 0, 2, 0,
+                           0x100000, 0x1000, 0x100000, 0x1000, 0, 16) + bytes(16 * 8)
+    section = struct.pack("<8sIIIIIIHHI", b".text", 0x200, 0x1000, 0x200, 0x200, 0, 0, 0, 0, 0x60000020)
+    headers = dos + b"PE\x00\x00" + coff + optional + section
+    return headers + bytes(0x200 - len(headers)) + bytes(range(256)) * 2 + b"overlay bytes 16"
 
 
 class WorkerCase(unittest.TestCase):
@@ -86,6 +115,64 @@ class AnalyzeTests(WorkerCase):
         self.assertEqual(result["artifact_bytes"], len(SAMPLE))
         self.assertEqual(result["summary"]["format_hint"], "ELF")
         self.assertNotIn("evidence_excerpt", result)
+
+    def summarize(self, data):
+        self.digest = self.add(data)
+        result = worker.analyze(self.request())
+        # The host projection must accept exactly what the worker emits.
+        projected = projection.project(result, "artifact_summary", {"artifact": self.digest}, False)
+        self.assertEqual(projected, result)
+        return result["summary"]
+
+    def test_summary_elf_header_fields(self):
+        for bits, encoding in ((32, 1), (32, 2), (64, 1), (64, 2)):
+            with self.subTest(bits=bits, encoding=encoding):
+                summary = self.summarize(elf_bytes(bits, encoding) + b" hidden_section_name ")
+                self.assertEqual(summary["elf"], {"elf_class": bits // 32, "data_encoding": encoding, "machine": 62,
+                                                  "e_type": 3, "e_entry": 0x401000 if bits == 32 else 0x7F0000401000,
+                                                  "phnum": 9, "shnum": 31})
+                self.assertNotIn("hidden_section_name", json.dumps(summary))
+        truncated = self.summarize(elf_bytes(64, 1)[:40])
+        self.assertEqual(set(truncated["elf"]), {"elf_class", "data_encoding", "machine"})
+
+    def test_summary_macho_fields(self):
+        summary = self.summarize(b"\xcf\xfa\xed\xfe" + (0x0100000C).to_bytes(4, "little") + bytes(4) +
+                                 (2).to_bytes(4, "little") + bytes(16))
+        self.assertEqual(summary["macho"], {"cputype": 0x0100000C, "filetype": 2})
+        fat = self.summarize(b"\xca\xfe\xba\xbe" + (2).to_bytes(4, "big") + bytes(40))
+        self.assertNotIn("macho", fat)
+
+    def test_summary_pe_fields_without_names(self):
+        sections = [dict(name="UPX%d" % index, rva=hex(0x1000 * (index + 1)), offset=0x200 * index, raw_size=0x200,
+                         virtual_size=0x180, flags="0x60000020", entropy=7.25) for index in range(100)]
+        metadata = dict(machine="0x14c", image_base="0x400000", entry_rva="0x1000", imports={"KERNEL32.dll": ["Sleep"]},
+                        certificate_size=0, overlay_offset=None, version_info={"ProductName": "x"}, sections=sections)
+        with patch.object(case, "pe_metadata", return_value=metadata):
+            summary = self.summarize(b"MZ" + bytes(62))
+        pe = summary["pe"]
+        self.assertEqual((pe["parsed"], pe["sections_count"], pe["import_libraries_count"], len(pe["sections"])),
+                         (True, 100, 1, 96))
+        self.assertEqual((pe["machine"], pe["entry_rva"], pe["image_base"], pe["overlay_offset"]),
+                         ("0x14c", "0x1000", "0x400000", None))
+        self.assertEqual(pe["sections"][1], {"rva": "0x2000", "raw_offset": 0x200, "raw_size": 0x200,
+                                             "virtual_size": 0x180, "flags": "0x60000020", "entropy": 7.25})
+        for leaked in ("UPX", "KERNEL32", "Sleep", "ProductName", "name"):
+            self.assertNotIn(leaked, json.dumps(summary))
+        for failure in (dict(limitation="Install pefile"), dict(parse_error="bad header")):
+            with patch.object(case, "pe_metadata", return_value=failure):
+                summary = self.summarize(b"MZ" + bytes(62) + repr(failure).encode())
+            self.assertEqual(summary["pe"], {"parsed": False, "sections_count": 0, "import_libraries_count": 0,
+                                             "certificate_bytes": 0})
+
+    @unittest.skipUnless(pefile, "pefile is installed in the worker image")
+    def test_summary_pe_fields_from_pefile(self):
+        pe = self.summarize(pe_bytes())["pe"]
+        self.assertEqual({key: pe[key] for key in ("parsed", "machine", "entry_rva", "image_base", "overlay_offset")},
+                         {"parsed": True, "machine": "0x14c", "entry_rva": "0x1000", "image_base": "0x400000",
+                          "overlay_offset": 0x400})
+        self.assertEqual(pe["sections"], [{"rva": "0x1000", "raw_offset": 0x200, "raw_size": 0x200,
+                                           "virtual_size": 0x200, "flags": "0x60000020", "entropy": 8.0}])
+        self.assertNotIn(".text", json.dumps(pe))
 
     def test_strings_rows_have_no_text(self):
         result = worker.analyze(self.request("artifact_strings"))

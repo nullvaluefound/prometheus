@@ -25,9 +25,58 @@ def boolean(value):
     return value
 
 
+HEX16 = r"0x[0-9a-f]{1,4}"
+HEX32 = r"0x[0-9a-f]{1,8}"
+HEX64 = r"0x[0-9a-f]{1,16}"
+MAX_SECTIONS = 96
+PE_COUNTS = {"parsed", "sections_count", "import_libraries_count", "certificate_bytes"}
+PE_HEADER = {"machine", "entry_rva", "image_base", "overlay_offset", "sections"}
+SECTION = {"rva", "raw_offset", "raw_size", "virtual_size", "flags", "entropy"}
+ELF_IDENT = {"elf_class", "data_encoding", "machine"}
+ELF_HEADER = {"e_type", "e_entry", "phnum", "shnum"}
+
+
+def entropy(value):
+    if type(value) is not float or not 0.0 <= value <= 8.0 or round(value, 3) != value:
+        raise invalid()
+    return value
+
+
+def pe_summary(value):
+    if not isinstance(value, dict) or type(value.get("parsed")) is not bool:
+        raise invalid()
+    pe = object_fields(value, PE_COUNTS | PE_HEADER if value["parsed"] else PE_COUNTS)
+    result = {"parsed": pe["parsed"], **{
+        field: number(pe[field], 0xFFFFFFFF) for field in ("sections_count", "import_libraries_count", "certificate_bytes")}}
+    if not pe["parsed"]:
+        return result
+    sections = listed(pe["sections"], MAX_SECTIONS)
+    if len(sections) != min(result["sections_count"], MAX_SECTIONS):
+        raise invalid()
+    overlay = pe["overlay_offset"]
+    result.update({"machine": text(pe["machine"], HEX16), "entry_rva": text(pe["entry_rva"], HEX32),
+                   "image_base": text(pe["image_base"], HEX64),
+                   "overlay_offset": None if overlay is None else number(overlay),
+                   "sections": [{"rva": text(section["rva"], HEX32), "raw_offset": number(section["raw_offset"], 0xFFFFFFFF),
+                                 "raw_size": number(section["raw_size"], 0xFFFFFFFF),
+                                 "virtual_size": number(section["virtual_size"], 0xFFFFFFFF),
+                                 "flags": text(section["flags"], HEX32), "entropy": entropy(section["entropy"])}
+                                for section in sections if object_fields(section, SECTION)]})
+    return result
+
+
+def elf_summary(value):
+    if not isinstance(value, dict) or value.keys() not in (ELF_IDENT, ELF_IDENT | ELF_HEADER):
+        raise invalid()
+    result = {field: number(value[field], 65535) for field in value if field != "e_entry"}
+    if "e_entry" in value:
+        result["e_entry"] = number(value["e_entry"], 2**64 - 1)
+    return result
+
+
 def technical_summary(value):
     mandatory = {"size", "format_hint", "strings_count", "strings_truncated"}
-    if not mandatory <= value.keys() or value.keys() - mandatory - {"pe", "elf"}:
+    if not mandatory <= value.keys() or value.keys() - mandatory - {"pe", "elf", "macho"}:
         raise invalid()
     kind = value["format_hint"]
     if kind not in ("PE candidate", "ELF", "Mach-O", "Mach-O universal", "ZIP candidate", "script", "unknown"):
@@ -36,13 +85,12 @@ def technical_summary(value):
               "strings_count": number(value["strings_count"], 10000),
               "strings_truncated": boolean(value["strings_truncated"])}
     if "pe" in value and kind == "PE candidate":
-        pe = object_fields(value["pe"], {"parsed", "sections_count", "import_libraries_count", "certificate_bytes"})
-        result["pe"] = {"parsed": boolean(pe["parsed"]), **{
-            field: number(pe[field], 0xFFFFFFFF)
-            for field in ("sections_count", "import_libraries_count", "certificate_bytes")}}
+        result["pe"] = pe_summary(value["pe"])
     if "elf" in value and kind == "ELF":
-        elf = object_fields(value["elf"], {"elf_class", "data_encoding", "machine"})
-        result["elf"] = {field: number(elf[field], 65535) for field in elf}
+        result["elf"] = elf_summary(value["elf"])
+    if "macho" in value and kind == "Mach-O":
+        macho = object_fields(value["macho"], {"cputype", "filetype"})
+        result["macho"] = {field: number(macho[field], 0xFFFFFFFF) for field in ("cputype", "filetype")}
     return result
 
 

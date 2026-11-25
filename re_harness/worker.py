@@ -21,6 +21,8 @@ rule prometheus_selftest : fixture { strings: $name = "example" condition: elf.t
 '''
 MAX_CASE_ARTIFACTS = 256
 MAX_CASE_BYTES = 4 * 1024 * 1024 * 1024
+MAX_SUMMARY_SECTIONS = 96
+ELF_FIELDS = ("elf_class", "data_encoding", "machine", "e_type", "e_entry", "phnum", "shnum")
 
 
 def emit(value):
@@ -57,13 +59,23 @@ def triage(name, path, digest, identities, options):
                 "scan_truncated": detail["strings_truncated"]}, rows
     info = {key: detail[key] for key in ("size", "format_hint", "strings_truncated")}
     info["strings_count"] = len(detail["strings"])
+    # Numeric header fields only. Section, import and version names stay behind an excerpt grant.
     if "elf" in detail:
-        info["elf"] = detail["elf"]
+        info["elf"] = {key: detail["elf"][key] for key in ELF_FIELDS if key in detail["elf"]}
+    if "macho" in detail and "cputype" in detail["macho"]:
+        info["macho"] = {key: detail["macho"][key] for key in ("cputype", "filetype")}
     if "pe" in detail:
         pe = detail["pe"]
         info["pe"] = {"parsed": "sections" in pe, "sections_count": len(pe.get("sections", [])),
                       "import_libraries_count": len(pe.get("imports", {})),
                       "certificate_bytes": pe.get("certificate_size", 0)}
+        if "sections" in pe:
+            info["pe"].update({key: pe[key] for key in ("machine", "entry_rva", "image_base", "overlay_offset")})
+            info["pe"]["sections"] = [
+                {"rva": section["rva"], "raw_offset": section["offset"], "raw_size": section["raw_size"],
+                 "virtual_size": section["virtual_size"], "flags": section["flags"],
+                 "entropy": float(section["entropy"])}
+                for section in pe["sections"][:MAX_SUMMARY_SECTIONS]]
     return info, None
 
 

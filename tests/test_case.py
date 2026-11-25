@@ -157,11 +157,16 @@ class TriageTests(unittest.TestCase):
         return case.triage_data(data, "a" * 64, {})
 
     def test_strings_offsets_encodings_and_truncation(self):
-        data = b"\x00\x01hello world\x00\x00" + "wide text".encode("utf-16le") + b"\x00short\x00" + b"A" * 5000
+        # The final "d" of the ASCII string must not start the UTF-16LE string that follows its NUL.
+        data = b"\x00\x01hello world\x00" + "wide text".encode("utf-16le") + b"\x00short\x00" + b"A" * 5000
         result = self.triage(data)
-        self.assertEqual([(s["offset"], s["encoding"]) for s in result["strings"]],
-                         [(2, "ascii"), (15, "utf-16le"), (40, "ascii")])
-        self.assertEqual(result["strings"][1]["text"], "wide text")
+        self.assertEqual([(s["offset"], s["encoding"], s["full_byte_length"]) for s in result["strings"]],
+                         [(2, "ascii", 11), (14, "utf-16le", 18), (39, "ascii", 5000)])
+        self.assertEqual([s["text"] for s in result["strings"][:2]], ["hello world", "wide text"])
+        # A short ASCII tail is not glued on either, and a UTF-16LE run left too short after trimming is dropped.
+        glued = self.triage(b"world\x00" + "widestring".encode("utf-16le") + b"\x00\x01xy\x00" + "abcde".encode("utf-16le"))
+        self.assertEqual([(s["offset"], s["encoding"], s["text"]) for s in glued["strings"]],
+                         [(6, "utf-16le", "widestring")])
         self.assertEqual((len(result["strings"][2]["text"]), result["strings"][2]["full_byte_length"]), (4096, 5000))
         self.assertFalse(result["strings_truncated"])
         with patch.object(case, "STRING_LIMIT", 2):
@@ -172,6 +177,11 @@ class TriageTests(unittest.TestCase):
     def test_format_hints(self):
         elf = self.triage(b"\x7fELF\x02\x01\x01" + bytes(11) + b"\x3e\x00" + bytes(44))
         self.assertEqual((elf["format_hint"], elf["elf"]["machine"]), ("ELF", 62))
+        self.assertEqual({key: elf["elf"][key] for key in ("e_type", "e_entry", "phnum", "shnum")},
+                         dict(e_type=0, e_entry=0, phnum=0, shnum=0))
+        for header in (b"\x7fELF\x01\x01\x01" + bytes(44), b"\x7fELF\x02\x01\x01" + bytes(56),
+                       b"\x7fELF\x03\x01\x01" + bytes(60), b"\x7fELF\x02\x03\x01" + bytes(60)):
+            self.assertEqual(set(self.triage(header)["elf"]), {"elf_class", "data_encoding", "machine"})
         pe = self.triage(b"MZ" + bytes(62))
         self.assertEqual(pe["format_hint"], "PE candidate")
         self.assertIn("pe", pe)

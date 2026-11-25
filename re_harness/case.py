@@ -218,6 +218,16 @@ def fat_count(data):
     return count if 0 < count < 20 and len(data) >= 8 + count * entry else 0
 
 
+def elf_header(data):
+    """Numeric ELF header fields, only when the class and encoding are valid and the header is complete."""
+    if data[4] not in (1, 2) or data[5] not in (1, 2) or len(data) < (52 if data[4] == 1 else 64):
+        return {}
+    endian = "little" if data[5] == 1 else "big"
+    width, base = (4, 44) if data[4] == 1 else (8, 56)
+    field = lambda offset, size: int.from_bytes(data[offset:offset + size], endian)
+    return dict(e_type=field(16, 2), e_entry=field(24, width), phnum=field(base, 2), shnum=field(base + 4, 2))
+
+
 def triage_data(data, digest, identities):
     kind = "unknown"
     thin = {b"\xfe\xed\xfa\xce": "big", b"\xfe\xed\xfa\xcf": "big",
@@ -238,11 +248,16 @@ def triage_data(data, digest, identities):
     truncated = False
     for pattern, codec in ((rb"[ -~]{6,}", "ascii"), (rb"(?:[ -~]\x00){6,}", "utf-16le")):
         for match in re.finditer(pattern, data):
+            start, end = match.span()
+            # A printable byte before the first unit means that unit ends an ASCII run, as in b"world\x00".
+            if codec == "utf-16le" and start and 0x20 <= data[start - 1] <= 0x7e:
+                start += 2
+                if end - start < 12:
+                    continue
             if len(strings) >= STRING_LIMIT:
                 truncated = True
                 break
-            start, end = match.span()
-            strings.append(dict(offset=match.start(), encoding=codec,
+            strings.append(dict(offset=start, encoding=codec,
                                 text=data[start:min(end, start + 4096)].decode(codec),
                                 full_byte_length=end - start))
     strings.sort(key=lambda item: item["offset"])
@@ -255,6 +270,7 @@ def triage_data(data, digest, identities):
         endian = "little" if data[5] == 1 else "big"
         result["elf"] = dict(elf_class=data[4], data_encoding=data[5],
                              machine=int.from_bytes(data[18:20], endian))
+        result["elf"].update(elf_header(data))
     if kind == "Mach-O" and len(data) >= 16:
         result["macho"] = dict(endian=thin, bits=64 if data[0] == 0xcf or data[3] == 0xcf else 32,
                                cputype=int.from_bytes(data[4:8], thin), filetype=int.from_bytes(data[12:16], thin))
