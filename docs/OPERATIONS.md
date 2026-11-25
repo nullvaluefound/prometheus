@@ -30,6 +30,16 @@ python -m re_harness.cli triage case-001 $sha
 python -m re_harness.cli derive case-001 $sha base64 0x120 256
 ```
 
+## Scan with YARA and capa
+
+```powershell
+python -m re_harness.cli yara-rules case-001 'C:\Ruleseviewed.yar'
+python -m re_harness.cli inspect case-001 yara_scan $sha --output 'C:\Restricted\yara.json'
+python -m re_harness.cli inspect case-001 capa_triage $sha --full --output 'C:\Restricted\capa.json'
+```
+
+`yara-rules` imports one reviewed rule file of at most 1 MiB into the case. A later import replaces it. The compile error or refused module is printed when a file is rejected. The case audit and `scope.json` record the rules' SHA-256 and rule count. The new rules retire any `yara_scan` grants. Models call `yara_scan` and `capa_triage` with an artifact and a page. Grant either tool with the same `--offset` and `--limit` to release matched bytes or the full capa detail.
+
 `derive` accepts `slice`, `base64`, `gzip` and `zlib`, with a file offset and input byte length. It admits the result under its own hash and records the method and parent. Compressed decoding accepts one complete stream bounded to 64 MiB of output. For a separately reviewed and recovered local file, use `ingest` with `--parent SHA256 --relation 'resource ID and method'`. Policy limits each admitted file to 128 MiB and each case to 256 unique artifacts and 4 GiB of artifact bytes. Track triage and report file growth independently of those artifact limits. A file count or format cap limits coverage, so record it in findings.
 
 Compare manifests by exact release and actual artifacts. Capture partial transfers and conditional alternatives distinctly. Carry out any live collection under the case's authorization in a separate acquisition environment. There is no network acquisition operation in this workspace.
@@ -51,6 +61,6 @@ Record observed, inferred, corroborated and unknown findings with evidence locat
 
 ## Pause and recover
 
-`pause CASE` immediately closes new broker actions and suppresses in-flight model-facing results when the broker next checks scope. Stop the caller to interrupt analysis promptly. `resume CASE` reopens the same validated scope and does not extend expiry. Audit records are local under `cases/<case-id>/audit.jsonl` inside the operator state directory.
+`pause CASE`, or **Pause case** on the case's Forge page, immediately closes new broker actions and suppresses in-flight model-facing results when the broker next checks scope. Stop the caller to interrupt analysis promptly. `resume CASE` reopens the same validated scope and does not extend expiry. Audit records are local under `cases/<case-id>/audit.jsonl` inside the operator state directory.
 
 After an interrupted operator command, establish whether its container still exists and whether a mutation already completed before retrying. An interrupted `init` can be rerun. An initialized case with a missing volume is an integrity incident. Restore its original evidence from trusted retention or use a new case ID. If a lock remains, check that its recorded process is gone and that the corresponding Docker worker stopped before removing only that exact lock. Avoid prune, volume removal and factory reset during recovery of an evidence case.

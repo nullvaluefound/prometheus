@@ -27,6 +27,17 @@ RUN curl -fsLS --retry 3 -o /tmp/extension.zip https://github.com/LaurieWired/Gh
 COPY docker/requirements.lock /opt/requirements.lock
 RUN python3 -m venv /opt/python && pip install --no-cache-dir --require-hashes -r /opt/requirements.lock && \
     pip install --no-cache-dir --no-deps /opt/ghidra_mcp-2.0.0-py3-none-any.whl && pip check
+# capa rules and FLIRT signatures matching the hash-locked flare-capa 10.0.0 package.
+RUN curl -fsLS --retry 3 -o /tmp/capa-rules.zip https://github.com/mandiant/capa-rules/archive/refs/tags/v10.0.0.zip && \
+    echo 'c27974b03020dd563125b40b20d26eeaee13a5cc5c0c2be1d1a7ee57098cbd2f  /tmp/capa-rules.zip' | sha256sum -c - && \
+    curl -fsLS --retry 3 -o /tmp/capa.tar.gz https://files.pythonhosted.org/packages/source/f/flare-capa/flare_capa-10.0.0.tar.gz && \
+    echo '4d449c5c1d79475f1d4ff5312c9f30555f5c124a6ea6c5da5c7eefb577b37da3  /tmp/capa.tar.gz' | sha256sum -c - && \
+    mkdir -p /opt/capa/sigs && unzip -q /tmp/capa-rules.zip -d /opt/capa && \
+    mv /opt/capa/capa-rules-10.0.0 /opt/capa/rules && rm -rf /opt/capa/rules/.github && \
+    tar -xzf /tmp/capa.tar.gz -C /opt/capa/sigs --strip-components=2 --wildcards 'flare_capa-10.0.0/sigs/*.sig' && \
+    rm /tmp/capa-rules.zip /tmp/capa.tar.gz && capa --version && \
+    XDG_CACHE_HOME=/opt/capa/cache capa -q -j -r /opt/capa/rules -s /opt/capa/sigs /usr/bin/true >/dev/null && \
+    test -n "$(ls /opt/capa/cache)" && chmod -R a+rX,go-w /opt/capa
 COPY docker/package.json docker/package-lock.json /opt/rea/
 RUN npm --prefix /opt/rea ci --ignore-scripts --omit=optional --no-audit --no-fund && npm cache clean --force && \
     rea --version && ghidra-mcp --help >/dev/null
@@ -36,7 +47,8 @@ RUN mkdir -p /case /opt/fixtures && chown 65532:65532 /case && \
     touch /case/.static-re-volume && chown 65532:65532 /case/.static-re-volume && \
     printf '%s\n' 'int example(int x) { return x + 3; }' 'int main(void) { return example(2); }' | \
     cc -g -O0 -x c - -o /opt/fixtures/benign.elf && chmod 0444 /opt/fixtures/benign.elf
-ENV HOME=/tmp REA_GHIDRA_STARTUP_TIMEOUT_MS=110000 GHIDRA_HEADLESS_MAXMEM=1536M \
+# The worker UID has no passwd entry, and vivisect asks for a login name at import.
+ENV HOME=/tmp USER=apprentice LOGNAME=apprentice REA_GHIDRA_STARTUP_TIMEOUT_MS=110000 GHIDRA_HEADLESS_MAXMEM=1536M \
     JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=2 PYTHONUNBUFFERED=1
 WORKDIR /opt/harness
 USER 65532:65532

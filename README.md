@@ -1,6 +1,6 @@
 # Prometheus
 
-Prometheus is a defensive static malware reverse-engineering harness. The **Forge** is the operator workspace. **Apprentices** are disposable, offline Docker workers that inspect files with Ghidra MCP and REA. The operator admits evidence and controls what gets shared with a model.
+Prometheus is a defensive static malware reverse-engineering harness. The **Forge** is the operator workspace. **Apprentices** are disposable, offline Docker workers that inspect files with Ghidra MCP, REA, capa and YARA. The operator admits evidence and controls what gets shared with a model.
 
 ## Start here
 

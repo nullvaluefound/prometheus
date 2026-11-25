@@ -74,6 +74,58 @@ def page(name, value, limit):
     return result
 
 
+def listed(value, maximum):
+    if not isinstance(value, list) or len(value) > maximum:
+        raise invalid()
+    return value
+
+
+def text(value, pattern):
+    if not policy.match(value, pattern):
+        raise invalid()
+    return value
+
+
+def yara_page(value, limit, rules):
+    object_fields(value, {"rows", "has_more", "matched_rules", "matches_truncated", "rules_sha256"})
+    if not policy.match(rules, policy.DIGEST) or value["rules_sha256"] != rules:
+        raise invalid()
+    rows = []
+    for row in listed(value["rows"], limit):
+        object_fields(row, {"rule", "namespace", "tags", "strings"})
+        strings = []
+        for found in listed(row["strings"], 32):
+            object_fields(found, {"identifier", "instances", "matches"})
+            hits = [{"offset": number(hit["offset"]), "length": number(hit["length"])}
+                    for hit in listed(found["matches"], 8) if object_fields(hit, {"offset", "length"})]
+            strings.append({"identifier": text(found["identifier"], policy.YARA_STRING),
+                            "instances": number(found["instances"], 2**32 - 1), "matches": hits})
+        rows.append({"rule": text(row["rule"], policy.YARA_IDENTIFIER),
+                     "namespace": text(row["namespace"], policy.YARA_IDENTIFIER),
+                     "tags": [text(tag, policy.YARA_IDENTIFIER) for tag in listed(row["tags"], 16)],
+                     "strings": strings})
+    return {"rows": rows, "has_more": boolean(value["has_more"]), "matched_rules": number(value["matched_rules"], 512),
+            "matches_truncated": boolean(value["matches_truncated"]), "rules_sha256": rules}
+
+
+def capa_page(value, limit):
+    object_fields(value, {"rows", "has_more", "capabilities", "limitations", "rules_withheld", "format", "arch", "os"})
+    rows = []
+    for row in listed(value["rows"], limit):
+        object_fields(row, {"rule", "namespace", "attack", "mbc", "matches", "addresses"})
+        if row["namespace"] != "":
+            text(row["namespace"], policy.CAPA_NAMESPACE)
+        rows.append({"rule": text(row["rule"], policy.CAPA_TEXT), "namespace": row["namespace"],
+                     "attack": [text(item, policy.ATTACK_ID) for item in listed(row["attack"], 16)],
+                     "mbc": [text(item, policy.MBC_ID) for item in listed(row["mbc"], 16)],
+                     "matches": number(row["matches"], 2**32 - 1),
+                     "addresses": [text(item, policy.ADDRESS) for item in listed(row["addresses"], 8)]})
+    return {"rows": rows, "has_more": boolean(value["has_more"]), "capabilities": number(value["capabilities"], 10000),
+            "limitations": [text(item, policy.CAPA_TEXT) for item in listed(value["limitations"], 16)],
+            "rules_withheld": number(value["rules_withheld"], 10000),
+            **{field: text(value[field], policy.CAPA_ENUM) for field in ("format", "arch", "os")}}
+
+
 def approved_excerpt(value):
     object_fields(value, {"trust", "text", "sha256_of_serialized_result", "serialized_bytes", "truncated"})
     if value["trust"] != "untrusted_sample_derived_data" or not isinstance(value["text"], str):
@@ -86,7 +138,7 @@ def approved_excerpt(value):
             "truncated": boolean(value["truncated"])}
 
 
-def project(reply, name, arguments, include):
+def project(reply, name, arguments, include, rules=None):
     required = {"tool", "artifact", "artifact_bytes", "summary"}
     if include and name != "artifact_summary":
         required.add("evidence_excerpt")
@@ -98,6 +150,10 @@ def project(reply, name, arguments, include):
         raise invalid()
     if name == "artifact_summary":
         summary = technical_summary(summary)
+    elif name == "yara_scan":
+        summary = yara_page(summary, arguments["limit"], rules)
+    elif name == "capa_triage":
+        summary = capa_page(summary, arguments["limit"])
     elif name in policy.PAGED:
         summary = page(name, summary, arguments["limit"])
     else:

@@ -26,7 +26,7 @@ def check_mcp(state, case_id, digest):
     child = subprocess.run([sys.executable, "-m", "re_harness.cli", "serve", case_id], cwd=runtime.ROOT,
                            input=lines, text=True, capture_output=True, env=env, timeout=195, check=True)
     initial, tools, result = (json.loads(line)["result"] for line in child.stdout.splitlines())
-    assert initial["protocolVersion"] == "2025-11-25" and len(tools["tools"]) == 7
+    assert initial["protocolVersion"] == "2025-11-25" and len(tools["tools"]) == 9
     assert not result["isError"], result
 
 
@@ -61,11 +61,22 @@ def execute(model=None, port=11434):
             functions = broker.call({"name": "ghidra_functions", "arguments": {"artifact": digest}})
             assert not functions["isError"], functions
             assert json.loads(functions["content"][0]["text"])["summary"]["rows"]
+            capa = broker.call({"name": "capa_triage", "arguments": {"artifact": digest}})
+            assert not capa["isError"], capa
+            assert json.loads(capa["content"][0]["text"])["summary"]["format"] == "elf"
+            assert broker.call({"name": "yara_scan", "arguments": {"artifact": digest}})["isError"]
+            rules = state / "rules.yar"
+            rules.write_text('rule smoke_example { strings: $a = "example" condition: $a }\n', encoding="ascii")
+            with patch.object(cli, "STATE", state):
+                cli.import_yara_rules(argparse.Namespace(case=case_id, input=rules))
+            yara = broker.call({"name": "yara_scan", "arguments": {"artifact": digest}})
+            assert not yara["isError"], yara
+            assert [row["rule"] for row in json.loads(yara["content"][0]["text"])["summary"]["rows"]] == ["smoke_example"]
             doc = json.loads(cli.call_worker(record, ["case", "verify"]))
             assert doc["ok"] and doc["checked"] == 1
             cli.call_worker(record, ["case", "report"], writable=True)
             assert b"Benign verification fixture" in cli.call_worker(record, ["export", "report.md"])
-            print("Verified blank workspace, case intake, stdio MCP, broker interception, Ghidra and evidence export.")
+            print("Verified blank workspace, case intake, stdio MCP, broker interception, Ghidra, capa, YARA and evidence export.")
             if model:
                 local_model.chat(state, case_id, port, model, "intake",
                                  f"Call artifact_summary for {digest}, then report the format and length.")

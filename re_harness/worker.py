@@ -15,6 +15,10 @@ from . import case, decoding, policy, providers
 
 ROOT = Path("/case")
 FIXTURE = Path("/opt/fixtures/benign.elf")
+YARA_RULES = ROOT / "rules" / "yara.yar"
+SELFTEST_RULE = b'''import "elf"
+rule prometheus_selftest : fixture { strings: $name = "example" condition: elf.type == elf.ET_DYN and $name }
+'''
 MAX_CASE_ARTIFACTS = 256
 MAX_CASE_BYTES = 4 * 1024 * 1024 * 1024
 
@@ -63,8 +67,19 @@ def triage(name, path, digest, identities, options):
     return info, None
 
 
+def case_rules(digest):
+    if not policy.match(digest, policy.DIGEST):
+        raise ValueError("invalid_worker_request")
+    if YARA_RULES.is_symlink() or not YARA_RULES.is_file():
+        raise ValueError("yara_rules_missing")
+    if hashlib.sha256(YARA_RULES.read_bytes()).hexdigest() != digest:
+        raise ValueError("yara_rules_mismatch")
+    return YARA_RULES
+
+
 def analyze(request, full=False):
-    if set(request) != {"tool", "arguments", "excerpt"} or type(request["excerpt"]) is not bool:
+    expected = {"tool", "arguments", "excerpt"} | ({"rules"} if request.get("tool") == "yara_scan" else set())
+    if set(request) != expected or type(request["excerpt"]) is not bool:
         raise ValueError("invalid_worker_request")
     name = request["tool"]
     options = policy.validate(name, request["arguments"])
@@ -75,6 +90,11 @@ def analyze(request, full=False):
     path, size, hashes = artifact(digest)
     if name.startswith("artifact_"):
         summary, raw = triage(name, path, digest, hashes, options)
+    elif name == "yara_scan":
+        summary, raw = providers.yara_scan(case_rules(request["rules"]), path, options)
+        summary["rules_sha256"] = request["rules"]
+    elif name == "capa_triage":
+        summary, raw = providers.capa_triage(path, options)
     else:
         raw = providers.run(name, path, options)
         if name in ("ghidra_functions", "ghidra_xrefs"):
@@ -133,6 +153,34 @@ def derive(parent, method, offset_text, length_text):
                               "--completeness", "unknown"])
 
 
+def import_rules():
+    source = sys.stdin.buffer.read(policy.MAX_YARA_RULES + 1)
+    import yara
+
+    try:
+        rules = providers.yara_compile(source)
+    except (yara.Error, UnicodeDecodeError, ValueError) as error:
+        # The rule text is operator-supplied, so its compiler diagnostic is safe to show the operator.
+        print(f"YARA rules rejected: {str(error)[:300]}", file=sys.stderr)
+        raise ValueError("yara_rules_rejected") from error
+    with case.locked(ROOT):
+        case.read_case(ROOT)
+        folder = YARA_RULES.parent
+        if folder.is_symlink() or YARA_RULES.is_symlink():
+            raise ValueError("yara_rules_path")
+        folder.mkdir(exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".writing-", dir=folder)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(source)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, YARA_RULES)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+    emit({"sha256": hashlib.sha256(source).hexdigest(), "bytes": len(source), "rules": len(list(rules))})
+
+
 def export_file(name):
     if name == "artifact":
         raise ValueError("artifact_digest_required")
@@ -175,7 +223,22 @@ def selftest(full):
         assert index["rows"] and providers.ghidra_index("ghidra_xrefs", crossrefs, 20)["rows"]
         assert "example" in json.dumps(native_ghidra) and "example" in json.dumps(rea_decompile)
         assert native_rea
-        result.update(ghidra_mcp="function index, xrefs, decompilation", rea="native inspect and decompilation")
+        with tempfile.NamedTemporaryFile(prefix="selftest-", suffix=".yar") as rules:
+            rules.write(SELFTEST_RULE)
+            rules.flush()
+            yara_page, yara_detail = providers.yara_scan(rules.name, FIXTURE, {"offset": 0, "limit": 20})
+        assert [row["rule"] for row in yara_page["rows"]] == ["prometheus_selftest"]
+        assert yara_detail["matches"][0]["strings"][0]["matches"][0]["data_hex"] == b"example".hex()
+        for forbidden in (b'import "console" rule a { condition: console.log("x") }', b'include "/etc/passwd"'):
+            try:
+                providers.yara_compile(forbidden)
+            except Exception:
+                continue
+            raise AssertionError("YARA accepted a forbidden module or include")
+        capa_page, _ = providers.capa_triage(FIXTURE, {"offset": 0, "limit": 50}, diagnostics=True)
+        assert capa_page["format"] == "elf" and capa_page["rules_withheld"] == 0
+        result.update(ghidra_mcp="function index, xrefs, decompilation", rea="native inspect and decompilation",
+                      yara="operator rules with module allowlist", capa="pinned rules on fixture ELF")
     emit(result)
 
 
@@ -193,6 +256,8 @@ def main():
             return derive(*args)
         elif mode == "export":
             export_file(*args)
+        elif mode == "yara-rules" and not args:
+            import_rules()
         elif mode == "fixture":
             if (ROOT / "case.json").exists():
                 raise ValueError("fixture_requires_blank_worker")

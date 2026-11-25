@@ -10,6 +10,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from . import policy
 from .policy import ADDRESS, match
 
 GHIDRA_TOOLS = {
@@ -18,6 +19,15 @@ GHIDRA_TOOLS = {
     "ghidra_decompile": "decompile_function_by_address",
 }
 MAX_PROVIDER_RESPONSE = 2 * 1024 * 1024
+YARA_TIMEOUT = 60
+YARA_MATCH_DATA = 64
+MAX_YARA_RULES_MATCHED = 512
+MAX_YARA_STRINGS = 32
+MAX_YARA_INSTANCES = 8
+CAPA = Path("/opt/capa")
+CAPA_TIMEOUT = 240
+MAX_CAPA_RESPONSE = 64 * 1024 * 1024
+MAX_CAPA_ADDRESSES = 64
 
 
 def provider_object(raw):
@@ -117,3 +127,130 @@ def run(name, path, options, diagnostics=False):
     if name in GHIDRA_TOOLS:
         return asyncio.run(asyncio.wait_for(ghidra(name, path, options, diagnostics), timeout=125))
     return rea(name, path, options, diagnostics)
+
+
+def quiet(_message):
+    return None
+
+
+def yara_compile(source):
+    """Compile operator rules with includes off and only the data-parsing modules."""
+    import yara
+
+    if len(source) > policy.MAX_YARA_RULES:
+        raise ValueError("yara_rules_too_large")
+    rules = yara.compile(source=source.decode("utf-8"), includes=False, error_on_warning=False)
+    yara_match(rules, data=b"")
+    return rules
+
+
+def yara_match(rules, **target):
+    import yara
+
+    def module(data):
+        if data.get("module") not in policy.YARA_MODULES:
+            raise ValueError("yara_module_not_allowed")
+        return yara.CALLBACK_CONTINUE
+
+    yara.set_config(max_match_data=YARA_MATCH_DATA)
+    return rules.match(**target, timeout=YARA_TIMEOUT, modules_callback=module, console_callback=quiet)
+
+
+def yara_meta(meta):
+    values = {}
+    for key, value in list(meta.items())[:32]:
+        if match(key, policy.YARA_IDENTIFIER) and type(value) in (str, int, bool):
+            values[key] = value[:256] if isinstance(value, str) else value
+    return values
+
+
+def yara_scan(rules_path, path, options):
+    matches = yara_match(yara_compile(Path(rules_path).read_bytes()), filepath=str(path))
+    rows = []
+    for item in matches[:MAX_YARA_RULES_MATCHED]:
+        strings = [{"identifier": found.identifier, "instances": len(found.instances),
+                    "matches": [{"offset": hit.offset, "length": hit.matched_length,
+                                 "data_hex": bytes(hit.matched_data).hex()}
+                                for hit in found.instances[:MAX_YARA_INSTANCES]]}
+                   for found in item.strings[:MAX_YARA_STRINGS]]
+        rows.append({"rule": item.rule, "namespace": item.namespace, "tags": list(item.tags)[:16],
+                     "meta": yara_meta(item.meta), "strings": strings})
+    rows.sort(key=lambda row: (row["namespace"], row["rule"]))
+    start, limit = options["offset"], options["limit"]
+    page = rows[start:start + limit]
+    summary = {"rows": [{"rule": row["rule"], "namespace": row["namespace"], "tags": row["tags"],
+                         "strings": [{"identifier": found["identifier"], "instances": found["instances"],
+                                      "matches": [{"offset": hit["offset"], "length": hit["length"]}
+                                                  for hit in found["matches"]]}
+                                     for found in row["strings"]]} for row in page],
+               "has_more": start + len(page) < len(rows), "matched_rules": len(rows),
+               "matches_truncated": len(matches) > MAX_YARA_RULES_MATCHED}
+    return summary, {"matches": page}
+
+
+def capa_ids(entries, pattern):
+    if not isinstance(entries, list):
+        return []
+    return sorted({entry["id"] for entry in entries if isinstance(entry, dict) and match(entry.get("id"), pattern)})[:16]
+
+
+def capa_address(value):
+    if isinstance(value, dict) and value.get("type") == "absolute" and type(value.get("value")) is int:
+        if 0 <= value["value"] < 2**64:
+            return hex(value["value"])
+    return None
+
+
+def capa_enum(value):
+    return value if match(value, policy.CAPA_ENUM) else "unknown"
+
+
+def capa_triage(path, options, diagnostics=False):
+    require_native(path)
+    env = {**os.environ, "XDG_CACHE_HOME": str(CAPA / "cache")}
+    with tempfile.TemporaryFile() as out:
+        proc = subprocess.run(["capa", "-q", "-j", "-r", str(CAPA / "rules"), "-s", str(CAPA / "sigs"), str(path)],
+                              stdin=subprocess.DEVNULL, stdout=out, stderr=None if diagnostics else subprocess.DEVNULL,
+                              env=env, timeout=CAPA_TIMEOUT, check=False)
+        if proc.returncode:
+            raise ValueError("capa_tool_error")
+        out.seek(0)
+        raw = out.read(MAX_CAPA_RESPONSE + 1)
+    if len(raw) > MAX_CAPA_RESPONSE:
+        raise ValueError("provider_response_too_large")
+    document = json.loads(raw)
+    analysis = document["meta"]["analysis"]
+    rows, limitations, withheld = [], [], 0
+    for name, item in document["rules"].items():
+        meta = item["meta"]
+        namespace = meta.get("namespace") or ""
+        if meta.get("lib") or meta.get("is_subscope_rule"):
+            continue
+        if not match(name, policy.CAPA_TEXT) or (namespace and not match(namespace, policy.CAPA_NAMESPACE)):
+            withheld += 1
+            continue
+        if namespace.startswith("internal/limitation/"):
+            limitations.append(name)
+            continue
+        if namespace.startswith("internal/"):
+            continue
+        addresses = [found for pair in item["matches"] if (found := capa_address(pair[0]))]
+        description = meta.get("description")
+        rows.append({"rule": name, "namespace": namespace, "attack": capa_ids(meta.get("attack"), policy.ATTACK_ID),
+                     "mbc": capa_ids(meta.get("mbc"), policy.MBC_ID), "matches": len(item["matches"]),
+                     "addresses": addresses[:MAX_CAPA_ADDRESSES],
+                     "description": description[:512] if isinstance(description, str) else ""})
+    rows.sort(key=lambda row: (row["namespace"], row["rule"]))
+    start, limit = options["offset"], options["limit"]
+    page = rows[start:start + limit]
+    layout = analysis.get("layout") if isinstance(analysis.get("layout"), dict) else {}
+    functions = layout.get("functions") if isinstance(layout.get("functions"), list) else []
+    summary = {"rows": [{**{key: row[key] for key in ("rule", "namespace", "attack", "mbc", "matches")},
+                         "addresses": row["addresses"][:8]} for row in page],
+               "has_more": start + len(page) < len(rows), "capabilities": len(rows),
+               "limitations": sorted(limitations)[:16], "rules_withheld": withheld,
+               "format": capa_enum(analysis.get("format")), "arch": capa_enum(analysis.get("arch")),
+               "os": capa_enum(analysis.get("os"))}
+    detail = {"base_address": capa_address(analysis.get("base_address")), "functions_with_matches": len(functions),
+              "capa_version": document["meta"].get("version"), "capabilities": page}
+    return summary, detail

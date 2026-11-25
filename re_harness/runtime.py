@@ -113,7 +113,24 @@ def load_case(state, case_id, *, allow_pending=False):
         raise RuntimeFailure("Invalid case policy record")
     if not allow_pending and not record["initialized"]:
         raise RuntimeFailure("Case setup is incomplete")
+    if "yara_rules" in record:
+        rules = record["yara_rules"]
+        if (not isinstance(rules, dict) or not policy.match(rules.get("sha256"), policy.DIGEST) or
+                type(rules.get("rules")) is not int or type(rules.get("bytes")) is not int):
+            raise RuntimeFailure("Invalid case YARA rules record")
     return folder, record
+
+
+def yara_rules(record):
+    """The SHA-256 of the case's operator-imported YARA rules, or a denial when none are imported."""
+    if "yara_rules" not in record:
+        raise policy.Denied("yara_rules_not_imported")
+    return record["yara_rules"]["sha256"]
+
+
+def tool_timeout(name):
+    # capa runs its own vivisect analysis with a 240 second provider budget.
+    return 300 if name == "capa_triage" else 155
 
 
 @contextlib.contextmanager

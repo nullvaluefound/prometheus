@@ -110,6 +110,31 @@ def change_scope(args):
     emit(event)
 
 
+def import_yara_rules(args):
+    folder = runtime.case_path(STATE, args.case)
+    with runtime.operator_lock(folder):
+        _, record = runtime.load_case(STATE, args.case)
+        runtime.audit(folder, case=args.case, decision="operator_requested", operation="yara-rules")
+        with args.input.open("rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= policy.MAX_YARA_RULES:
+                raise runtime.RuntimeFailure("YARA rules must be a regular file of at most 1 MiB")
+            result = server.strict_json(call_worker(record, ["yara-rules"], source=stream, writable=True,
+                                                    diagnostics=True))
+        if (set(result) != {"sha256", "bytes", "rules"} or not policy.match(result["sha256"], policy.DIGEST) or
+                type(result["bytes"]) is not int or type(result["rules"]) is not int):
+            raise runtime.RuntimeFailure("Unexpected YARA import result")
+        # Grants named matched bytes under the previous rules, so a new rule set retires them.
+        retired = [grant["id"] for grant in record["grants"] if grant["tool"] == "yara_scan"]
+        record["grants"] = [grant for grant in record["grants"] if grant["tool"] != "yara_scan"]
+        record["yara_rules"] = {**result, "imported_utc": dt.datetime.now(dt.timezone.utc).isoformat()}
+        event = {"case": args.case, "decision": "yara_rules_imported", "rules_sha256": result["sha256"],
+                 "rules": result["rules"], "retired_grants": retired}
+        runtime.audit(folder, **event)
+        atomic_json(folder / "scope.json", record)
+    emit(event)
+
+
 def operator_options(args):
     opts = []
     sources = {"source": "--source", "parent": "--parent", "relation": "--relation",
@@ -169,9 +194,12 @@ def operator_action(args):
             response = json.dumps({"exported": str(path)}).encode()
         elif args.command == "inspect":
             request = {"tool": args.tool, "arguments": action_options(args), "excerpt": True}
+            if args.tool == "yara_scan":
+                request["rules"] = runtime.yara_rules(record)
             mode = "capture" if args.full else "analyze"
             path = output_file(args.output, lambda stream: call_worker(
-                record, [mode], request=json.dumps(request).encode("ascii"), output=stream))
+                record, [mode], request=json.dumps(request).encode("ascii"), output=stream,
+                timeout=runtime.tool_timeout(args.tool)))
             response = json.dumps({"exported": str(path), "sha256": hashes(path)[1]["sha256"]}).encode()
         else:
             positionals = [args.artifact] if args.command == "triage" else []
@@ -222,10 +250,10 @@ def hookup(args):
     if args.format == "codex":
         print("[mcp_servers.static_re]\ncommand = " + json.dumps(command) + "\nargs = " + json.dumps(config)
               + "\ncwd = " + json.dumps(str(runtime.ROOT)) + "\nenv = { STATIC_RE_STATE_DIR = "
-              + json.dumps(env["STATIC_RE_STATE_DIR"]) + " }\nstartup_timeout_sec = 20\ntool_timeout_sec = 185"
+              + json.dumps(env["STATIC_RE_STATE_DIR"]) + " }\nstartup_timeout_sec = 20\ntool_timeout_sec = 330"
                 "\n")
     else:
-        emit({"command": command, "args": config, "cwd": str(runtime.ROOT), "env": env, "tool_timeout_seconds": 185})
+        emit({"command": command, "args": config, "cwd": str(runtime.ROOT), "env": env, "tool_timeout_seconds": 330})
 
 
 def add_selector(parser):
@@ -273,6 +301,8 @@ def make_parser():
     finding.add_argument("--confidence", choices=("low", "medium", "high"), required=True)
     finding.add_argument("--claim", required=True)
     finding.add_argument("--evidence", action="append", required=True)
+    rules = command("yara-rules", import_yara_rules)
+    rules.add_argument("input", type=Path, help="Reviewed YARA rule source, at most 1 MiB, without includes")
     export = command("export", operator_action)
     export.add_argument("item")
     export.add_argument("output", type=Path)
