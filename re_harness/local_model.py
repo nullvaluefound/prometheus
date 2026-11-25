@@ -36,9 +36,13 @@ def ollama(port, path, payload=None):
 def installed(port, model):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}", model) or model.endswith(":cloud"):
         return False
-    tags = ollama(port, "/api/tags")["models"]
-    return any(item["name"] == model and item.get("size", 0) > 0
-               and not item.get("remote_model") and not item.get("remote_host") for item in tags)
+    reply = ollama(port, "/api/tags")
+    tags = reply.get("models") if isinstance(reply, dict) else None
+    if not isinstance(tags, list):
+        raise runtime.RuntimeFailure("Unexpected local model listing")
+    return any(isinstance(item, dict) and item.get("name") == model and isinstance(item.get("size"), int)
+               and item["size"] > 0 and not item.get("remote_model") and not item.get("remote_host")
+               for item in tags)
 
 
 def chat(state, case_id, port, model, role, question):
@@ -58,8 +62,8 @@ def chat(state, case_id, port, model, role, question):
             broker.current_scope()
             result = ollama(port, "/api/chat", {"model": model, "messages": messages, "tools": tools,
                                               "stream": False, "options": {"num_predict": 1400, "temperature": 0}})
-            message = result["message"]
-            if result.get("done") is not True or message.get("role") != "assistant":
+            message = result.get("message") if isinstance(result, dict) else None
+            if not isinstance(message, dict) or result.get("done") is not True or message.get("role") != "assistant":
                 raise runtime.RuntimeFailure("Unexpected local model response")
             calls = message.get("tool_calls") or []
             text = message.get("content", "")

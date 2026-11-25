@@ -169,6 +169,12 @@ class LocalModelTests(unittest.TestCase):
                                ([{"name": MODEL, "size": 1, "remote_host": "https://ollama.com:443"}], False)):
             with self.subTest(tags=tags), patch.object(local_model, "ollama", return_value={"models": tags}):
                 self.assertIs(local_model.installed(PORT, MODEL), expected)
+        for reply in ({}, {"models": None}, [], {"models": [["x"]]}, {"models": [{"name": MODEL, "size": "1"}]}):
+            with self.subTest(reply=reply), patch.object(local_model, "ollama", return_value=reply):
+                if isinstance(reply, dict) and isinstance(reply.get("models"), list):
+                    self.assertFalse(local_model.installed(PORT, MODEL))
+                else:
+                    self.assertRaises(runtime.RuntimeFailure, local_model.installed, PORT, MODEL)
 
     def test_remote_model_is_refused_before_any_chat(self):
         with self.assertRaises(runtime.RuntimeFailure):
