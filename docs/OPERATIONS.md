@@ -33,7 +33,7 @@ python -m re_harness.cli derive case-001 $sha base64 0x120 256
 ## Scan with YARA and capa
 
 ```powershell
-python -m re_harness.cli yara-rules case-001 'C:\Ruleseviewed.yar'
+python -m re_harness.cli yara-rules case-001 'C:\Rules\reviewed.yar'
 python -m re_harness.cli inspect case-001 yara_scan $sha --output 'C:\Restricted\yara.json'
 python -m re_harness.cli inspect case-001 capa_triage $sha --full --output 'C:\Restricted\capa.json'
 ```
@@ -55,12 +55,19 @@ python -m re_harness.cli export case-001 report.md 'C:\Restricted\report.md'
 python -m re_harness.cli export case-001 evidence.json 'C:\Restricted\evidence.json'
 ```
 
-`inspect --full` writes the bounded structured provider response to the operator's chosen local path and prints its SHA-256. Cite that path and hash in findings if retained. Export only to a restricted directory. Use the artifact SHA-256 to export its verified bytes under an inert `.bin` extension. Use `<sha256>.triage.json` to export persisted triage. `report` creates an editable scaffold and an evidence JSON record. Review defanging and secret handling before distribution.
+`inspect --full` writes the bounded structured provider response to the operator's chosen local path and prints its SHA-256. Cite that path and hash in findings if retained. Export only to a restricted directory. Use the artifact SHA-256 to export its verified bytes under an inert `.bin` extension. Use `<sha256>.triage.json` to export persisted triage. `report` creates an editable scaffold and an evidence JSON record that name the case image and imported YARA rules SHA-256. `--claim` accepts up to 2000 characters and `--evidence` up to 16 entries of 500 characters. `--source` and `--relation` take plain labels of up to 160 characters without URLs. Review defanging and secret handling before distribution.
 
 Record observed, inferred, corroborated and unknown findings with evidence locators and confidence. Report analyzed artifact coverage, exact versus rolling variants, unresolved conditionals, unavailable files and static limitations. Include pertinent file and process behavior and defensive indicators. Use hashes, transfer details and access-controlled configuration when needed for handoff.
 
 ## Pause and recover
 
-`pause CASE`, or **Pause case** on the case's Forge page, immediately closes new broker actions and suppresses in-flight model-facing results when the broker next checks scope. Stop the caller to interrupt analysis promptly. `resume CASE` reopens the same validated scope and does not extend expiry. Audit records are local under `cases/<case-id>/audit.jsonl` inside the operator state directory.
+`pause CASE`, or **Pause case** on the case's Forge page, immediately closes new broker actions and suppresses in-flight model-facing results when the broker next checks scope. Stop the caller to interrupt analysis promptly. `resume CASE` reopens the same validated scope and does not extend grant expiry. `grant` is refused while a case is paused. Audit records are local under `cases/<case-id>/audit.jsonl` inside the operator state directory. Each worker-backed command records `operator_requested` and then `operator_completed` or `operator_failed` with a fixed reason. The records carry the validated `inspect` tool, artifact and arguments, the `export` item, the admitted SHA-256 for `ingest` and `derive` and the capture SHA-256 for `inspect`.
+
+```powershell
+python -m re_harness.cli cases
+python -m re_harness.cli grants case-001
+```
+
+`cases` lists each case's ID, paused and initialized state, image ID and imported YARA rules SHA-256 without changing scope. `grants CASE` lists active grants with their ID, tool, artifact, selector, audience and UTC expiry. It removes expired grants from `scope.json` and audits the removal.
 
 After an interrupted operator command, establish whether its container still exists and whether a mutation already completed before retrying. An interrupted `init` can be rerun. An initialized case with a missing volume is an integrity incident. Restore its original evidence from trusted retention or use a new case ID. If a lock remains, check that its recorded process is gone and that the corresponding Docker worker stopped before removing only that exact lock. Avoid prune, volume removal and factory reset during recovery of an evidence case.

@@ -243,7 +243,7 @@ def selftest(full):
 
 
 def main():
-    mode, *args = sys.argv[1:]
+    mode, *args = sys.argv[1:] or [""]
     try:
         if mode in ("analyze", "capture"):
             request = sys.stdin.buffer.read(policy.MAX_LINE + 1)

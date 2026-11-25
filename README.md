@@ -14,7 +14,7 @@ Run these commands from this directory in PowerShell. Initial setup needs Python
 .\scripts\Bootstrap.ps1
 ```
 
-Bootstrap builds an image from the pinned tool inputs, tests isolation and both analysis providers with a benign ELF, and records the verified image ID as the clean baseline. Windows WSL keeps the image and case volumes inside the distribution. Host-side policy and audit files live under `%USERPROFILE%\.static-re-harness`.
+Bootstrap builds an image from the pinned tool inputs, tests isolation and the Ghidra MCP, REA, YARA and capa providers with a benign ELF, and records the verified image ID as the clean baseline. Windows WSL keeps the image and case volumes inside the distribution. Host-side policy and audit files live under `%USERPROFILE%\.static-re-harness`.
 
 ```powershell
 python -m re_harness.cli blank

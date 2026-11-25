@@ -9,7 +9,7 @@ flowchart LR
     P --> B
     B --> D[Apprentice in offline Docker]
     E[Named case evidence volume] -->|read-only for model tools| D
-    D --> G[Ghidra MCP and static REA]
+    D --> G[Ghidra MCP, static REA, YARA and capa]
     D --> F[Typed result projection]
     F --> B
 ```

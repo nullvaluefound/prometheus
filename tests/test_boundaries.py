@@ -52,7 +52,7 @@ class InputTests(unittest.TestCase):
             decoding.decode("gzip", data)
 
     def test_report_defangs_mixed_case_scheme(self):
-        self.assertEqual(case.defang("HtTpS://example.invalid"), "hxxps://example.invalid")
+        self.assertEqual(case.defang("HtTpS://example.invalid"), "hxxps://example[.]invalid")
 
 
 class BrokerTests(unittest.TestCase):

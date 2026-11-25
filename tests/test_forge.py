@@ -35,7 +35,8 @@ class ForgeTests(unittest.TestCase):
         write_case(state, "frozen", image, paused=True)
         write_case(state, "offscope", image)
         atomic_json(state / "baseline.json", {"engine": "linux", "image": image,
-                    "verification": {"ghidra_mcp": "fixture", "rea": "fixture"}})
+                    "verification": {"ghidra_mcp": "fixture", "rea": "fixture", "yara": "fixture",
+                                     "capa": "fixture"}})
         self.path = state / "forge.sock"
         self.origin = "https://forge.example"
         self.app = forge.Forge(self.path, self.origin, "/prometheus/", state, {"review", "frozen"})
@@ -75,6 +76,9 @@ class ForgeTests(unittest.TestCase):
         self.assertEqual(status, 200)
         for text in ("Prometheus", "Forge", "Apprentices", "review", "Verified"):
             self.assertIn(text, body)
+        for label in ("Ghidra MCP", "REA", "YARA", "capa"):
+            self.assertIn(f'<li><span>{label}</span><span class="status">Verified</span></li>', body)
+        self.assertNotIn("Awaiting baseline", body)
         self.assertIn("default-src 'none'", headers["Content-Security-Policy"])
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
@@ -321,6 +325,31 @@ class ForgeArgumentTests(unittest.TestCase):
             self.skipTest("Unix sockets are available")
         with self.assertRaises(OSError):
             forge.Forge(Path("forge.sock"), "https://forge.example", "/prometheus/", Path("."), set())
+
+
+class BaselineToolsTests(unittest.TestCase):
+    def baseline(self, verification):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        state = Path(directory.name)
+        record = {"engine": "linux", "image": "sha256:" + "a" * 64}
+        if verification is not None:
+            record["verification"] = verification
+        atomic_json(state / "baseline.json", record)
+        return state
+
+    def test_reports_each_selftest_apprentice(self):
+        state = self.baseline({"ghidra_mcp": "ok", "rea": "ok", "yara": "", "capa": "ok"})
+        self.assertEqual(forge.baseline_tools(state),
+                         (("Ghidra MCP", True), ("REA", True), ("YARA", False), ("capa", True)))
+
+    def test_missing_or_invalid_baseline_awaits_every_apprentice(self):
+        expected = (("Ghidra MCP", False), ("REA", False), ("YARA", False), ("capa", False))
+        self.assertEqual(forge.baseline_tools(self.baseline(None)), expected)
+        self.assertEqual(forge.baseline_tools(self.baseline(["ghidra_mcp"])), expected)
+        empty = tempfile.TemporaryDirectory()
+        self.addCleanup(empty.cleanup)
+        self.assertEqual(forge.baseline_tools(Path(empty.name)), expected)
 
 
 if __name__ == "__main__":

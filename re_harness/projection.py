@@ -30,7 +30,7 @@ def technical_summary(value):
     if not mandatory <= value.keys() or value.keys() - mandatory - {"pe", "elf"}:
         raise invalid()
     kind = value["format_hint"]
-    if kind not in ("PE candidate", "ELF", "ZIP candidate", "script", "unknown"):
+    if kind not in ("PE candidate", "ELF", "Mach-O", "Mach-O universal", "ZIP candidate", "script", "unknown"):
         raise invalid()
     result = {"size": number(value["size"]), "format_hint": kind,
               "strings_count": number(value["strings_count"], 10000),

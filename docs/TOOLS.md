@@ -22,7 +22,7 @@ Upstream references for the pinned providers. [Ghidra 12.1.4](https://github.com
 
 | Name | Accepted selectors beyond SHA-256 | Basic result |
 | --- | --- | --- |
-| `artifact_summary` | None | Format hint, length, string count and selected header fields |
+| `artifact_summary` | None | Format hint (`PE candidate`, `ELF`, `Mach-O`, `Mach-O universal`, `ZIP candidate`, `script` or `unknown`), length, string count and selected header fields |
 | `artifact_strings` | Offset, limit | File offsets and byte lengths of ASCII and UTF-16LE strings |
 | `ghidra_functions` | Offset, limit | Function entry addresses |
 | `ghidra_xrefs` | Address, offset, limit | Static inbound cross-reference addresses |

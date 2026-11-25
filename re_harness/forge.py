@@ -46,12 +46,18 @@ def case_rows(state, visible):
     return rows
 
 
+APPRENTICES = (("ghidra_mcp", "Ghidra MCP"), ("rea", "REA"), ("yara", "YARA"), ("capa", "capa"))
+
+
 def baseline_tools(state):
+    """Return (label, verified) for each baseline Apprentice the selftest records."""
     try:
         verified = runtime.load_baseline(state).get("verification", {})
-        return (bool(verified.get("ghidra_mcp")), bool(verified.get("rea")))
+        if not isinstance(verified, dict):
+            verified = {}
     except BROWSER_ERRORS:
-        return (False, False)
+        verified = {}
+    return tuple((label, bool(verified.get(key))) for key, label in APPRENTICES)
 
 
 AUDIT_TAIL = 256 * 1024
@@ -238,8 +244,8 @@ class Handler(BaseHTTPRequestHandler):
         options = "".join(f'<option value="{esc(name)}"{" selected" if name == selected else ""}>{esc(name)}</option>'
                           for name, status in cases if status == "Ready")
         inactive = " disabled" if not options else ""
-        tools = "".join(f'<li><span>{name}</span><span class="status">{"Verified" if ready else "Awaiting baseline"}</span></li>'
-                        for name, ready in zip(("Ghidra MCP", "REA"), providers))
+        tools = "".join(f'<li><span>{esc(name)}</span><span class="status">{"Verified" if ready else "Awaiting baseline"}</span></li>'
+                        for name, ready in providers)
         output = ""
         if result is not None:
             rendered = esc(json.dumps(result, indent=2, ensure_ascii=True))
