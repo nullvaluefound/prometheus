@@ -100,9 +100,12 @@ class AnalyzeTests(WorkerCase):
 
     def test_excerpt_only_tools_need_grant_before_provider(self):
         for name in sorted(policy.EXCERPT_ONLY):
-            with self.subTest(name=name), patch.object(providers, "run") as run:
-                self.refused("excerpt_grant_required", worker.analyze, self.request(name, address="0x10"))
+            selector = {"address": "0x10"} if name in policy.ADDRESSED else {}
+            with self.subTest(name=name), patch.object(providers, "run") as run, \
+                    patch.object(providers, "artifact_imports") as names:
+                self.refused("excerpt_grant_required", worker.analyze, self.request(name, **selector))
                 run.assert_not_called()
+                names.assert_not_called()
         with patch.object(providers, "run", return_value={"code": "int main()"}) as run:
             result = worker.analyze(self.request("ghidra_decompile", True, address="0x0010"))
         self.assertEqual(run.call_args.args[2], {"address": "0x10"})

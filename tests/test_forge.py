@@ -255,6 +255,36 @@ class ForgeTests(unittest.TestCase):
         self.assertIn("Resume with the operator CLI", body)
         self.assertEqual(self.request("POST", "/prometheus/inspect", self.post_headers, self.form)[0], 400)
 
+    def test_closed_case_is_read_only(self):
+        write_case(self.state, "sealed", "sha256:" + self.digest)
+        folder = runtime.case_path(self.state, "sealed")
+        atomic_json(folder / "scope.json", {**runtime.read_json(folder / "scope.json"), "closed": True,
+                                            "closed_utc": "2026-11-25T10:00:00+00:00"})
+        before = (folder / "scope.json").read_bytes()
+        self.app.visible.add("sealed")
+        _, body, _ = self.request("GET", "/prometheus/", OPERATOR)
+        self.assertIn('<a href="/prometheus/cases/sealed">sealed</a></span><span class="status">Closed</span>', body)
+        self.assertNotIn('<option value="sealed"', body)
+        with patch.object(forge, "case_ledger", return_value=self.ledger()):
+            status, body, _ = self.request("GET", "/prometheus/cases/sealed", OPERATOR)
+        self.assertEqual(status, 200)
+        for expected in ('<span class="status">Closed</span>', "Closure is irreversible", "2026-11-25T10:00:00+00:00",
+                         "F0001", self.digest):
+            self.assertIn(expected, body)
+        for hidden in ("Pause case", 'action="/prometheus/pause"', 'action="/prometheus/inspect"', "Summary"):
+            self.assertNotIn(hidden, body)
+        with patch.object(forge.server, "Broker") as broker:
+            for route, form in (("/prometheus/inspect", {**self.form, "case": "sealed"}),
+                                ("/prometheus/pause", {"case": "sealed"})):
+                with self.subTest(route=route):
+                    status, body, _ = self.request("POST", route, self.post_headers, form)
+                    self.assertEqual((status, body), (409, "Case is closed"))
+            broker.assert_not_called()
+        self.assertEqual((folder / "scope.json").read_bytes(), before)
+        self.assertFalse((folder / "audit.jsonl").exists())
+        with self.assertRaisesRegex(runtime.RuntimeFailure, "Case is closed"):
+            forge.pause_case(self.state, "sealed", "analyst")
+
     def test_pause_respects_operator_lock(self):
         lock = runtime.case_path(self.state, "review") / ".operator.lock"
         lock.write_text("1", encoding="ascii")

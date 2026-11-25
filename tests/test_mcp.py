@@ -55,7 +55,7 @@ class MessageTests(unittest.TestCase):
     def test_tools_list_is_the_read_only_policy_surface(self):
         reply, _ = server.message({"jsonrpc": "2.0", "id": "a", "method": "tools/list"}, None, True)
         tools = reply["result"]["tools"]
-        self.assertEqual(len(tools), 9)
+        self.assertEqual(len(tools), 10)
         self.assertEqual([tool["name"] for tool in tools], list(policy.TOOLS))
         for tool in tools:
             self.assertEqual(tool["inputSchema"], policy.tool_schema(tool["name"]))

@@ -31,11 +31,12 @@ The default output consists of format hints, counts, hashes, offsets and validat
 ```powershell
 python -m re_harness.cli grant case-001 ghidra_decompile $sha --address 0x401000 --audience local --minutes 10
 python -m re_harness.cli grant case-001 artifact_strings $sha --offset 0 --limit 10 --audience mcp --minutes 5
+python -m re_harness.cli grant case-001 artifact_imports $sha --offset 0 --limit 50 --audience mcp --minutes 5
 python -m re_harness.cli grants case-001
 python -m re_harness.cli revoke case-001 $grantId
 ```
 
-`grants CASE` lists the active grant IDs for `revoke` and prunes expired grants. `grant` is refused while the case is paused.
+`grants CASE` lists the active grant IDs for `revoke` and prunes expired grants. `grant` is refused while the case is paused. Closing a case retires all of its grants and refuses new `ask`, `serve` and `hookup` sessions.
 
 `local` grants apply to `ask` and are the default. `mcp` grants apply to clients connected to the case's MCP broker and may disclose evidence to a hosted model. Configure only the intended MCP client for that case before granting its audience. Cancel an unused grant and pause the case when scope changes. Revocation cannot recall a response already delivered. Operator-only `inspect` lets you review the evidence on disk before granting anything to a model.
 

@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -100,7 +101,10 @@ def analyze(request, full=False):
     if name in policy.EXCERPT_ONLY and not display_excerpt:
         raise ValueError("excerpt_grant_required")
     path, size, hashes = artifact(digest)
-    if name.startswith("artifact_"):
+    if name == "artifact_imports":
+        # The grant releases the names themselves, validated row by row on the host.
+        summary, raw = providers.artifact_imports(path, options), None
+    elif name.startswith("artifact_"):
         summary, raw = triage(name, path, digest, hashes, options)
     elif name == "yara_scan":
         summary, raw = providers.yara_scan(case_rules(request["rules"]), path, options)
@@ -210,6 +214,23 @@ def export_file(name):
         shutil.copyfileobj(source, sys.stdout.buffer)
 
 
+def synthetic_pe(section=b".idata", library=b"KERNEL32.dll", function=b"ExitProcess"):
+    """A PE32 whose one section holds an import of one name and ordinal 7, for parser checks."""
+    dos = b"MZ" + bytes(58) + struct.pack("<I", 0x40)
+    coff = struct.pack("<HHIIIHH", 0x14C, 1, 0, 0, 0, 0xE0, 0x0102)
+    directories = bytearray(16 * 8)
+    directories[8:16] = struct.pack("<II", 0x1000, 40)
+    optional = struct.pack("<HBBIIIIIIIIIHHHHHHIIIIHHIIIIII", 0x10B, 14, 0, 0, 0x200, 0, 0x1000, 0x1000, 0x1000,
+                           0x400000, 0x1000, 0x200, 6, 0, 0, 0, 6, 0, 0, 0x2000, 0x200, 0, 2, 0,
+                           0x100000, 0x1000, 0x100000, 0x1000, 0, 16) + bytes(directories)
+    header = struct.pack("<8sIIIIIIHHI", section, 0x200, 0x1000, 0x200, 0x200, 0, 0, 0, 0, 0xC0000040)
+    headers = dos + b"PE\x00\x00" + coff + optional + header
+    thunks = struct.pack("<III", 0x1090, 0x80000007, 0)
+    body = (struct.pack("<IIIII", 0x1040, 0, 0, 0x1080, 0x1060) + bytes(44) + thunks + bytes(20) + thunks
+            + bytes(20) + library[:15].ljust(16, b"\x00") + b"\x00\x00" + function[:100] + b"\x00")
+    return headers + bytes(0x200 - len(headers)) + body.ljust(0x200, b"\x00")
+
+
 def selftest(full):
     # A golden input built from the two-line source in the Dockerfile, opened as data.
     assert os.geteuid() == 65532 and os.getegid() == 65532
@@ -247,10 +268,21 @@ def selftest(full):
             except Exception:
                 continue
             raise AssertionError("YARA accepted a forbidden module or include")
+        with tempfile.NamedTemporaryFile(prefix="selftest-", suffix=".bin") as sample:
+            sample.write(synthetic_pe())
+            sample.flush()
+            pe_names = providers.artifact_imports(sample.name, {"offset": 0, "limit": 50})
+        elf_names = providers.artifact_imports(FIXTURE, {"offset": 0, "limit": 50})
+        assert pe_names["limitations"] == [] and [(row["kind"], row["name"], row["ordinal"]) for row in
+                                                  pe_names["rows"]][2:] == [("pe_import", "ExitProcess", None),
+                                                                            ("pe_import", "", 7)]
+        assert elf_names["format"] == "elf" and not elf_names["limitations"]
+        assert ("elf_needed", "libc.so.6") in [(row["kind"], row["name"]) for row in elf_names["rows"]]
         capa_page, _ = providers.capa_triage(FIXTURE, {"offset": 0, "limit": 50}, diagnostics=True)
         assert capa_page["format"] == "elf" and capa_page["rules_withheld"] == 0
         result.update(ghidra_mcp="function index, xrefs, decompilation", rea="native inspect and decompilation",
-                      yara="operator rules with module allowlist", capa="pinned rules on fixture ELF")
+                      yara="operator rules with module allowlist", capa="pinned rules on fixture ELF",
+                      imports="synthetic PE and fixture ELF names")
     emit(result)
 
 

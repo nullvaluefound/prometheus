@@ -39,11 +39,15 @@ def case_rows(state, visible):
         if visible and folder.name not in visible:
             continue
         try:
-            _, case = runtime.load_case(state, folder.name)
+            _, case = runtime.load_case(state, folder.name, allow_closed=True)
         except BROWSER_ERRORS:
             continue
-        rows.append((folder.name, "Paused" if case["paused"] else "Ready"))
+        rows.append((folder.name, case_status(case)))
     return rows
+
+
+def case_status(record):
+    return "Closed" if runtime.closed(record) else "Paused" if record["paused"] else "Ready"
 
 
 APPRENTICES = (("ghidra_mcp", "Ghidra MCP"), ("rea", "REA"), ("yara", "YARA"), ("capa", "capa"))
@@ -260,13 +264,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def case_page(self, operator, case_id):
         try:
-            folder, record = runtime.load_case(self.server.state, case_id)
+            folder, record = runtime.load_case(self.server.state, case_id, allow_closed=True)
         except BROWSER_ERRORS:
             return self.plain(HTTPStatus.SERVICE_UNAVAILABLE, "Case service unavailable")
         prefix = esc(self.server.prefix)
-        paused = record["paused"]
+        status = case_status(record)
+        paused = status != "Ready"
         hidden_case = f'<input type="hidden" name="case" value="{esc(case_id)}">'
-        if paused:
+        if status == "Closed":
+            control = (f'<p class="muted">Closed {text(record.get("closed_utc"))}. Closure is irreversible. '
+                       'The ledger, report and evidence volume are retained read-only.</p>')
+        elif paused:
             control = '<p class="muted">Paused. Resume with the operator CLI after reviewing scope.</p>'
         else:
             control = (f'<form class="inline" method="post" action="{prefix}pause">{hidden_case}'
@@ -274,7 +282,7 @@ class Handler(BaseHTTPRequestHandler):
                        '<p class="muted">Pausing closes new broker actions at once. Only the operator CLI can resume.</p>')
         rules = record.get("yara_rules")
         yara_rules = (f'<code>{esc(rules["sha256"])}</code>' if rules else '<span class="muted">None imported</span>')
-        scope = (f'<ul><li><span>Status</span><span class="status">{"Paused" if paused else "Ready"}</span></li>'
+        scope = (f'<ul><li><span>Status</span><span class="status">{esc(status)}</span></li>'
                  f'<li><span>Image</span><code>{esc(record["image"])}</code></li>'
                  f'<li><span>Engine</span><code>{esc(record["engine"])}</code></li>'
                  f'<li><span>YARA rules</span>{yara_rules}</li></ul>{control}')
@@ -299,9 +307,10 @@ class Handler(BaseHTTPRequestHandler):
                     + (f'<br><span class="muted">from <code>{text(entry.get("parent"))}</code> '
                        f'({text(entry.get("relation"))})</span>' if entry.get("parent") else "")
                     for entry in provenance[:4] if isinstance(entry, dict))
-                summary = (f'<form class="inline" method="post" action="{prefix}inspect">{hidden_case}'
-                           f'<input type="hidden" name="artifact" value="{esc(digest)}">'
-                           f'<button{" disabled" if paused else ""}>Summary</button></form>')
+                summary = "" if status == "Closed" else (
+                    f'<form class="inline" method="post" action="{prefix}inspect">{hidden_case}'
+                    f'<input type="hidden" name="artifact" value="{esc(digest)}">'
+                    f'<button{" disabled" if paused else ""}>Summary</button></form>')
                 artifacts.append((f"<code>{esc(digest)}</code>", text(item.get("size")), origin, summary))
             artifacts_html = table(("SHA-256", "Bytes", "Provenance", ""), artifacts, "No artifacts admitted yet.")
             findings = []
@@ -370,9 +379,12 @@ class Handler(BaseHTTPRequestHandler):
             form = self.read_form(("case", "artifact"))
             case_id, digest = form["case"], form["artifact"]
             values = policy.validate("artifact_summary", {"artifact": digest})
-            if self.listed_cases().get(case_id) != "Ready":
-                raise ValueError("case unavailable")
+            status = self.listed_cases().get(case_id)
         except (ValueError, UnicodeError, OSError):
+            return self.plain(HTTPStatus.BAD_REQUEST, "Invalid case or artifact")
+        if status == "Closed":
+            return self.plain(HTTPStatus.CONFLICT, "Case is closed")
+        if status != "Ready":
             return self.plain(HTTPStatus.BAD_REQUEST, "Invalid case or artifact")
         try:
             broker = server.Broker(self.server.state, case_id, {"artifact_summary"}, audience="forge")
@@ -385,15 +397,19 @@ class Handler(BaseHTTPRequestHandler):
     def pause(self, operator):
         try:
             case_id = self.read_form(("case",))["case"]
-            if not policy.match(case_id, policy.CASE_ID) or case_id not in self.listed_cases():
+            if not policy.match(case_id, policy.CASE_ID) or case_id not in (listed := self.listed_cases()):
                 raise ValueError("case unavailable")
         except (ValueError, UnicodeError, OSError):
             return self.plain(HTTPStatus.BAD_REQUEST, "Invalid case")
+        if listed[case_id] == "Closed":
+            return self.plain(HTTPStatus.CONFLICT, "Case is closed")
         try:
             pause_case(self.server.state, case_id, operator)
         except runtime.RuntimeFailure as error:
             if "lock" in str(error):
                 return self.plain(HTTPStatus.CONFLICT, "Another operator command holds this case. Pause from the CLI.")
+            if "closed" in str(error):
+                return self.plain(HTTPStatus.CONFLICT, "Case is closed")
             return self.plain(HTTPStatus.SERVICE_UNAVAILABLE, "Case service unavailable")
         except BROWSER_ERRORS:
             return self.plain(HTTPStatus.SERVICE_UNAVAILABLE, "Case service unavailable")

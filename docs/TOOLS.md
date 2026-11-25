@@ -12,7 +12,7 @@
 | Node 24.22.1 and REA 6.8.0 | `inspect` and `decompile` using REA's Ghidra 12.1 provider | Node base pinned by digest, REA locked with npm integrity fields |
 | yara-python 4.5.4 | Offline YARA scans with operator-imported rules | Hash-locked Python environment |
 | capa 10.0.0, capa-rules 10.0.0 and FLIRT signatures | Capability triage of PE and ELF with the vivisect backend | Package hash-locked. Rules archive and source signatures checked by SHA-256, with a prebuilt rule cache |
-| pefile, file, binutils and jq | PE triage and operator diagnostic utilities | Python and Ubuntu image packages |
+| pefile, file, binutils and jq | PE triage, granted `artifact_imports` names and operator diagnostic utilities | Python and Ubuntu image packages |
 | tini | Process-group signal handling inside workers | Ubuntu package in image |
 | Ollama or a stdio MCP client | Optional model-driven analysis | Operator selects the client and model |
 
@@ -23,6 +23,7 @@ Upstream references for the pinned providers. [Ghidra 12.1.4](https://github.com
 | Name | Accepted selectors beyond SHA-256 | Basic result |
 | --- | --- | --- |
 | `artifact_summary` | None | Format hint (`PE candidate`, `ELF`, `Mach-O`, `Mach-O universal`, `ZIP candidate`, `script` or `unknown`), length, string count and numeric header fields. PE adds machine, image base, entry RVA, overlay offset, section, import-library and certificate counts, and up to 96 sections as RVA, raw offset, raw size, virtual size, flags and entropy. ELF adds class, encoding, machine, type, entry, and program and section header counts. Thin Mach-O adds CPU type and file type. Section, import, version and string names are never included |
+| `artifact_imports` | Offset, limit | Requires a grant. Rows of PE section names with RVA, import and delay-import DLL names, and function names or ordinals with IAT slot RVA. ELF gives `DT_NEEDED` libraries and named `.dynsym` imports and exports with value. Each row carries `kind`, `index`, `library` index, `name`, `name_hex`, `name_bytes`, `ordinal` and `address`. Limitations name a missing parser, parse failure or cap |
 | `artifact_strings` | Offset, limit | File offsets and byte lengths of ASCII and UTF-16LE strings |
 | `ghidra_functions` | Offset, limit | Function entry addresses |
 | `ghidra_xrefs` | Address, offset, limit | Static inbound cross-reference addresses |
@@ -33,6 +34,10 @@ Upstream references for the pinned providers. [Ghidra 12.1.4](https://github.com
 | `capa_triage` | Offset, limit | Capability names and namespaces, ATT&CK and MBC IDs, match counts, up to 8 function addresses, capa format, arch and OS, and any packer or installer limitation. Up to 64 addresses, rule descriptions and analysis layout by grant |
 
 Native admission covers common ELF, PE with its signature in the first 4 KiB, and thin Mach-O signatures. Format and loader support can narrow this further. For a long or unusual sample, record any parser limit and use separate approved tools in an isolated lab. The built-in REA lane selects only its Ghidra native provider. It does not offer runtime, browser, ADB, script, emulator, remote provider or install operations. Both frontends share Ghidra analysis, so matching results should be attributed accordingly.
+
+### Import names
+
+Section, import and symbol names are sample text, so `artifact_imports` returns nothing without an operator grant for the exact artifact, offset, limit and audience. The worker keeps up to 96 sections, 256 import and delay-import DLLs, 512 functions per DLL and 8,192 rows in all, and reads each name to 256 bytes. Bytes outside printable ASCII become `?`. When that changes or cuts a name, `name_hex` holds the first 256 original bytes and `name_bytes` the full length. The host projection accepts only listed kinds, printable names consistent with their hex, bounded integers, hex addresses and a fixed set of limitations. The ELF reader parses section headers with the standard library and stops on any out-of-range read. Without pefile, a PE yields only the `pefile_unavailable` limitation.
 
 ### Scanner controls
 

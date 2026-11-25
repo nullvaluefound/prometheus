@@ -1,6 +1,7 @@
 """Trusted host state and the fixed Docker invocation boundary."""
 
 import contextlib
+import datetime as dt
 import json
 import os
 import re
@@ -102,7 +103,19 @@ def validate_runtime(record):
         raise RuntimeFailure("Invalid baseline or case runtime record")
 
 
-def load_case(state, case_id, *, allow_pending=False):
+def closed(record):
+    return record.get("closed") is True
+
+
+def valid_utc(value):
+    try:
+        return isinstance(value, str) and dt.datetime.fromisoformat(value).tzinfo is not None
+    except ValueError:
+        return False
+
+
+def load_case(state, case_id, *, allow_pending=False, allow_closed=False):
+    """Load a validated case scope. A closed case is refused unless the caller only reads it."""
     folder = case_path(state, case_id)
     record = read_json(folder / "scope.json")
     validate_runtime(record)
@@ -111,6 +124,10 @@ def load_case(state, case_id, *, allow_pending=False):
     if (type(record.get("paused")) is not bool or not isinstance(record.get("grants"), list) or
             type(record.get("initialized")) is not bool):
         raise RuntimeFailure("Invalid case policy record")
+    if ("closed" in record or "closed_utc" in record) and (
+            record.get("closed") is not True or not valid_utc(record.get("closed_utc")) or
+            record["grants"] or not record["initialized"]):
+        raise RuntimeFailure("Invalid case closure record")
     if not allow_pending and not record["initialized"]:
         raise RuntimeFailure("Case setup is incomplete")
     if "yara_rules" in record:
@@ -118,6 +135,8 @@ def load_case(state, case_id, *, allow_pending=False):
         if (not isinstance(rules, dict) or not policy.match(rules.get("sha256"), policy.DIGEST) or
                 type(rules.get("rules")) is not int or type(rules.get("bytes")) is not int):
             raise RuntimeFailure("Invalid case YARA rules record")
+    if closed(record) and not allow_closed:
+        raise RuntimeFailure("Case is closed")
     return folder, record
 
 

@@ -174,6 +174,44 @@ def capa_page(value, limit):
             **{field: text(value[field], policy.CAPA_ENUM) for field in ("format", "arch", "os")}}
 
 
+IMPORT_ROW = {"kind", "index", "library", "name", "name_hex", "name_bytes", "ordinal", "address"}
+LIBRARY_KINDS = {"pe_import": "pe_library", "pe_delay_import": "pe_delay_library"}
+
+
+def optional(value, check):
+    return None if value is None else check(value)
+
+
+def imports_page(value, limit):
+    object_fields(value, {"rows", "has_more", "total_rows", "format", "limitations"})
+    if value["format"] not in ("pe", "elf", "unknown"):
+        raise invalid()
+    rows = []
+    for row in listed(value["rows"], limit):
+        object_fields(row, IMPORT_ROW)
+        if row["kind"] not in policy.IMPORT_KINDS or (row["library"] is None) == (row["kind"] in LIBRARY_KINDS):
+            raise invalid()
+        name, raw = text(row["name"], policy.IMPORT_NAME), text(row["name_hex"], r"(?:[0-9a-f]{2}){0,256}")
+        length = number(row["name_bytes"], 2**32 - 1)
+        # Hex appears exactly when the printable name differs from, or cuts, the original bytes.
+        original = bytes.fromhex(raw)
+        printable = "".join(chr(byte) if 0x20 <= byte <= 0x7E else "?" for byte in original)
+        if (len(name) != length if not raw else len(original) != min(length, policy.MAX_IMPORT_NAME) or
+                name != printable or length == len(original) and printable.encode("ascii") == original):
+            raise invalid()
+        if row["ordinal"] is not None and row["kind"] not in LIBRARY_KINDS:
+            raise invalid()
+        rows.append({"kind": row["kind"], "index": number(row["index"], policy.MAX_IMPORT_ROWS),
+                     "library": optional(row["library"], lambda item: number(item, 255)), "name": name,
+                     "name_hex": raw, "name_bytes": length, "ordinal": optional(row["ordinal"], lambda item: number(item, 65535)),
+                     "address": optional(row["address"], lambda item: text(item, HEX64))})
+    limitations = listed(value["limitations"], len(policy.IMPORT_LIMITATIONS))
+    if any(item not in policy.IMPORT_LIMITATIONS for item in limitations) or limitations != sorted(set(limitations)):
+        raise invalid()
+    return {"rows": rows, "has_more": boolean(value["has_more"]), "format": value["format"],
+            "total_rows": number(value["total_rows"], policy.MAX_IMPORT_ROWS), "limitations": list(limitations)}
+
+
 def approved_excerpt(value):
     object_fields(value, {"trust", "text", "sha256_of_serialized_result", "serialized_bytes", "truncated"})
     if value["trust"] != "untrusted_sample_derived_data" or not isinstance(value["text"], str):
@@ -188,7 +226,8 @@ def approved_excerpt(value):
 
 def project(reply, name, arguments, include, rules=None):
     required = {"tool", "artifact", "artifact_bytes", "summary"}
-    if include and name != "artifact_summary":
+    # Import names are the granted result itself, so they cross as validated rows, not an excerpt.
+    if include and name not in ("artifact_summary", "artifact_imports"):
         required.add("evidence_excerpt")
     object_fields(reply, required)
     if reply["tool"] != name or reply["artifact"] != arguments["artifact"]:
@@ -202,6 +241,10 @@ def project(reply, name, arguments, include, rules=None):
         summary = yara_page(summary, arguments["limit"], rules)
     elif name == "capa_triage":
         summary = capa_page(summary, arguments["limit"])
+    elif name == "artifact_imports":
+        if not include:
+            raise invalid()
+        summary = imports_page(summary, arguments["limit"])
     elif name in policy.PAGED:
         summary = page(name, summary, arguments["limit"])
     else:

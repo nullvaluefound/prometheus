@@ -18,6 +18,7 @@ CLAIM_LIMIT = 2000
 EVIDENCE_LIMIT = 16
 EVIDENCE_TEXT_LIMIT = 500
 KINDS = ("observed", "inferred", "corroborated", "unknown")
+FINDING_ID = r"F[0-9]{4,}"
 # Common file extensions that are also TLDs. Bare names ending in these stay readable.
 FILE_TLDS = {"md", "py", "sh", "ps", "so", "rs", "cs", "rb"}
 # Bare dotted names are defanged only for ccTLD-length or well-known abused TLDs, not os.path or self.root.
@@ -324,7 +325,10 @@ def report(root, case, image=None, yara_rules=None):
     result = verify(root, case)
     if not result["ok"]:
         raise ValueError("Integrity verification failed; repair or document it before reporting")
-    artifacts, findings = case["artifacts"], case["findings"]
+    artifacts = case["artifacts"]
+    # The ledger is append-only. A superseded finding stays listed but no longer counts as current.
+    replaced = superseded(case["findings"])
+    findings = [finding for finding in case["findings"] if finding["id"] not in replaced]
     ledger = hashlib.sha256((root / "case.json").read_bytes()).hexdigest()
     lines = ["# " + defang(case["title"]), "",
              "Static analysis report scaffold. Quoted text is untrusted sample-derived evidence and is defanged.", "",
@@ -355,7 +359,7 @@ def report(root, case, image=None, yara_rules=None):
     cited = {digest for finding in findings for digest in finding["artifacts"]}
     covered = [digest for digest in artifacts if digest in cited]
     uncovered = [digest for digest in artifacts if digest not in cited]
-    lines.extend(["## Coverage", "", f"- {len(covered)} of {len(artifacts)} artifacts are cited by findings"])
+    lines.extend(["## Coverage", "", f"- {len(covered)} of {len(artifacts)} artifacts are cited by current findings"])
     lines.extend(f"  - With findings `{digest}`" for digest in covered)
     lines.extend(f"  - Without findings `{digest}`" for digest in uncovered)
     lines.extend(f"- Partial or unknown completeness `{digest}`" for digest in partial)
@@ -371,6 +375,13 @@ def report(root, case, image=None, yara_rules=None):
             lines.append("")
     if not any(finding["kind"] != "unknown" for finding in findings):
         lines.extend(["Analysis findings remain to be recorded.", ""])
+    old = [finding for finding in case["findings"] if finding["id"] in replaced]
+    if old:
+        lines.extend(["### Superseded", "", "Retained for the record. These findings are not current.", ""])
+        for finding in old:
+            lines.append(f"- ~~{finding['id']}~~ Superseded by {replaced[finding['id']]}")
+            lines.extend("  " + line for line in finding_lines(finding))
+        lines.append("")
     lines.extend(["## Unknowns", ""])
     unknown = [line for finding in findings if finding["kind"] == "unknown" for line in finding_lines(finding)]
     lines.extend(unknown or ["No unknowns are recorded."])
@@ -383,13 +394,22 @@ def report(root, case, image=None, yara_rules=None):
                   "", "## Ledger verification", "",
                   f"- Passed: {result['checked']} artifacts checked, {len(result['problems'])} problems",
                   f"- case.json SHA-256 `{ledger}`", "- Evidence record evidence.json", ""])
-    atomic_text(root / "report.md", "\n".join(lines))
+    text = "\n".join(lines)
+    atomic_text(root / "report.md", text)
     atomic_json(root / "evidence.json", case)
-    return dict(report=str(root / "report.md"), evidence=str(root / "evidence.json"), case_sha256=ledger)
+    return dict(report=str(root / "report.md"), evidence=str(root / "evidence.json"), case_sha256=ledger,
+                report_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest())
+
+
+def superseded(findings):
+    """Map each superseded finding ID to the ID of the finding that replaced it."""
+    return {finding["supersedes"]: finding["id"] for finding in findings if finding.get("supersedes")}
 
 
 def finding_lines(finding):
     yield f"- {finding['id']} [{finding['confidence']}] " + defang(finding["claim"])
+    if finding.get("supersedes"):
+        yield "  - Supersedes " + defang(finding["supersedes"])
     yield "  - Artifacts " + ", ".join(f"`{digest}`" for digest in finding["artifacts"])
     yield "  - Recorded " + defang(finding["created_utc"])
     yield from ("  - Evidence " + defang(value) for value in finding["evidence"])
@@ -411,9 +431,22 @@ def record_finding(case, args):
             len(value) > EVIDENCE_TEXT_LIMIT for value in evidence):
         raise ValueError(f"Finding exceeds {CLAIM_LIMIT} claim characters or "
                          f"{EVIDENCE_LIMIT} evidence items of {EVIDENCE_TEXT_LIMIT} characters")
-    result = dict(id="F" + str(len(case["findings"]) + 1).zfill(4), created_utc=now(),
+    identifier = "F" + str(len(case["findings"]) + 1).zfill(4)
+    target = getattr(args, "supersedes", None)
+    if target is not None:
+        if not isinstance(target, str) or not re.fullmatch(FINDING_ID, target):
+            raise ValueError("--supersedes must be a finding ID such as F0001")
+        if target == identifier:
+            raise ValueError("A finding cannot supersede itself")
+        if target not in {finding["id"] for finding in case["findings"]}:
+            raise ValueError("Unknown finding ID for --supersedes")
+        if target in superseded(case["findings"]):
+            raise ValueError("Finding " + target + " is already superseded")
+    result = dict(id=identifier, created_utc=now(),
                   artifacts=list(dict.fromkeys(args.artifact)), kind=args.kind, confidence=args.confidence,
                   claim=claim, evidence=evidence)
+    if target is not None:
+        result["supersedes"] = target
     case["findings"].append(result)
     return result
 
@@ -440,6 +473,7 @@ def parser():
             child.add_argument("--confidence", choices=("low", "medium", "high"), required=True)
             child.add_argument("--claim", required=True)
             child.add_argument("--evidence", action="append", required=True)
+            child.add_argument("--supersedes", type=pattern(FINDING_ID, "expected a finding ID such as F0001"))
         elif name == "report":
             child.add_argument("--image", type=pattern(r"sha256:[0-9a-f]{64}", "expected sha256:<64 hex>"))
             child.add_argument("--yara-rules-sha256", type=pattern(r"[0-9a-f]{64}", "expected 64 lowercase hex"))

@@ -9,8 +9,9 @@ from . import policy, runtime, server
 ROLES = {
     "intake": {"artifact_summary", "artifact_strings", "yara_scan", "capa_triage"},
     "native": set(policy.TOOLS),
-    "evidence": {"artifact_summary", "artifact_strings", "ghidra_functions", "ghidra_xrefs", "yara_scan", "capa_triage"},
-    "review": {"artifact_summary", "ghidra_functions", "ghidra_xrefs", "yara_scan", "capa_triage"},
+    "evidence": {"artifact_summary", "artifact_strings", "artifact_imports", "ghidra_functions", "ghidra_xrefs",
+                 "yara_scan", "capa_triage"},
+    "review": {"artifact_summary", "artifact_imports", "ghidra_functions", "ghidra_xrefs", "yara_scan", "capa_triage"},
 }
 MAX_TURNS = 8
 MAX_MODEL_RESPONSE = 128 * 1024

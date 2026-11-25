@@ -31,7 +31,7 @@ def check_mcp(state, case_id, digest):
     child = subprocess.run([sys.executable, "-m", "re_harness.cli", "serve", case_id], cwd=runtime.ROOT,
                            input=lines, text=True, capture_output=True, env=env, timeout=195, check=True)
     initial, tools, result = (json.loads(line)["result"] for line in child.stdout.splitlines())
-    assert initial["protocolVersion"] == "2025-11-25" and len(tools["tools"]) == 9
+    assert initial["protocolVersion"] == "2025-11-25" and len(tools["tools"]) == 10
     assert not result["isError"], result
 
 
@@ -88,6 +88,39 @@ def check_forge(state, case_id, digest, broker):
             thread.join(timeout=10)
     path.unlink(missing_ok=True)
     print("Verified the Forge landing page, a browser inspection, an audited browser pause and refusal after pause.")
+
+
+def operator(state, *argv):
+    parser, handlers = cli.make_parser()
+    args = parser.parse_args(argv)
+    with patch.object(cli, "STATE", state):
+        handlers[args.command](args)
+
+
+def check_imports(state, case_id, digest, broker):
+    assert broker.call({"name": "artifact_imports", "arguments": {"artifact": digest}})["isError"]
+    operator(state, "grant", case_id, "artifact_imports", digest, "--audience", "mcp", "--minutes", "5")
+    imports = broker.call({"name": "artifact_imports", "arguments": {"artifact": digest}})
+    assert not imports["isError"], imports
+    rows = json.loads(imports["content"][0]["text"])["summary"]["rows"]
+    assert any(row["kind"] == "elf_needed" and row["name"].startswith("libc.so") for row in rows), rows
+    print("Verified import names are withheld until an operator grant releases them.")
+
+
+def check_close(state, case_id, digest, broker):
+    operator(state, "close", case_id)
+    _, closed = runtime.load_case(state, case_id, allow_closed=True)
+    assert closed["closed"] and not closed["grants"]
+    assert json.loads(cli.call_worker(closed, ["case", "verify"]))["ok"]
+    for argv in (("resume", case_id), ("grant", case_id, "artifact_strings", digest)):
+        try:
+            operator(state, *argv)
+        except runtime.RuntimeFailure as error:
+            assert "closed" in str(error)
+        else:
+            raise AssertionError(argv)
+    assert broker.call({"name": "artifact_summary", "arguments": {"artifact": digest}})["isError"]
+    print("Verified an irreversible close that keeps verify and refuses changes.")
 
 
 def execute(model=None, port=11434):
@@ -148,7 +181,9 @@ def execute(model=None, port=11434):
                 assert any(event.get("audience") == "local" and event.get("tool") == "artifact_summary" and
                            event["decision"] == "completed" for event in events)
                 print("Verified one completed, audited tool call from the local model.")
+            check_imports(state, case_id, digest, broker)
             check_forge(state, case_id, digest, broker)
+            check_close(state, case_id, digest, broker)
         finally:
             scope = runtime.case_path(state, case_id) / "scope.json"
             if scope.exists():

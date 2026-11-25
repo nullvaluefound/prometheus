@@ -44,7 +44,7 @@ python -m re_harness.cli inspect case-001 capa_triage $sha --full --output 'C:\R
 
 Compare manifests by exact release and actual artifacts. Capture partial transfers and conditional alternatives distinctly. Carry out any live collection under the case's authorization in a separate acquisition environment. There is no network acquisition operation in this workspace.
 
-## Capture evidence and close
+## Capture evidence and report
 
 ```powershell
 python -m re_harness.cli inspect case-001 ghidra_decompile $sha --address 0x401000 --full --output 'C:\Restricted\function.json'
@@ -57,7 +57,24 @@ python -m re_harness.cli export case-001 evidence.json 'C:\Restricted\evidence.j
 
 `inspect --full` writes the bounded structured provider response to the operator's chosen local path and prints its SHA-256. Cite that path and hash in findings if retained. Export only to a restricted directory. Use the artifact SHA-256 to export its verified bytes under an inert `.bin` extension. Use `<sha256>.triage.json` to export persisted triage. `report` creates an editable scaffold and an evidence JSON record that name the case image and imported YARA rules SHA-256. `--claim` accepts up to 2000 characters and `--evidence` up to 16 entries of 500 characters. `--source` and `--relation` take plain labels of up to 160 characters without URLs. Review defanging and secret handling before distribution.
 
+The ledger is append-only. To correct or withdraw a finding, record its replacement with `--supersedes F0001`. The new finding records the ID it replaces. The target must exist and must not already be superseded. The report keeps superseded findings in a struck-through **Superseded** subsection that names the replacement, and Coverage counts only current findings.
+
+```powershell
+python -m re_harness.cli finding case-001 --artifact $sha --kind observed --confidence high --claim 'Configuration selects the beta channel' --evidence 'Offset 0x5120 in native capture' --supersedes F0001
+```
+
 Record observed, inferred, corroborated and unknown findings with evidence locators and confidence. Report analyzed artifact coverage, exact versus rolling variants, unresolved conditionals, unavailable files and static limitations. Include pertinent file and process behavior and defensive indicators. Use hashes, transfer details and access-controlled configuration when needed for handoff.
+
+## Close a case
+
+```powershell
+python -m re_harness.cli close case-001
+python -m re_harness.cli export case-001 report.md 'C:\Restricted\closed-report.md'
+```
+
+`close CASE` runs only from the operator CLI. Under the operator lock it verifies the ledger and refuses to close if verification fails. It then generates the report with the case image and YARA rules SHA-256, records `closed` and `closed_utc` in `scope.json`, retires every grant and audits `case_closed` with the report and `case.json` SHA-256 and the retired grant IDs. Closure is irreversible. There is no reopen. Use a new case ID for further work.
+
+The evidence volume is retained. A closed case refuses broker and Forge tool calls, `ask`, `serve`, `hookup`, `ingest`, `derive`, `triage`, `finding`, `report`, `inspect`, `grant`, `revoke`, `pause`, `resume`, `yara-rules` and `init` with `Case is closed`. Broker refusals are audited with the reason `case_closed`. `status`, `verify`, `export`, `cases` and `grants` keep working, and the Forge shows the case page read-only.
 
 ## Pause and recover
 
@@ -68,6 +85,6 @@ python -m re_harness.cli cases
 python -m re_harness.cli grants case-001
 ```
 
-`cases` lists each case's ID, paused and initialized state, image ID and imported YARA rules SHA-256 without changing scope. `grants CASE` lists active grants with their ID, tool, artifact, selector, audience and UTC expiry. It removes expired grants from `scope.json` and audits the removal.
+`cases` lists each case's ID, paused, initialized and closed state, image ID and imported YARA rules SHA-256 without changing scope. `grants CASE` lists active grants with their ID, tool, artifact, selector, audience and UTC expiry. It removes expired grants from `scope.json` and audits the removal.
 
 After an interrupted operator command, establish whether its container still exists and whether a mutation already completed before retrying. An interrupted `init` can be rerun. An initialized case with a missing volume is an integrity incident. Restore its original evidence from trusted retention or use a new case ID. If a lock remains, check that its recorded process is gone and that the corresponding Docker worker stopped before removing only that exact lock. Avoid prune, volume removal and factory reset during recovery of an evidence case.

@@ -136,6 +136,22 @@ class CaseRecordTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(runtime.RuntimeFailure):
                 self.load(**changes)
 
+    def test_closed_case_needs_explicit_allowance(self):
+        closed = {"closed": True, "closed_utc": "2026-11-25T10:00:00+00:00"}
+        with self.assertRaisesRegex(runtime.RuntimeFailure, "Case is closed"):
+            self.load(**closed)
+        record = runtime.load_case(self.state, "fixture", allow_closed=True)[1]
+        self.assertTrue(runtime.closed(record))
+        self.assertFalse(runtime.closed(self.load()[1]))
+        for changes in ({"closed": False}, {"closed": "true"}, {"closed": 1}, {"closed": True},
+                        {"closed_utc": closed["closed_utc"]}, {"closed": False, "closed_utc": closed["closed_utc"]},
+                        {**closed, "closed_utc": "yesterday"}, {**closed, "closed_utc": "2026-11-25T10:00:00"},
+                        {**closed, "closed_utc": 1}, {**closed, "initialized": False},
+                        {**closed, "grants": [{"id": "1" * 32}]}):
+            with self.subTest(changes=changes), self.assertRaisesRegex(runtime.RuntimeFailure, "closure"):
+                case.atomic_json(self.folder / "scope.json", {**self.scope, **changes})
+                runtime.load_case(self.state, "fixture", allow_pending=True, allow_closed=True)
+
     def test_pending_case_needs_explicit_allowance(self):
         case.atomic_json(self.folder / "scope.json", {**self.scope, "initialized": False})
         self.assertFalse(runtime.load_case(self.state, "fixture", allow_pending=True)[1]["initialized"])

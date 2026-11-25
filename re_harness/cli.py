@@ -23,6 +23,9 @@ MAX_CLAIM = 2000
 MAX_EVIDENCE = 16
 MAX_EVIDENCE_TEXT = 500
 MAX_GRANTS = 128
+FINDING_ID = r"F[0-9]{4,}"
+# A closed case keeps these read-only operator commands. Everything else is refused by load_case.
+CLOSED_READS = ("status", "verify", "export")
 
 
 def emit(value):
@@ -37,6 +40,12 @@ def bounded_text(limit, pattern=None):
             raise argparse.ArgumentTypeError("use a short sanitized label without credentials or URLs")
         return value
     return parse
+
+
+def finding_id(value):
+    if not re.fullmatch(FINDING_ID, value) or len(value) > 16:
+        raise argparse.ArgumentTypeError("expected a finding ID such as F0001")
+    return value
 
 
 class AppendBounded(argparse.Action):
@@ -150,11 +159,12 @@ def list_cases(_args):
         if not folder.is_dir() or not policy.match(folder.name, policy.CASE_ID):
             continue
         try:
-            _, record = runtime.load_case(STATE, folder.name, allow_pending=True)
+            _, record = runtime.load_case(STATE, folder.name, allow_pending=True, allow_closed=True)
         except (OSError, ValueError, KeyError, RuntimeError):
             rows.append({"case": folder.name, "error": "Unreadable or invalid case scope record"})
             continue
         rows.append({"case": folder.name, "paused": record["paused"], "initialized": record["initialized"],
+                     "closed": runtime.closed(record),
                      "image": record["image"], "yara_rules_sha256": record.get("yara_rules", {}).get("sha256")})
     emit({"cases": rows})
 
@@ -162,7 +172,7 @@ def list_cases(_args):
 def list_grants(args):
     folder = runtime.case_path(STATE, args.case)
     with runtime.operator_lock(folder):
-        _, record = runtime.load_case(STATE, args.case)
+        _, record = runtime.load_case(STATE, args.case, allow_closed=True)
         active, expired = split_grants(record)
         if expired:
             record["grants"] = active
@@ -203,7 +213,7 @@ def operator_options(args):
     opts = []
     sources = {"source": "--source", "parent": "--parent", "relation": "--relation",
                "completeness": "--completeness", "kind": "--kind", "confidence": "--confidence",
-               "claim": "--claim"}
+               "claim": "--claim", "supersedes": "--supersedes"}
     for field, flag in sources.items():
         value = getattr(args, field, None)
         if value is not None:
@@ -291,7 +301,7 @@ def run_operation(args, record, options):
 def operator_action(args):
     folder = runtime.case_path(STATE, args.case)
     with runtime.operator_lock(folder):
-        _, record = runtime.load_case(STATE, args.case)
+        _, record = runtime.load_case(STATE, args.case, allow_closed=args.command in CLOSED_READS)
         event = {"case": args.case, "operation": args.command}
         options = None
         if args.command == "inspect":
@@ -309,6 +319,40 @@ def operator_action(args):
             raise
         runtime.audit(folder, decision="operator_completed", **event, **outcome)
     print(response.decode("utf-8").strip())
+
+
+def close_case(args):
+    """Verify, report and irreversibly close a case. The evidence volume is retained."""
+    folder = runtime.case_path(STATE, args.case)
+    with runtime.operator_lock(folder):
+        _, record = runtime.load_case(STATE, args.case)
+        event = {"case": args.case, "operation": "close"}
+        runtime.audit(folder, decision="operator_requested", **event)
+        reason = "verify_failed"
+        try:
+            try:
+                verified = server.strict_json(call_worker(record, ["case", "verify"], diagnostics=True,
+                                                          cap=4 * 1024 * 1024))
+            except (ValueError, runtime.RuntimeFailure) as error:
+                raise runtime.RuntimeFailure("Ledger verification failed. The case stays open") from error
+            if not isinstance(verified, dict) or verified.get("ok") is not True:
+                raise runtime.RuntimeFailure("Ledger verification failed. The case stays open")
+            reason = "report_failed"
+            reported = server.strict_json(call_worker(record, ["case", "report", *report_options(record)],
+                                                      writable=True, diagnostics=True, cap=4 * 1024 * 1024))
+        except BaseException as error:
+            reason = "interrupted" if isinstance(error, KeyboardInterrupt) else reason
+            runtime.audit(folder, decision="operator_failed", reason=reason, **event)
+            raise
+        retired = [grant["id"] for grant in record["grants"]]
+        record.update(grants=[], closed=True, closed_utc=dt.datetime.now(dt.timezone.utc).isoformat())
+        outcome = {"retired_grants": retired, "closed_utc": record["closed_utc"]}
+        for key in ("report_sha256", "case_sha256"):
+            if isinstance(reported, dict) and policy.match(reported.get(key), policy.DIGEST):
+                outcome[key] = reported[key]
+        runtime.audit(folder, decision="case_closed", **event, **outcome)
+        atomic_json(folder / "scope.json", record)
+    emit({**event, "decision": "case_closed", **outcome})
 
 
 def snapshot(args):
@@ -403,6 +447,8 @@ def make_parser():
     finding.add_argument("--claim", required=True, type=bounded_text(MAX_CLAIM))
     finding.add_argument("--evidence", action=AppendBounded, required=True, type=bounded_text(MAX_EVIDENCE_TEXT),
                          help=f"Evidence locator, repeatable up to {MAX_EVIDENCE} times")
+    finding.add_argument("--supersedes", type=finding_id,
+                         help="Current finding ID, such as F0001, that this finding replaces")
     rules = command("yara-rules", import_yara_rules)
     rules.add_argument("input", type=Path, help="Reviewed YARA rule source, at most 1 MiB, without includes")
     export = command("export", operator_action)
@@ -423,6 +469,7 @@ def make_parser():
     command("revoke", change_scope).add_argument("grant")
     command("grants", list_grants)
     command("cases", list_cases, False)
+    command("close", close_case)
     for name in ("pause", "resume"):
         command(name, change_scope)
     command("hookup", hookup).add_argument("--format", choices=("codex", "json"), default="codex")

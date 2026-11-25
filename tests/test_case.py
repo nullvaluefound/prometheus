@@ -129,7 +129,7 @@ class LedgerTests(unittest.TestCase):
         record = self.ledger()["artifacts"][parent]
         for value in (record["hashes"]["md5"], record["hashes"]["sha1"], "- Format hint ELF",
                       "- Format hint not triaged", f"  - Parent `{parent}`, carved",
-                      "- 1 of 2 artifacts are cited by findings", f"  - With findings `{parent}`",
+                      "- 1 of 2 artifacts are cited by current findings", f"  - With findings `{parent}`",
                       f"  - Without findings `{child}`", f"- Partial or unknown completeness `{child}`",
                       "### Observed", "hxxp://c2[.]example[.]com/gate", "10[.]1[.]2[.]3",
                       f"`{parent}`: String scan truncated at 0 strings", "- Passed: 2 artifacts checked, 0 problems",
@@ -141,6 +141,51 @@ class LedgerTests(unittest.TestCase):
         self.assertIn("  - Recorded " + self.ledger()["findings"][1]["created_utc"], unknowns)
         self.assertEqual(json.loads((self.root / "evidence.json").read_text(encoding="utf-8")), self.ledger())
         self.assertEqual(result["case_sha256"], hashlib.sha256((self.root / "case.json").read_bytes()).hexdigest())
+        self.assertEqual(result["report_sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertNotIn("### Superseded", text)
+
+    def test_supersedes_is_append_only_and_validated(self):
+        digest = self.ingest(b"superseded bytes")[1]["sha256"]
+        base = ["--artifact", digest, "--kind", "inferred", "--confidence", "low", "--evidence", "e"]
+        self.run_case("finding", *base, "--claim", "Original")
+        for target, message in (("F0009", "Unknown finding"), ("F0002", "itself")):
+            code, _, err = self.run_case("finding", *base, "--claim", "x", "--supersedes", target)
+            self.assertEqual(code, 2)
+            self.assertIn(message, err)
+        for target in ("F1", "f0001", "F0001x", "0001", "F-001"):
+            with self.subTest(target=target):
+                self.assertEqual(self.run_case("finding", *base, "--claim", "x", "--supersedes", target)[0], 2)
+        code, second, _ = self.run_case("finding", *base, "--claim", "Revised", "--supersedes", "F0001")
+        self.assertEqual((code, second["id"], second["supersedes"]), (0, "F0002", "F0001"))
+        code, _, err = self.run_case("finding", *base, "--claim", "Again", "--supersedes", "F0001")
+        self.assertIn("already superseded", err)
+        findings = self.ledger()["findings"]
+        self.assertEqual([(item["id"], item.get("supersedes")) for item in findings], [("F0001", None), ("F0002", "F0001")])
+        self.assertEqual(findings[0]["claim"], "Original")
+        args = type("Args", (), dict(artifact=[digest], kind="observed", confidence="low", claim="c", evidence=["e"]))
+        for target, message in (("F0003", "itself"), ("F12", "finding ID"), ("F0001", "already superseded")):
+            args.supersedes = target
+            with self.subTest(target=target), self.assertRaisesRegex(ValueError, message):
+                case.record_finding({"findings": findings, "artifacts": {digest: {}}}, args)
+
+    def test_report_lists_superseded_findings_apart_from_coverage(self):
+        first = self.ingest(b"first artifact")[1]["sha256"]
+        second = self.ingest(b"second artifact", name="second.bin")[1]["sha256"]
+        self.run_case("finding", "--artifact", first, "--kind", "observed", "--confidence", "high",
+                      "--claim", "Old claim", "--evidence", "offset 0x10")
+        self.run_case("finding", "--artifact", second, "--kind", "observed", "--confidence", "medium",
+                      "--claim", "New claim", "--evidence", "offset 0x20", "--supersedes", "F0001")
+        self.assertEqual(self.run_case("report")[0], 0)
+        text = (self.root / "report.md").read_text(encoding="utf-8")
+        self.assertIn("- 1 of 2 artifacts are cited by current findings", text)
+        self.assertIn(f"  - Without findings `{first}`", text)
+        current = text.split("### Observed")[1].split("### Superseded")[0]
+        self.assertIn("F0002 [medium] New claim", current)
+        self.assertIn("  - Supersedes F0001", current)
+        self.assertNotIn("Old claim", current)
+        old = text.split("### Superseded")[1].split("## Unknowns")[0]
+        self.assertIn("- ~~F0001~~ Superseded by F0002", old)
+        self.assertIn("Old claim", old)
 
     def test_report_without_toolchain_or_findings(self):
         self.ingest(b"lonely")
@@ -149,7 +194,7 @@ class LedgerTests(unittest.TestCase):
         self.assertIn("- Worker image not recorded", text)
         self.assertIn("Analysis findings remain to be recorded.", text)
         self.assertIn("No unknowns are recorded.", text)
-        self.assertIn("- 0 of 1 artifacts are cited by findings", text)
+        self.assertIn("- 0 of 1 artifacts are cited by current findings", text)
 
 
 class TriageTests(unittest.TestCase):
