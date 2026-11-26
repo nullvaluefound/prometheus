@@ -28,6 +28,10 @@ MAX_HISTORY = 40
 FALLBACK_MODELS = {"claude-fable-5-2", "claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
 PRIVATE_SUFFIXES = (".local", ".lan", ".home.arpa", ".internal", ".localhost")
 STORE_LOCK = threading.Lock()
+RECORD_NUDGE = ("Before you finish: you received tool results but recorded no facts. Call record_observation for each "
+                "useful result, citing its evidence_id, and propose_finding if the facts answer the question. Then "
+                "give your answer.")
+RECORDERS = frozenset({"record_observation", "propose_finding"})
 WRAPUP = ("This turn's tool budget is spent, so no further tool calls will run. Without calling tools, write a short "
           "wrap-up for the operator: what you learned, citing SHA-256 values and addresses; the open leads; and which "
           "grant or evidence would help next.")
@@ -399,8 +403,12 @@ class Plan:
     metrics holds the session id, broker calls, tokens, audience and grants.
     """
 
-    def __init__(self, purpose="chat", allowed=None, role_body=None, extra=None, context=(), interrupt=None):
+    def __init__(self, purpose="chat", allowed=None, role_body=None, extra=None, context=(), interrupt=None,
+                 require_record=False):
         self.purpose, self.allowed, self.role_body, self.extra = purpose, allowed, role_body, extra or {}
+        # Small models often answer without recording what they saw. With require_record, a session that got sample
+        # tool results but recorded nothing is asked once to record before its answer counts.
+        self.require_record = require_record
         self.context, self.interrupt, self.metrics = set(context), interrupt, {}
         self.broker = self.adapter = None  # set by converse, so a stop check can see the live session
 
@@ -567,13 +575,23 @@ def converse(state, case_id, config, settings, history, message, operator, plan=
     runtime.audit(broker.folder, case=case_id, session=broker.session, decision="forge_chat_started", role=role,
                   provider=config["provider"], cloud=cloud, operator=operator, via="forge", purpose=plan.purpose)
     stop = None
+    analyzed = recorded = nudged = False
     try:
-        for _ in range(MAX_TURNS):
+        for index in range(MAX_TURNS):
             broker.current_scope()
             stop = plan.interrupt() if plan.interrupt else None
             if stop:
                 break
             text, calls = adapter.step()
+            # Only with a turn left to record in: on the last turn the nudge would meet the tool-free wrap-up.
+            if (not calls and plan.require_record and analyzed and not recorded and not nudged
+                    and index < MAX_TURNS - 1):
+                nudged = True
+                rows.append({"role": "assistant", "text": text or "(no answer)", "model": config["model"]})
+                runtime.audit(broker.folder, case=case_id, session=broker.session, decision="record_nudged",
+                              purpose=plan.purpose, via="forge")
+                adapter.user(RECORD_NUDGE)
+                continue
             if not calls:
                 return finish(text or "(no answer)")
             if text:
@@ -588,6 +606,9 @@ def converse(state, case_id, config, settings, history, message, operator, plan=
                     model_text = boundary.for_model(shown, True, name, role)
                 else:
                     shown, call["error"], model_text, extra = turn.dispatch(name, call.get("arguments"))
+                    if not call["error"]:
+                        analyzed = analyzed or name in policy.TOOLS
+                        recorded = recorded or name in RECORDERS
                 pairs.append((call, model_text))
                 rows.append(tool_row(call["safe_name"], shown, call["error"], extra.get("request")))
             adapter.results(pairs)

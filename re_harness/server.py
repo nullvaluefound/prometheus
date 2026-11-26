@@ -154,6 +154,8 @@ class Broker:
             if code:
                 raise runtime.RuntimeFailure("offline_worker_failed")
             reply = projection.project(strict_json(raw), name, arguments, include, request.get("rules"))
+            if name == "artifact_summary":
+                reply = projection.derived(reply)
             scope = self.current_scope()
             if name == "yara_scan" and runtime.yara_rules(scope) != request["rules"]:
                 raise policy.Denied("yara_rules_changed")

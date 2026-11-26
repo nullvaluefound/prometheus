@@ -87,37 +87,88 @@ def shown_by_call(entry):
     return set()
 
 
-def check(case_folder, candidate, admitted):
-    """Return {result: passed | failed | not_assessed, problems: [{code, ref}], utc}. Problems hold ids, not text."""
-    problems = []
-    try:
-        manifest = admitted()
-    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
-        return {"result": "not_assessed", "problems": [{"code": "manifest_unreadable", "ref": None}], "utc": now()}
-    for digest in candidate.get("artifacts") or []:
-        if digest not in manifest:
-            problems.append({"code": "artifact_not_admitted", "ref": digest})
-    cited, seen = [], set()
-    for evidence_id in candidate.get("evidence") or []:
+def source_of(entry):
+    """Where one evidence entry's content came from, decided by the Forge from the entry, never by the model.
+
+    An entry that released an excerpt holds text the sample's author controls: string text, import, section and
+    symbol names, YARA-matched bytes, decompiled code with its literals. ARTEX calls this target_response and never
+    lets it prove a goal alone. Everything else is a tool's own result (tool_output): header numbers, capa verdicts,
+    Ghidra's function addresses and cross-references.
+    """
+    return "sample_content" if entry.get("excerpt") else "tool_output"
+
+
+def subject(entry):
+    """The artifact an evidence entry is about: every sample tool takes exactly one."""
+    arguments = entry.get("arguments") if isinstance(entry.get("arguments"), dict) else {}
+    return arguments.get("artifact") if isinstance(arguments.get("artifact"), str) else None
+
+
+def references(case_folder, text, evidence_ids, manifest, artifacts=()):
+    """Check a text against the evidence it cites. Returns (problems, cited ids, sources, grounded).
+
+    With artifacts, evidence about another artifact is a problem and shows nothing: a claim rests only on results
+    about what it names. grounded is True when a tool's own result is among the evidence and every address in the
+    text is shown by one (an address only sample content shows rests on sample content).
+    """
+    problems, cited, seen, by_tool, sources = [], [], set(), set(), set()
+    about = set(artifacts)
+    for evidence_id in evidence_ids:
         try:
             entry = evidence.load(case_folder, evidence_id)
         except evidence.EvidenceError as error:
             problems.append({"code": str(error), "ref": evidence_id})
             continue
         cited.append(evidence_id)
-        numbers(entry.get("reply"), seen)
-        seen |= shown_by_call(entry)
-    claim = candidate.get("claim") or ""
-    named = addresses(claim)
-    for token in sorted(named):
+        if about and subject(entry) not in about:
+            problems.append({"code": "evidence_other_artifact", "ref": evidence_id})
+            continue
+        source = source_of(entry)
+        sources.add(source)
+        shown = numbers(entry.get("reply"), set()) | shown_by_call(entry)
+        seen |= shown
+        if source == "tool_output":
+            by_tool |= shown
+    named = []
+    for token in sorted(addresses(text or "")):
         if policy.match(token, policy.DIGEST):
             if token not in manifest and token not in cited:
                 problems.append({"code": "claim_names_unadmitted_sha256", "ref": token})
-        elif token not in seen:
+            continue
+        named.append(token)
+        if token not in seen:
             problems.append({"code": "address_not_in_evidence", "ref": token})
+    grounded = "tool_output" in sources and all(token in by_tool for token in named)
+    return problems, cited, sorted(sources), grounded
+
+
+def grounded(case_folder, candidate):
+    """Whether a candidate's claim rests on a tool's own result about its artifacts (see references)."""
+    return references(case_folder, candidate.get("claim") or "", candidate.get("evidence") or [], frozenset(),
+                      candidate.get("artifacts") or [])[3]
+
+
+def check(case_folder, candidate, admitted):
+    """Return {result: passed | failed | not_assessed, problems: [{code, ref}], sources, grounded, utc}.
+
+    No text in problems. sources says where the evidence about the claim's artifacts came from: tool_output,
+    sample_content, both, or neither. grounded says whether the claim rests on a tool's own result (references).
+    """
+    try:
+        manifest = admitted()
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return {"result": "not_assessed", "problems": [{"code": "manifest_unreadable", "ref": None}], "sources": [],
+                "grounded": False, "utc": now()}
+    problems = [{"code": "artifact_not_admitted", "ref": digest} for digest in candidate.get("artifacts") or []
+                if digest not in manifest]
+    found, cited, sources, grounded_ = references(case_folder, candidate.get("claim") or "",
+                                                  candidate.get("evidence") or [], manifest,
+                                                  candidate.get("artifacts") or [])
+    problems += found
     if candidate.get("kind") in ("observed", "corroborated") and not cited:
         problems.append({"code": "observed_without_evidence", "ref": None})
-    return {"result": "failed" if problems else "passed", "problems": problems[:32], "utc": now()}
+    return {"result": "failed" if problems else "passed", "problems": problems[:32], "sources": sources,
+            "grounded": grounded_, "utc": now()}
 
 
 def brief(candidate):

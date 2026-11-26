@@ -60,6 +60,23 @@ GUIDANCE = {
     "not_requestable": "This call cannot be requested. Carry on without this excerpt.",
     "invalid_note": "Send note_grant_need with exactly a request id and a short reason.",
     "invalid_reason": "Give a short, non-empty reason.",
+    "duplicate_proposal": "You already proposed exactly this, with the same evidence. If its check failed, fix the "
+                          "listed problem (the claim, its evidence or its observations) instead of proposing it "
+                          "again.",
+    "answer_needs_tool_output": "No cited proposal rests on a tool's own result. Content the sample's author controls "
+                                "(string text, import and symbol names, matched bytes, decompiled code) never "
+                                "answers alone. Cite a proposal whose evidence includes the header, capa, or "
+                                "Ghidra's function list or cross-references for the same artifact, and whose "
+                                "addresses that result shows.",
+    "too_much_evidence": "A finding can rest on at most 16 evidence ids, counting those your observations bring. "
+                         "Cite fewer: the observations and results that show the claim.",
+    "evidence_other_artifact": "You cited a result about an artifact your text does not name. List that artifact "
+                               "too, or cite results about this one.",
+    "unknown_observation": "No such observation. Use an O id from lead_detail or a record_observation reply.",
+    "address_not_in_evidence": "An address in your text does not appear in the evidence you cited. Write it as the "
+                               "evidence shows it, cite the result that shows it, or record the fact as inferred.",
+    "claim_names_unadmitted_sha256": "Your text names a SHA-256 that is not an admitted artifact. Use the artifact's "
+                                     "exact SHA-256.",
     "too_many_leads_this_round": "That is the most leads one planning round may add. Carry on with the others.",
     "investigation_stopped": "The investigation is no longer running. Stop calling tools and write your wrap-up.",
     "investigation_settling": "The investigation's budget is spent. Stop calling tools and write your wrap-up.",

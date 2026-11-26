@@ -338,13 +338,33 @@ function LeadsPanel({ ctx, data, reload }: { ctx: CaseContext; data: Investigati
   );
 }
 
+/** Where a fact's evidence came from, set by the Forge: a tool's own result, or content the sample's author controls. */
+export function SourceBadge({ sources, grounded }: { sources: string[]; grounded?: boolean }) {
+  if (sources.length === 0) return null;
+  if (sources.includes("tool_output") && grounded === false)
+    return (
+      <Badge tone="warn" title="Some address in this claim is shown only by sample content, so it cannot answer a question">
+        not grounded
+      </Badge>
+    );
+  if (sources.includes("tool_output")) return <Badge tone="muted">tool output</Badge>;
+  if (sources.includes("sample_content"))
+    return (
+      <Badge tone="warn" title="The sample's author controls this content, so it never proves an answer alone">
+        sample content only
+      </Badge>
+    );
+  return <Badge tone="muted">inference</Badge>;
+}
+
 function ObservationList({ caseId, rows }: { caseId: string; rows: Observation[] }) {
   if (rows.length === 0) return null;
   return (
     <ul className="plain observations">
       {rows.slice(-50).map((row) => (
         <li key={txt(row.id)}>
-          <code>{txt(row.id)}</code> <Badge tone={row.kind === "observed" ? "ok" : "muted"}>{txt(row.kind)}</Badge> {txt(row.text)}{" "}
+          <code>{txt(row.id)}</code> <Badge tone={row.kind === "observed" ? "ok" : "muted"}>{txt(row.kind)}</Badge>{" "}
+          <SourceBadge sources={list<string>(row.sources)} /> {txt(row.text)}{" "}
           {list<string>(row.evidence).map((id) => (
             <EvidenceLink key={id} caseId={caseId} id={id} />
           ))}

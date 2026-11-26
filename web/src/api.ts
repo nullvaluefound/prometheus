@@ -235,6 +235,7 @@ export interface Observation extends Authored {
   artifact: string;
   lead: string | null;
   evidence: string[];
+  sources?: ("tool_output" | "sample_content" | "inference")[];
 }
 
 export type CheckResult = "passed" | "failed" | "not_assessed";
@@ -243,6 +244,8 @@ export type Verdict = "supported" | "unsupported" | "insufficient";
 export interface CandidateCheck {
   result: CheckResult;
   problems: { code: string; ref: string | null }[];
+  sources?: ("tool_output" | "sample_content")[];
+  grounded?: boolean;
   utc: string;
 }
 

@@ -48,7 +48,8 @@ The Forge chat (docs/FORGE_API.md) uses the same boundary. In addition:
 
 - A call refused with `operator_excerpt_grant_required` files a grant request for exactly that call, which the operator approves or denies on the case's Rules & grants tab or from the dashboard's *Waiting on you* list. The model can add one short reason with `note_grant_need`.
 - A turn that reaches the turn cap gets one last model step with no tools, and its summary becomes the answer instead of an error.
-- The prompt lists the skills the role may load (`static-malware-re` for every role but review, plus `static-re-native` for native and `static-re-evidence` for evidence and review), and `load_skill` returns one body. Requests for a skill the role cannot load are audited and listed as skill gaps on the Rules page.
+- The prompt lists the skills the role may load, and `load_skill` returns one body (docs/SKILLS.md). Requests for a skill the role cannot load are audited and listed as skill gaps on the Rules page.
+- Investigation leads and the benchmark ask a session once to record its facts if it received tool results but recorded nothing (`record_nudged` in the audit). Small models often answer without recording.
 - Each chat turn and review run records its input and output tokens in the audit, by provider and locality, and the case's Overview tab shows them on its outcome card.
 
 ## Measuring a model
