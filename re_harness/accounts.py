@@ -236,6 +236,12 @@ def issue_session(state, username, epoch, now=None):
     return f"{body}.{b64(mac)}"
 
 
+def session_expiry(token):
+    """The expiry of an already verified session token, as an ISO-8601 UTC string."""
+    claims = json.loads(unb64(token.split(".")[0]))
+    return dt.datetime.fromtimestamp(claims["x"], dt.timezone.utc).isoformat()
+
+
 def session_user(state, token, now=None):
     """Return the username for a valid, unexpired, unrevoked session token, otherwise None."""
     now = now or utcnow()

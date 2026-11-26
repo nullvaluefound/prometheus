@@ -9,11 +9,21 @@ server {
         allow 192.0.2.1;
         deny all;
 
-        client_max_body_size 1k;
+        client_max_body_size 64k;
         proxy_pass http://unix:/run/prometheus-forge/forge.sock:;
         proxy_set_header X-Forge-Operator "";
         proxy_set_header Authorization "";
         proxy_read_timeout 195s;
+
+        # Sample uploads stream to the Forge, which stores them only in the case's offline volume.
+        location ~ ^/prometheus/api/cases/[a-z0-9][a-z0-9-]{0,47}/artifacts$ {
+            client_max_body_size 128m;
+            proxy_request_buffering off;
+            proxy_pass http://unix:/run/prometheus-forge/forge.sock:;
+            proxy_set_header X-Forge-Operator "";
+            proxy_set_header Authorization "";
+            proxy_read_timeout 195s;
+        }
     }
 
     location / { return 404; }

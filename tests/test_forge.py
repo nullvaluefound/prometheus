@@ -1,96 +1,45 @@
-import http.client
 import json
 import os
 from pathlib import Path
-import socket
 import tempfile
-import threading
 import unittest
 from unittest.mock import patch
-from urllib.parse import urlencode
 
-from re_harness import accounts, forge, runtime
+from re_harness import accounts, forge
 from re_harness.case import atomic_json
-
-FORM_TYPE = "application/x-www-form-urlencoded"
-
-
-def write_case(state, case_id, image, paused=False):
-    case_dir = runtime.case_path(state, case_id)
-    case_dir.mkdir(parents=True)
-    atomic_json(case_dir / "scope.json", {"case": case_id, "engine": "linux", "image": image,
-                "volume": "static-re-" + "1" * 32, "paused": paused, "grants": [], "initialized": True})
+from tests.forge_support import FORM_TYPE, ForgeServer
 
 
 @unittest.skipUnless(os.name == "posix", "Forge uses Linux Unix sockets")
-class ForgeTests(unittest.TestCase):
+class ForgeTests(ForgeServer, unittest.TestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.state = state = Path(directory.name)
-        self.digest = "a" * 64
-        image = "sha256:" + self.digest
-        write_case(state, "review", image)
-        write_case(state, "frozen", image, paused=True)
-        write_case(state, "offscope", image)
-        atomic_json(state / "baseline.json", {"engine": "linux", "image": image,
-                    "verification": {"ghidra_mcp": "fixture", "rea": "fixture", "yara": "fixture",
-                                     "capa": "fixture"}})
-        self.path = state / "forge.sock"
-        self.origin = "https://forge.example"
-        self.app = forge.Forge(self.path, self.origin, "/prometheus/", state, {"review", "frozen"})
-        self.addCleanup(self.app.server_close)
-        thread = threading.Thread(target=self.app.serve_forever, daemon=True)
-        thread.start()
-        self.addCleanup(self.app.shutdown)
-        self.form = {"case": "review", "artifact": self.digest}
-        fast = patch.dict(accounts.SCRYPT, {"n": 2 ** 10})
-        fast.start()
-        self.addCleanup(fast.stop)
-        code = accounts.issue_setup(state, "analyst")
-        epoch = accounts.complete_setup(state, "analyst", code, "correct horse battery")
-        self.token = accounts.issue_session(state, "analyst", epoch)
-        self.cookie = ("prometheus_session=" + self.token).encode("ascii")
-        self.operator = {"Cookie": self.cookie.decode("ascii")}
-        self.post_headers = {**self.operator, "Origin": self.origin, "Content-Type": FORM_TYPE}
+        self.start_forge()
 
-    def request(self, method, route, headers=None, form=None):
-        body = urlencode(form).encode("ascii") if form else b""
-        lines = [f"{method} {route} HTTP/1.1", "Host: forge", "Connection: close"]
-        lines += [f"{name}: {value}" for name, value in (headers or {}).items()]
-        if form:
-            lines.append(f"Content-Length: {len(body)}")
-        return self.exchange(("\r\n".join(lines) + "\r\n\r\n").encode("utf-8") + body)
-
-    def raw(self, data):
-        """Send hand-built bytes so header duplication and framing can be tested."""
-        return self.exchange(data)[0]
-
-    def exchange(self, data):
-        # The Forge rejects bad requests before reading their bodies, so a request split across
-        # writes can race the server's close. One write mirrors the buffering NGINX proxy does.
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(4)
-            sock.connect(str(self.path))
-            sock.sendall(data)
-            response = http.client.HTTPResponse(sock)
-            response.begin()
-            return response.status, response.read().decode("utf-8"), dict(response.headers)
-
-    def test_identity_and_rendering(self):
+    def test_app_shell_is_served_only_to_a_session(self):
         status, _, headers = self.request("GET", "/prometheus/")
         self.assertEqual((status, headers["Location"]), (303, "/prometheus/login"))
         status, body, headers = self.request("GET", "/prometheus/", self.operator)
         self.assertEqual(status, 200)
-        for text in ("Prometheus", "Forge", "Apprentices", "review", "Verified"):
-            self.assertIn(text, body)
-        for label in ("Ghidra MCP", "REA", "YARA", "capa"):
-            self.assertIn(f'<li><span>{label}</span><span class="status">Verified</span></li>', body)
-        self.assertNotIn("Awaiting baseline", body)
-        self.assertIn("default-src 'none'", headers["Content-Security-Policy"])
+        self.assertIn('<div id="root">', body)
+        csp = headers["Content-Security-Policy"]
+        for directive in ("default-src 'none'", "script-src 'self'", "connect-src 'self'", "frame-ancestors 'none'"):
+            self.assertIn(directive, csp)
+        self.assertNotIn("unsafe", csp)
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
-        self.assertEqual(self.request("GET", "/prometheus/../forge.py", self.operator)[0], 404)
+        status, body, headers = self.request("GET", "/prometheus/assets/app.js", self.operator)
+        self.assertEqual((status, body), (200, "console.log('forge')"))
+        self.assertTrue(headers["Content-Type"].startswith("text/javascript"))
+        self.assertEqual(self.request("GET", "/prometheus/assets/app.js")[0], 303)
+        for route in ("/prometheus/../forge.py", "/prometheus/assets/../forge.py", "/prometheus/assets/other.js",
+                      "/prometheus/index.html"):
+            with self.subTest(route=route):
+                self.assertEqual(self.request("GET", route, self.operator)[0], 404)
+
+    def test_missing_build_is_reported_not_crashed(self):
+        with patch.object(forge, "WEB", self.state / "absent"):
+            status, body, _ = self.request("GET", "/prometheus/", self.operator)
+        self.assertEqual((status, body), (503, "The Forge web app is not built."))
 
     def test_identity_comes_only_from_a_valid_session(self):
         body, mac = self.token.split(".")
@@ -100,210 +49,28 @@ class ForgeTests(unittest.TestCase):
                         {"Cookie": "other=" + self.token}, {"Cookie": "prometheus_session=\"unterminated"}):
             with self.subTest(headers=headers):
                 self.assertEqual(self.request("GET", "/prometheus/", headers)[0], 303)
+                self.assertEqual(self.request("GET", "/prometheus/api/me", headers)[0], 401)
         duplicated = (b"GET /prometheus/ HTTP/1.1\r\nHost: forge\r\nCookie: " + self.cookie + b"\r\n"
                       b"Cookie: " + self.cookie + b"\r\nConnection: close\r\n\r\n")
         self.assertEqual(self.raw(duplicated), 303)
-        self.assertEqual(self.request("POST", "/prometheus/pause", {"Origin": self.origin, "Content-Type": FORM_TYPE},
-                                      {"case": "review"})[0], 403)
+        self.assertEqual(self.request("POST", "/prometheus/api/cases/review/pause", {"Origin": self.origin})[0], 401)
 
     def test_stylesheet_and_unknown_routes(self):
-        status, body, headers = self.request("GET", "/prometheus/forge.css", self.operator)
+        status, body, headers = self.request("GET", "/prometheus/forge.css")
         self.assertEqual(status, 200)
         self.assertTrue(headers["Content-Type"].startswith("text/css"))
         self.assertEqual(body, (Path(forge.__file__).with_name("forge.css")).read_text(encoding="utf-8"))
-        self.assertEqual(self.request("GET", "/prometheus/forge.css", {})[0], 200)
         self.assertEqual(self.request("GET", "/elsewhere/", self.operator)[0], 404)
-        self.assertEqual(self.request("POST", "/prometheus/other", self.post_headers, self.form)[0], 404)
+        self.assertEqual(self.request("POST", "/prometheus/other", self.post_headers, {"a": "b"})[0], 404)
+        self.assertEqual(self.request("PUT", "/prometheus/login", self.writes)[0], 404)
 
-    def test_case_visibility_and_pause_state(self):
-        _, body, _ = self.request("GET", "/prometheus/", self.operator)
-        self.assertIn("frozen", body)
-        self.assertIn("Paused", body)
-        self.assertNotIn("offscope", body)
-        self.assertIn('<option value="review">', body)
-        self.assertNotIn('<option value="frozen"', body)
-        with patch.object(forge.server, "Broker") as broker:
-            for case_id in ("frozen", "offscope"):
-                with self.subTest(case=case_id):
-                    status = self.request("POST", "/prometheus/inspect", self.post_headers,
-                                          {**self.form, "case": case_id})[0]
-                    self.assertEqual(status, 400)
-            broker.assert_not_called()
-
-    def test_inspection_is_origin_and_case_bound(self):
-        headers, form = self.post_headers, self.form
-        with patch.object(forge.server, "Broker") as broker:
-            self.assertEqual(self.request("POST", "/prometheus/inspect", {**headers, "Origin": "https://else.example"}, form)[0], 403)
-            missing_origin = {key: value for key, value in headers.items() if key != "Origin"}
-            self.assertEqual(self.request("POST", "/prometheus/inspect", missing_origin, form)[0], 403)
-            self.assertEqual(self.request("POST", "/prometheus/inspect", headers, {**form, "case": "other"})[0], 400)
-            self.assertEqual(self.request("POST", "/prometheus/inspect", headers, {**form, "tool": "anything"})[0], 400)
-            self.assertEqual(self.request("POST", "/prometheus/inspect", headers, {**form, "artifact": "../input.bin"})[0], 400)
-            broker.assert_not_called()
-            broker.return_value.call.return_value = {"content": [{"text": json.dumps({"format_hint": "ELF"})}],
-                                                       "isError": False}
-            status, body, _ = self.request("POST", "/prometheus/inspect", headers, form)
-            self.assertEqual(status, 200)
-            self.assertIn("ELF", body)
-            self.assertIn("Artifact summary", body)
-            self.assertEqual(broker.call_args.args[-1], {"artifact_summary"})
-            self.assertEqual(broker.call_args.kwargs, {"audience": "forge"})
-            broker.return_value.call.assert_called_once_with({"name": "artifact_summary", "arguments": {"artifact": self.digest}})
-
-    def test_inspection_form_framing(self):
-        with patch.object(forge.server, "Broker") as broker:
-            json_type = {**self.post_headers, "Content-Type": "application/json"}
-            self.assertEqual(self.request("POST", "/prometheus/inspect", json_type, self.form)[0], 400)
-            oversized = {**self.form, "artifact": self.digest + "a" * 600}
-            self.assertEqual(self.request("POST", "/prometheus/inspect", self.post_headers, oversized)[0], 400)
-            body = urlencode(self.form).encode("ascii")
-            chunked = (b"POST /prometheus/inspect HTTP/1.1\r\nHost: forge\r\nCookie: " + self.cookie + b"\r\n"
-                       b"Origin: " + self.origin.encode("ascii") + b"\r\nContent-Type: " + FORM_TYPE.encode("ascii") +
-                       b"\r\nContent-Length: " + str(len(body)).encode("ascii") +
-                       b"\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" + body)
-            self.assertEqual(self.raw(chunked), 400)
-            doubled = (b"POST /prometheus/inspect HTTP/1.1\r\nHost: forge\r\nCookie: " + self.cookie + b"\r\n"
-                       b"Origin: " + self.origin.encode("ascii") + b"\r\nContent-Type: " + FORM_TYPE.encode("ascii") +
-                       b"\r\nContent-Length: " + str(len(body)).encode("ascii") +
-                       b"\r\nContent-Length: " + str(len(body)).encode("ascii") + b"\r\nConnection: close\r\n\r\n" + body)
-            self.assertEqual(self.raw(doubled), 400)
-            repeated = self.request("POST", "/prometheus/inspect", self.post_headers,
-                                    [("case", "review"), ("case", "review"), ("artifact", self.digest)])
-            self.assertEqual(repeated[0], 400)
-            broker.assert_not_called()
-
-    def test_provider_output_is_escaped_and_errors_are_contained(self):
-        with patch.object(forge.server, "Broker") as broker:
-            hostile = {"format_hint": "<script>alert(1)</script>"}
-            broker.return_value.call.return_value = {"content": [{"text": json.dumps(hostile)}], "isError": True}
-            status, body, _ = self.request("POST", "/prometheus/inspect", self.post_headers, self.form)
-            self.assertEqual(status, 200)
-            self.assertIn("Inspection stopped", body)
-            self.assertNotIn("<script>", body)
-            self.assertIn("&lt;script&gt;", body)
-            broker.return_value.call.side_effect = RuntimeError("worker failed")
-            status, body, _ = self.request("POST", "/prometheus/inspect", self.post_headers, self.form)
-            self.assertEqual(status, 503)
-            self.assertNotIn("worker failed", body)
-
-
-    def ledger(self):
-        hostile = "<img src=x onerror=alert(1)>"
-        return {"title": "Review " + hostile, "mode": "static", "findings": [
-                    {"id": "F0001", "kind": "inferred", "confidence": "medium", "claim": "Claim " + hostile,
-                     "evidence": ["RVA 0x5120"], "artifacts": [self.digest]}],
-                "artifacts": {self.digest: {"size": 16, "hashes": {}, "provenance": [
-                    {"source": "Operator handoff " + hostile, "completeness": "complete", "parent": None,
-                     "relation": "", "acquired_utc": "2026-11-25T00:00:00+00:00"}]},
-                    "not-a-digest": {"size": 1}}}
-
-    def add_grants_and_audit(self):
-        folder = runtime.case_path(self.state, "review")
-        scope = runtime.read_json(folder / "scope.json")
-        scope["grants"] = [
-            {"id": "b" * 32, "tool": "ghidra_decompile", "arguments": {"artifact": self.digest, "address": "0x401000"},
-             "audience": "local", "expires_utc": "2999-01-01T00:00:00+00:00"},
-            {"id": "c" * 32, "tool": "artifact_strings", "arguments": {"artifact": self.digest, "offset": 0, "limit": 10},
-             "audience": "mcp", "expires_utc": "2000-01-01T00:00:00+00:00"}]
-        atomic_json(folder / "scope.json", scope)
-        runtime.audit(folder, case="review", decision="intercepted", tool="ghidra_decompile", audience="mcp",
-                      reason="operator_excerpt_grant_required", prompt="secret model prompt",
-                      arguments={"artifact": self.digest, "address": "0x401000"})
-
-    def test_case_page_renders_scope_ledger_grants_and_audit(self):
-        _, body, _ = self.request("GET", "/prometheus/", self.operator)
-        self.assertIn('<a href="/prometheus/cases/review">review</a>', body)
-        self.add_grants_and_audit()
-        with patch.object(forge, "case_ledger", return_value=self.ledger()) as ledger:
-            status, body, headers = self.request("GET", "/prometheus/cases/review", self.operator)
-        self.assertEqual(status, 200)
-        self.assertEqual(ledger.call_args.args[0]["case"], "review")
-        self.assertIn("default-src 'none'", headers["Content-Security-Policy"])
-        self.assertNotIn("<img", body)
-        self.assertIn("&lt;img src=x onerror=alert(1)&gt;", body)
-        for expected in ("F0001", "RVA 0x5120", "Operator handoff", "Pause case", "bbbbbbbb", "0x401000",
-                         "operator_excerpt_grant_required", 'name="artifact" value="' + self.digest + '"'):
-            self.assertIn(expected, body)
-        self.assertNotIn("cccccccc", body)
-        self.assertNotIn("not-a-digest", body)
-        self.assertNotIn("secret model prompt", body)
-
-    def test_case_page_degrades_without_ledger_and_hides_unlisted_cases(self):
-        with patch.object(forge, "case_ledger", side_effect=runtime.RuntimeFailure("ledger_unavailable")):
-            status, body, _ = self.request("GET", "/prometheus/cases/review", self.operator)
-        self.assertEqual(status, 200)
-        self.assertIn("evidence ledger is unavailable", body)
-        self.assertIn("None imported", body)
-        folder, record = runtime.load_case(self.state, "review")
-        atomic_json(folder / "scope.json", {**record, "yara_rules": {"sha256": "d" * 64, "rules": 3, "bytes": 90}})
-        with patch.object(forge, "case_ledger", return_value=None):
-            self.assertIn("<code>" + "d" * 64 + "</code>", self.request("GET", "/prometheus/cases/review", self.operator)[1])
-        with patch.object(forge, "case_ledger") as ledger:
-            for route in ("/prometheus/cases/offscope", "/prometheus/cases/missing", "/prometheus/cases/../review",
-                          "/prometheus/cases/Review", "/prometheus/cases/", "/prometheus/cases/review/"):
-                with self.subTest(route=route):
-                    self.assertEqual(self.request("GET", route, self.operator)[0], 404)
-            self.assertEqual(self.request("GET", "/prometheus/cases/review", {})[0], 303)
-            ledger.assert_not_called()
-
-    def test_pause_is_one_way_audited_and_origin_bound(self):
-        folder = runtime.case_path(self.state, "review")
-        paused = lambda: runtime.read_json(folder / "scope.json")["paused"]
-        form = {"case": "review"}
-        self.assertEqual(self.request("POST", "/prometheus/pause", {**self.post_headers, "Origin": "https://else.example"}, form)[0], 403)
-        self.assertEqual(self.request("POST", "/prometheus/pause", self.post_headers, {"case": "offscope"})[0], 400)
-        self.assertEqual(self.request("POST", "/prometheus/pause", self.post_headers, {**form, "resume": "1"})[0], 400)
-        self.assertEqual(self.request("POST", "/prometheus/resume", self.post_headers, form)[0], 404)
-        self.assertFalse(paused())
-        status, _, headers = self.request("POST", "/prometheus/pause", self.post_headers, form)
-        self.assertEqual(status, 303)
-        self.assertEqual(headers["Location"], "/prometheus/cases/review")
-        self.assertTrue(paused())
-        events = [json.loads(line) for line in (folder / "audit.jsonl").read_text(encoding="ascii").splitlines()]
-        self.assertEqual([(e["decision"], e["operator"], e["via"]) for e in events], [("pause", "analyst", "forge")])
-        self.assertEqual(self.request("POST", "/prometheus/pause", self.post_headers, form)[0], 303)
-        self.assertEqual(len((folder / "audit.jsonl").read_text(encoding="ascii").splitlines()), 1)
-        with patch.object(forge, "case_ledger", return_value=self.ledger()):
-            _, body, _ = self.request("GET", "/prometheus/cases/review", self.operator)
-        self.assertNotIn("Pause case", body)
-        self.assertIn("Resume with the operator CLI", body)
-        self.assertEqual(self.request("POST", "/prometheus/inspect", self.post_headers, self.form)[0], 400)
-
-    def test_closed_case_is_read_only(self):
-        write_case(self.state, "sealed", "sha256:" + self.digest)
-        folder = runtime.case_path(self.state, "sealed")
-        atomic_json(folder / "scope.json", {**runtime.read_json(folder / "scope.json"), "closed": True,
-                                            "closed_utc": "2026-11-25T10:00:00+00:00"})
-        before = (folder / "scope.json").read_bytes()
-        self.app.visible.add("sealed")
-        _, body, _ = self.request("GET", "/prometheus/", self.operator)
-        self.assertIn('<a href="/prometheus/cases/sealed">sealed</a></span><span class="status">Closed</span>', body)
-        self.assertNotIn('<option value="sealed"', body)
-        with patch.object(forge, "case_ledger", return_value=self.ledger()):
-            status, body, _ = self.request("GET", "/prometheus/cases/sealed", self.operator)
-        self.assertEqual(status, 200)
-        for expected in ('<span class="status">Closed</span>', "Closure is irreversible", "2026-11-25T10:00:00+00:00",
-                         "F0001", self.digest):
-            self.assertIn(expected, body)
-        for hidden in ("Pause case", 'action="/prometheus/pause"', 'action="/prometheus/inspect"', "Summary"):
-            self.assertNotIn(hidden, body)
-        with patch.object(forge.server, "Broker") as broker:
-            for route, form in (("/prometheus/inspect", {**self.form, "case": "sealed"}),
-                                ("/prometheus/pause", {"case": "sealed"})):
-                with self.subTest(route=route):
-                    status, body, _ = self.request("POST", route, self.post_headers, form)
-                    self.assertEqual((status, body), (409, "Case is closed"))
-            broker.assert_not_called()
-        self.assertEqual((folder / "scope.json").read_bytes(), before)
-        self.assertFalse((folder / "audit.jsonl").exists())
-        with self.assertRaisesRegex(runtime.RuntimeFailure, "Case is closed"):
-            forge.pause_case(self.state, "sealed", "analyst")
-
-    def test_pause_respects_operator_lock(self):
-        lock = runtime.case_path(self.state, "review") / ".operator.lock"
-        lock.write_text("1", encoding="ascii")
-        self.assertEqual(self.request("POST", "/prometheus/pause", self.post_headers, {"case": "review"})[0], 409)
-        self.assertFalse(runtime.read_json(lock.parent / "scope.json")["paused"])
+    def test_every_write_requires_the_forge_origin(self):
+        for method, route in (("POST", "/prometheus/api/cases/review/pause"), ("PUT", "/prometheus/api/models/x"),
+                              ("DELETE", "/prometheus/api/cases/review/chat"), ("POST", "/prometheus/logout")):
+            for origin in ({}, {"Origin": "https://else.example"}):
+                with self.subTest(route=route, origin=origin):
+                    self.assertEqual(self.request(method, route, {**self.operator, **origin})[0], 403)
+        self.assertFalse(json.loads((self.state / "cases" / "review" / "scope.json").read_text())["paused"])
 
     def sign_in(self, username, password, origin=None):
         headers = {"Origin": origin or self.origin, "Content-Type": FORM_TYPE}
@@ -323,9 +90,10 @@ class ForgeTests(unittest.TestCase):
         flags = [part.strip() for part in headers["Set-Cookie"].split(";")[1:]]
         for flag in ("Path=/prometheus/", "Secure", "HttpOnly", "SameSite=Strict", "Max-Age=43200"):
             self.assertIn(flag, flags)
-        status, body, _ = self.request("GET", "/prometheus/", self.session_of(headers))
-        self.assertEqual(status, 200)
-        self.assertIn('<a href="/prometheus/account">analyst</a>', body)
+        session = self.session_of(headers)
+        self.assertEqual(self.request("GET", "/prometheus/", session)[0], 200)
+        status, body, _ = self.request("GET", "/prometheus/api/me", session)
+        self.assertEqual(json.loads(body)["user"], "analyst")
 
     def test_failed_sign_in_reveals_nothing_and_is_throttled(self):
         for username, password in (("analyst", "wrong password!"), ("nobody", "correct horse battery"),
@@ -376,7 +144,6 @@ class ForgeTests(unittest.TestCase):
         self.assertEqual((status, headers["Location"]), (303, "/prometheus/login"))
         self.assertIn("Max-Age=0", headers["Set-Cookie"])
         self.assertEqual(self.request("GET", "/prometheus/", self.operator)[0], 303)
-
 
 class ForgeHelperTests(unittest.TestCase):
     def test_recent_audit_is_bounded_newest_first_and_filtered(self):

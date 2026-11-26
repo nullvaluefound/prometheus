@@ -2,7 +2,6 @@
 
 import argparse
 import hashlib
-import html
 import http.client
 import json
 import os
@@ -13,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from unittest.mock import patch
 from urllib.parse import urlencode
@@ -52,8 +52,33 @@ def forge_request(path, method, route, headers, form=None):
         return response.status, response.read().decode("utf-8"), dict(response.headers)
 
 
+def forge_json(path, method, route, headers, value=None):
+    body = json.dumps(value).encode("ascii") if value is not None else b""
+    lines = [f"{method} {route} HTTP/1.1", "Host: forge", "Connection: close", f"Content-Length: {len(body)}"]
+    lines += [f"{name}: {item}" for name, item in headers.items()]
+    if value is not None:
+        lines.append("Content-Type: application/json")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(195)
+        sock.connect(str(path))
+        sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii") + body)
+        response = http.client.HTTPResponse(sock)
+        response.begin()
+        return response.status, json.loads(response.read() or b"null")
+
+
+def wait_task(path, prefix, headers, task):
+    for _ in range(400):
+        status, task = forge_json(path, "GET", f"{prefix}api/tasks/{task['id']}", headers)
+        assert status == 200, status
+        if task["state"] not in ("queued", "running"):
+            return task
+        time.sleep(0.5)
+    raise AssertionError("Forge task did not finish")
+
+
 def check_forge(state, case_id, digest, broker):
-    """Serve the Forge on a private socket: landing page, inspection, audited pause, then refusal."""
+    """Serve the Forge on a private socket: sign-in, the app shell, API overview, a tool task, an audited pause."""
     if os.name != "posix" or not hasattr(socket, "AF_UNIX"):
         print("Skipped the Forge phase: the Forge serves only over a Unix socket on Linux.")
         return
@@ -71,33 +96,35 @@ def check_forge(state, case_id, digest, broker):
             status, _, headers = forge_request(path, "POST", prefix + "login", form_type,
                                                {"username": operator, "password": password})
             assert status == 303 and "HttpOnly" in headers["Set-Cookie"], status
-            get_headers = {"Cookie": headers["Set-Cookie"].split(";")[0]}
-            post_headers = {**get_headers, **form_type}
-            status, body, _ = forge_request(path, "GET", prefix, get_headers)
-            assert status == 200 and case_id in body and "Apprentices" in body, status
-            assert digest not in body and "Artifact summary" not in body
-            for label in ("Ghidra MCP", "REA", "YARA", "capa"):
-                assert f"<li><span>{label}</span><span class=\"status\">Verified</span></li>" in body, label
-            form = {"case": case_id, "artifact": digest}
-            status, body, _ = forge_request(path, "POST", prefix + "inspect", post_headers, form)
-            assert status == 200 and "<h2>Artifact summary</h2>" in body, (status, body[:200])
-            assert html.escape('"format_hint": "ELF"', quote=True) in body
-            status, _, headers = forge_request(path, "POST", prefix + "pause", post_headers, {"case": case_id})
-            assert status == 303 and headers["Location"] == f"{prefix}cases/{case_id}", status
+            session = {"Cookie": headers["Set-Cookie"].split(";")[0]}
+            writes = {**session, "Origin": origin}
+            status, body, headers = forge_request(path, "GET", prefix, session)
+            assert status == 200 and "script-src 'self'" in headers["Content-Security-Policy"], status
+            status, overview = forge_json(path, "GET", prefix + "api/overview", session)
+            assert status == 200 and [row["id"] for row in overview["cases"]] == [case_id], overview
+            assert all(row["verified"] for row in overview["apprentices"]), overview["apprentices"]
+            status, reply = forge_json(path, "POST", f"{prefix}api/cases/{case_id}/tools/artifact_summary", writes,
+                                       {"artifact": digest})
+            assert status == 202, (status, reply)
+            task = wait_task(path, prefix, session, reply["task"])
+            assert task["state"] == "succeeded" and task["result"]["summary"]["format_hint"] == "ELF", task
+            status, reply = forge_json(path, "POST", f"{prefix}api/cases/{case_id}/pause", writes, {})
+            assert status == 200 and reply["status"] == "Paused", (status, reply)
             events = [json.loads(line) for line in (state / "cases" / case_id / "audit.jsonl")
                       .read_text(encoding="ascii").splitlines()]
             assert any(event.get("decision") == "pause" and event.get("operator") == operator and
                        event.get("via") == "forge" for event in events)
             assert runtime.load_case(state, case_id)[1]["paused"]
-            status, body, _ = forge_request(path, "POST", prefix + "inspect", post_headers, form)
-            assert status == 400 and "Artifact summary" not in body, status
+            status, reply = forge_json(path, "POST", f"{prefix}api/cases/{case_id}/tools/artifact_summary", writes,
+                                       {"artifact": digest})
+            assert wait_task(path, prefix, session, reply["task"])["state"] == "failed"
             assert broker.call({"name": "artifact_summary", "arguments": {"artifact": digest}})["isError"]
         finally:
             app.shutdown()
             thread.join(timeout=10)
     path.unlink(missing_ok=True)
-    print("Verified the Forge landing page behind sign-in, a browser inspection, an audited browser pause and refusal after pause.")
-
+    print("Verified the Forge landing page behind sign-in, the API overview, a queued tool task, "
+          "an audited browser pause and refusal after pause.")
 
 def operator(state, *argv):
     parser, handlers = cli.make_parser()

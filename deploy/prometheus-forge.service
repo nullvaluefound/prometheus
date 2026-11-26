@@ -16,13 +16,14 @@ RuntimeDirectory=prometheus-forge
 RuntimeDirectoryMode=0750
 StateDirectory=prometheus-forge
 StateDirectoryMode=0700
-ExecStart=/usr/bin/python3 -m re_harness.forge --socket /run/prometheus-forge/forge.sock --origin ${FORGE_ORIGIN} --prefix ${FORGE_PREFIX}
+ExecStart=/opt/prometheus-forge-venv/bin/python -m re_harness.forge --socket /run/prometheus-forge/forge.sock --origin ${FORGE_ORIGIN} --prefix ${FORGE_PREFIX}
 Restart=on-failure
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-RestrictAddressFamilies=AF_UNIX
+# AF_INET/AF_INET6 let chat reach the operator's configured model endpoints.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 UMask=0077
 
 [Install]

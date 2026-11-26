@@ -15,6 +15,10 @@ on:
       - "re_harness/policy.py"
       - "re_harness/providers.py"
       - "re_harness/worker.py"
+      - "re_harness/forge.py"
+      - "re_harness/forge_api.py"
+      - "re_harness/tasks.py"
+      - "re_harness/accounts.py"
       - "tests/smoke.py"
       - ".github/workflows/image.yml"
 

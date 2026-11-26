@@ -1,4 +1,8 @@
-"""The Prometheus Forge, served over a private Unix socket behind a TLS proxy, with its own operator sign-in."""
+"""The Prometheus Forge: a React operator app and JSON API over a private Unix socket, with its own sign-in.
+
+A TLS proxy forwards the base path to this socket. The server renders only the sign-in, setup and account pages;
+everything else is the single-page app in forge_web/ talking to the API in forge_api.py (docs/FORGE_API.md).
+"""
 
 import argparse
 import collections
@@ -10,6 +14,7 @@ import re
 import socket
 import socketserver
 import subprocess
+import threading
 import time
 from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
@@ -17,8 +22,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from . import accounts, policy, runtime, server
-from .case import atomic_json
+from . import accounts, cli, policy, runtime, server, tasks
 
 BROWSER_ERRORS = (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError)
 BASE_PATH = r"/(?:[a-z0-9-]+/)+"
@@ -26,31 +30,16 @@ COOKIE = "prometheus_session"
 # Failed sign-ins and setup attempts across all clients. The proxy also limits each client address.
 FAILURE_WINDOW = 600
 FAILURE_LIMIT = 30
-FORM_LIMIT = 1024  # the public proxy caps request bodies at 1 KiB
+FORM_LIMIT = 1024  # sign-in forms stay small
+WEB = Path(__file__).with_name("forge_web")
+STATIC = {"assets/app.js": "text/javascript; charset=utf-8", "assets/app.css": "text/css; charset=utf-8"}
+PAGE_CSP = "default-src 'none'; style-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+APP_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; "
+           "form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 
 
 def esc(value):
     return html.escape(str(value), quote=True)
-
-
-def case_rows(state, visible):
-    root = state / "cases"
-    if not root.is_dir():
-        return []
-    rows = []
-    for folder in sorted(root.iterdir(), key=lambda item: item.name):
-        if len(rows) == 100:
-            break
-        if folder.is_symlink() or not policy.match(folder.name, policy.CASE_ID):
-            continue
-        if visible and folder.name not in visible:
-            continue
-        try:
-            _, case = runtime.load_case(state, folder.name, allow_closed=True)
-        except BROWSER_ERRORS:
-            continue
-        rows.append((folder.name, case_status(case)))
-    return rows
 
 
 def case_status(record):
@@ -77,7 +66,7 @@ AUDIT_FIELDS = ("utc", "decision", "tool", "audience", "reason", "operation", "o
 LEDGER_CAP = 4 * 1024 * 1024
 
 
-def recent_audit(folder):
+def recent_audit(folder, rows=AUDIT_ROWS):
     """Return the newest audit events, newest first, keeping only display-safe fields."""
     path = folder / "audit.jsonl"
     try:
@@ -92,7 +81,7 @@ def recent_audit(folder):
         lines = lines[1:]
     events = []
     for line in reversed(lines):
-        if len(events) == AUDIT_ROWS:
+        if len(events) == rows:
             break
         try:
             event = json.loads(line.decode("ascii"))
@@ -114,6 +103,8 @@ def recent_audit(folder):
             for key in ("artifact", "address"):
                 if isinstance(arguments.get(key), str):
                     row[key] = arguments[key]
+        if isinstance(event.get("artifact"), str) and "artifact" not in row:
+            row["artifact"] = event["artifact"]
         events.append(row)
     return events
 
@@ -136,42 +127,18 @@ def case_ledger(record):
     if code:
         raise runtime.RuntimeFailure("ledger_unavailable")
     ledger = server.strict_json(data)
-    if not isinstance(ledger, dict) or not isinstance(ledger.get("artifacts"), dict) or             not isinstance(ledger.get("findings"), list):
+    if not isinstance(ledger, dict) or not isinstance(ledger.get("artifacts"), dict) or \
+            not isinstance(ledger.get("findings"), list):
         raise runtime.RuntimeFailure("ledger_invalid")
     return ledger
-
-
-def pause_case(state, case_id, operator):
-    """One-way browser control. Resume, grants and intake stay with the operator CLI."""
-    folder = runtime.case_path(state, case_id)
-    with runtime.operator_lock(folder):
-        _, record = runtime.load_case(state, case_id)
-        if record["paused"]:
-            return False
-        record["paused"] = True
-        runtime.audit(folder, case=case_id, decision="pause", operator=operator, via="forge")
-        atomic_json(folder / "scope.json", record)
-    return True
-
-
-def text(value):
-    return esc(value) if isinstance(value, (str, int)) and not isinstance(value, bool) else ""
-
-
-def table(headings, rows, empty):
-    if not rows:
-        return f'<p class="muted">{esc(empty)}</p>'
-    head = "".join(f"<th>{esc(name)}</th>" for name in headings)
-    body = "".join("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>" for row in rows)
-    return f'<div class="scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
 
 
 def shell(prefix, operator, body, title="Forge"):
     prefix = esc(prefix)
     if operator:
-        account = (f'<nav class="operator"><a href="{prefix}account">{esc(operator)}</a>'
-                   f'<form class="inline" method="post" action="{prefix}logout"><button class="link">Sign out</button>'
-                   '</form></nav>')
+        account = (f'<nav class="operator"><a href="{prefix}">Back to the Forge</a><a href="{prefix}account">'
+                   f'{esc(operator)}</a><form class="inline" method="post" action="{prefix}logout">'
+                   '<button class="link">Sign out</button></form></nav>')
     else:
         account = ""
     return f'''<!doctype html>
@@ -186,60 +153,73 @@ def notice(message, error=True):
     return f'<p class="{"error" if error else "notice"}" role="status">{esc(message)}</p>' if message else ""
 
 
-class Forge(socketserver.TCPServer):
-    """Serve one request at a time to keep browser-triggered Docker work bounded."""
+class Forge(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    """Threaded HTTP for the browser; Apprentice work runs one task at a time on the task queue."""
+
+    daemon_threads = True
 
     def __init__(self, socket_path, origin, prefix, state, visible):
         if os.name != "posix" or not hasattr(socket, "AF_UNIX"):
             raise OSError("Serve the Forge from the Linux deployment VM")
+        from . import forge_api  # forge_api imports this module
         self.address_family = socket.AF_UNIX
         self.origin = origin
         self.prefix = prefix
         self.state = state
         self.visible = visible
         self.failures = collections.deque()
+        self.failure_lock = threading.Lock()
+        cli.STATE = state  # the API reuses the operator CLI's case actions on this state directory
+        self.tasks = tasks.TaskQueue(state)
+        self.api = forge_api.Api(self)
         super().__init__(str(socket_path), Handler)
 
     def throttled(self):
         cutoff = time.monotonic() - FAILURE_WINDOW
-        while self.failures and self.failures[0] < cutoff:
-            self.failures.popleft()
-        return len(self.failures) >= FAILURE_LIMIT
+        with self.failure_lock:
+            while self.failures and self.failures[0] < cutoff:
+                self.failures.popleft()
+            return len(self.failures) >= FAILURE_LIMIT
 
     def record_failure(self):
-        self.failures.append(time.monotonic())
+        with self.failure_lock:
+            self.failures.append(time.monotonic())
 
     def get_request(self):
         connection, address = super().get_request()
-        connection.settimeout(8)
+        connection.settimeout(30)
         return connection, address
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "Prometheus"
     sys_version = ""
+    session_expires = None
 
     def log_message(self, _format, *_args):
         # The ingress owns access logging. Never log bodies or evidence in the app.
         return
 
-    def send_common(self):
+    def send_common(self, csp=PAGE_CSP):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "same-origin")
-        self.send_header("Content-Security-Policy",
-                         "default-src 'none'; style-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+        self.send_header("Content-Security-Policy", csp)
 
-    def respond(self, status, content, content_type="text/html; charset=utf-8", cookie=None):
+    def respond(self, status, content, content_type="text/html; charset=utf-8", cookie=None, csp=PAGE_CSP):
         data = content.encode("utf-8") if isinstance(content, str) else content
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         if cookie is not None:
             self.send_header("Set-Cookie", cookie)
-        self.send_common()
+        self.send_common(csp)
         self.end_headers()
         self.wfile.write(data)
+
+    def respond_json(self, status, value):
+        data = json.dumps(value, ensure_ascii=True, allow_nan=False).encode("ascii")
+        self.respond(status, data, "application/json")
 
     def redirect(self, location, cookie=None):
         self.send_response(HTTPStatus.SEE_OTHER)
@@ -267,15 +247,59 @@ class Handler(BaseHTTPRequestHandler):
         if COOKIE not in jar:
             return None
         try:
-            return accounts.session_user(self.server.state, jar[COOKIE].value)
+            token = jar[COOKIE].value
+            user = accounts.session_user(self.server.state, token)
+            if user:
+                self.session_expires = accounts.session_expiry(token)
+            return user
         except BROWSER_ERRORS:
             return None
 
     def plain(self, status, message):
         self.respond(status, message, "text/plain; charset=utf-8")
 
-    def listed_cases(self):
-        return {name: status for name, status in case_rows(self.server.state, self.server.visible)}
+    # ---- Request bodies ----
+
+    def content_length(self, limit):
+        lengths = self.headers.get_all("Content-Length", [])
+        if self.headers.get("Transfer-Encoding") or len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,10}", lengths[0]):
+            raise ValueError("invalid framing")
+        length = int(lengths[0])
+        if length > limit:
+            from .forge_api import ApiError
+            raise ApiError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "too_large", "The request body is too large.")
+        return length
+
+    def read_body(self, limit):
+        length = self.content_length(limit)
+        return self.rfile.read(length) if length else b""
+
+    def copy_body(self, stream, limit):
+        remaining = self.content_length(limit)
+        if remaining == 0:
+            from .forge_api import ApiError
+            raise ApiError(HTTPStatus.BAD_REQUEST, "empty_upload", "The upload is empty.")
+        while remaining:
+            chunk = self.rfile.read(min(remaining, 1024 * 1024))
+            if not chunk:
+                raise ValueError("truncated upload")
+            stream.write(chunk)
+            remaining -= len(chunk)
+
+    def read_form(self, fields, limit=FORM_LIMIT):
+        """Parse one small urlencoded form with exactly the expected single-valued fields."""
+        lengths = self.headers.get_all("Content-Length", [])
+        if (len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,4}", lengths[0]) or
+                not 1 <= int(lengths[0]) <= limit or self.headers.get("Transfer-Encoding") or
+                self.headers.get_content_type() != "application/x-www-form-urlencoded"):
+            raise ValueError("invalid framing")
+        form = parse_qs(self.rfile.read(int(lengths[0])).decode("ascii"), max_num_fields=len(fields),
+                        keep_blank_values=True, strict_parsing=True, encoding="utf-8", errors="strict")
+        if set(form) != set(fields) or any(len(values) != 1 for values in form.values()):
+            raise ValueError("invalid form")
+        return {key: values[0] for key, values in form.items()}
+
+    # ---- Routing ----
 
     def do_GET(self):
         prefix = self.server.prefix
@@ -285,19 +309,78 @@ class Handler(BaseHTTPRequestHandler):
             return self.login_page()
         if self.path == prefix + "setup":
             return self.setup_page()
+        if self.path.startswith(prefix + "api/"):
+            return self.api("GET")
         if not self.path.startswith(prefix):
             return self.plain(HTTPStatus.NOT_FOUND, "Not found")
         if not (operator := self.identity()):
             return self.redirect(prefix + "login")
         if self.path == prefix:
-            return self.dashboard(operator)
+            return self.web_file("index.html", "text/html; charset=utf-8")
         if self.path == prefix + "account":
             return self.account_page(operator)
-        if self.path.startswith(prefix + "cases/"):
-            case_id = self.path[len(prefix + "cases/"):]
-            if policy.match(case_id, policy.CASE_ID) and case_id in self.listed_cases():
-                return self.case_page(operator, case_id)
+        relative = self.path[len(prefix):]
+        if relative in STATIC:
+            return self.web_file(relative, STATIC[relative])
         self.plain(HTTPStatus.NOT_FOUND, "Not found")
+
+    def web_file(self, relative, content_type):
+        try:
+            data = (WEB / relative).read_bytes()
+        except OSError:
+            return self.plain(HTTPStatus.SERVICE_UNAVAILABLE, "The Forge web app is not built.")
+        self.respond(HTTPStatus.OK, data, content_type, csp=APP_CSP)
+
+    def do_POST(self):
+        prefix = self.server.prefix
+        public = {prefix + "login": self.login, prefix + "setup": self.complete_setup}
+        private = {prefix + "logout": self.logout, prefix + "account": self.change_password}
+        is_api = self.path.startswith(prefix + "api/")
+        if self.path not in public and self.path not in private and not is_api:
+            return self.plain(HTTPStatus.NOT_FOUND, "Not found")
+        # Every form and API write, sign-in included, must come from the Forge's own origin.
+        if self.headers.get_all("Origin", []) != [self.server.origin]:
+            return self.plain(HTTPStatus.FORBIDDEN, "Origin rejected")
+        if is_api:
+            return self.api("POST")
+        if self.path in public:
+            return public[self.path]()
+        if not (operator := self.identity()):
+            return self.plain(HTTPStatus.FORBIDDEN, "Sign in required")
+        private[self.path](operator)
+
+    def do_PUT(self):
+        self.api_write("PUT")
+
+    def do_DELETE(self):
+        self.api_write("DELETE")
+
+    def api_write(self, method):
+        if not self.path.startswith(self.server.prefix + "api/"):
+            return self.plain(HTTPStatus.NOT_FOUND, "Not found")
+        if self.headers.get_all("Origin", []) != [self.server.origin]:
+            return self.plain(HTTPStatus.FORBIDDEN, "Origin rejected")
+        self.api(method)
+
+    def api(self, method):
+        from .forge_api import ApiError
+        if not (operator := self.identity()):
+            return self.respond_json(HTTPStatus.UNAUTHORIZED, {"error": "sign_in_required",
+                                                               "message": "Sign in again."})
+        try:
+            status, value = self.server.api.dispatch(self, method, self.path[len(self.server.prefix + "api/"):],
+                                                     operator)
+        except ApiError as error:
+            return self.respond_json(error.status, {"error": error.code, "message": error.message})
+        except (ValueError, UnicodeError) as error:
+            return self.respond_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request",
+                                                              "message": "The request was not well formed."})
+        except BROWSER_ERRORS:
+            return self.respond_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "unavailable",
+                                                                      "message": "The case service is unavailable."})
+        self.respond_json(status, value)
+
+    # ---- Sign-in pages ----
 
     def login_page(self, message="", status=HTTPStatus.OK, username=""):
         prefix = esc(self.server.prefix)
@@ -322,7 +405,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def account_page(self, operator, message="", error=True, status=HTTPStatus.OK):
         prefix = esc(self.server.prefix)
-        body = f'''<p class="crumb"><a href="{prefix}">Forge</a> / Account</p><section class="auth">{notice(message, error)}
+        body = f'''<section class="auth">{notice(message, error)}
 <h2>Change password</h2><form method="post" action="{prefix}account">
 <label>Current password<input name="current" type="password" autocomplete="current-password" maxlength="72" required></label>
 <label>New password<input name="password" type="password" autocomplete="new-password" minlength="{accounts.MIN_PASSWORD}" maxlength="72" required></label>
@@ -331,156 +414,11 @@ class Handler(BaseHTTPRequestHandler):
 <p class="muted">Use at least {accounts.MIN_PASSWORD} characters. Changing your password signs out your other sessions.</p></section>'''
         self.respond(status, shell(self.server.prefix, operator, body, "Account"))
 
-    def case_link(self, name):
-        return f'<a href="{esc(self.server.prefix)}cases/{esc(name)}">{esc(name)}</a>'
-
-    def dashboard(self, operator, selected="", digest="", result=None, error=False):
-        cases = case_rows(self.server.state, self.server.visible)
-        providers = baseline_tools(self.server.state)
-        rows = "".join(f'<li><span>{self.case_link(name)}</span><span class="status">{esc(status)}</span></li>'
-                       for name, status in cases)
-        if not rows:
-            rows = '<li class="muted">Open a case with the Prometheus operator CLI to begin.</li>'
-        options = "".join(f'<option value="{esc(name)}"{" selected" if name == selected else ""}>{esc(name)}</option>'
-                          for name, status in cases if status == "Ready")
-        inactive = " disabled" if not options else ""
-        tools = "".join(f'<li><span>{esc(name)}</span><span class="status">{"Verified" if ready else "Awaiting baseline"}</span></li>'
-                        for name, ready in providers)
-        output = ""
-        if result is not None:
-            rendered = esc(json.dumps(result, indent=2, ensure_ascii=True))
-            output = f'<section class="result"><h2>{"Inspection stopped" if error else "Artifact summary"}</h2><pre>{rendered}</pre></section>'
-        body = f'''<div class="layout"><section><h2>Cases</h2><ul>{rows}</ul></section>
-<section><h2>Apprentices</h2><ul>{tools}</ul></section></div>
-<section class="inspect"><h2>Inspect an artifact</h2><form method="post" action="{esc(self.server.prefix)}inspect">
-<label>Case<select name="case" required{inactive}>{options}</select></label>
-<label>SHA-256<input name="artifact" value="{esc(digest)}" pattern="[a-f0-9]{{64}}" maxlength="64" required{inactive}></label>
-<button{inactive}>Inspect</button></form></section>{output}'''
-        self.respond(HTTPStatus.OK, shell(self.server.prefix, operator, body))
-
-    def case_page(self, operator, case_id):
-        try:
-            folder, record = runtime.load_case(self.server.state, case_id, allow_closed=True)
-        except BROWSER_ERRORS:
-            return self.plain(HTTPStatus.SERVICE_UNAVAILABLE, "Case service unavailable")
-        prefix = esc(self.server.prefix)
-        status = case_status(record)
-        paused = status != "Ready"
-        hidden_case = f'<input type="hidden" name="case" value="{esc(case_id)}">'
-        if status == "Closed":
-            control = (f'<p class="muted">Closed {text(record.get("closed_utc"))}. Closure is irreversible. '
-                       'The ledger, report and evidence volume are retained read-only.</p>')
-        elif paused:
-            control = '<p class="muted">Paused. Resume with the operator CLI after reviewing scope.</p>'
-        else:
-            control = (f'<form class="inline" method="post" action="{prefix}pause">{hidden_case}'
-                       '<button class="stop">Pause case</button></form>'
-                       '<p class="muted">Pausing closes new broker actions at once. Only the operator CLI can resume.</p>')
-        rules = record.get("yara_rules")
-        yara_rules = (f'<code>{esc(rules["sha256"])}</code>' if rules else '<span class="muted">None imported</span>')
-        scope = (f'<ul><li><span>Status</span><span class="status">{esc(status)}</span></li>'
-                 f'<li><span>Image</span><code>{esc(record["image"])}</code></li>'
-                 f'<li><span>Engine</span><code>{esc(record["engine"])}</code></li>'
-                 f'<li><span>YARA rules</span>{yara_rules}</li></ul>{control}')
-
-        try:
-            ledger = case_ledger(record)
-        except BROWSER_ERRORS:
-            ledger = None
-        if ledger is None:
-            unavailable = '<p class="muted">The evidence ledger is unavailable. Check the Docker engine and run verify.</p>'
-            ledger_html, artifacts_html, findings_html = unavailable, unavailable, unavailable
-        else:
-            ledger_html = f'<p>{text(ledger.get("title"))}</p><p class="muted">{len(ledger["artifacts"])} artifacts · ' \
-                          f'{len(ledger["findings"])} findings</p>'
-            artifacts = []
-            for digest, item in sorted(ledger["artifacts"].items())[:256]:
-                if not policy.match(digest, policy.DIGEST) or not isinstance(item, dict):
-                    continue
-                provenance = item.get("provenance") if isinstance(item.get("provenance"), list) else []
-                origin = "<br>".join(
-                    f'{text(entry.get("source"))} · {text(entry.get("completeness"))}'
-                    + (f'<br><span class="muted">from <code>{text(entry.get("parent"))}</code> '
-                       f'({text(entry.get("relation"))})</span>' if entry.get("parent") else "")
-                    for entry in provenance[:4] if isinstance(entry, dict))
-                summary = "" if status == "Closed" else (
-                    f'<form class="inline" method="post" action="{prefix}inspect">{hidden_case}'
-                    f'<input type="hidden" name="artifact" value="{esc(digest)}">'
-                    f'<button{" disabled" if paused else ""}>Summary</button></form>')
-                artifacts.append((f"<code>{esc(digest)}</code>", text(item.get("size")), origin, summary))
-            artifacts_html = table(("SHA-256", "Bytes", "Provenance", ""), artifacts, "No artifacts admitted yet.")
-            findings = []
-            for item in ledger["findings"][:200]:
-                if not isinstance(item, dict):
-                    continue
-                cited = item.get("artifacts") if isinstance(item.get("artifacts"), list) else []
-                evidence = item.get("evidence") if isinstance(item.get("evidence"), list) else []
-                findings.append((text(item.get("id")), text(item.get("kind")), text(item.get("confidence")),
-                                 text(item.get("claim")), "<br>".join(text(value) for value in evidence[:8]),
-                                 "<br>".join(f"<code>{text(value)}</code>" for value in cited[:8])))
-            findings_html = table(("ID", "Kind", "Confidence", "Claim", "Evidence", "Artifacts"), findings,
-                                  "No findings recorded yet.")
-
-        grants = []
-        for grant in active_grants(record):
-            arguments = grant.get("arguments")
-            if not isinstance(arguments, dict):
-                continue
-            selector = " ".join(f"{key}={value}" for key, value in sorted(arguments.items()) if key != "artifact")
-            grants.append((f'<code>{text(grant.get("id"))[:8]}</code>', text(grant.get("tool")),
-                           f'<code>{text(arguments.get("artifact"))}</code>', text(selector),
-                           text(grant.get("audience")), text(grant.get("expires_utc"))))
-        grants_html = table(("Grant", "Tool", "Artifact", "Selector", "Audience", "Expires (UTC)"), grants,
-                            "No active excerpt grants.")
-        events = [(text(event.get("utc")), text(event.get("decision")),
-                   text(event.get("tool") or event.get("operation")), text(event.get("audience") or event.get("via")),
-                   text(event.get("reason") or event.get("operator") or event.get("address")),
-                   f'<code>{text(event["artifact"])}</code>' if event.get("artifact") else "")
-                  for event in recent_audit(folder)]
-        audit_html = table(("UTC", "Decision", "Tool or operation", "Audience", "Detail", "Artifact"), events,
-                           "No audit events yet.")
-        body = f'''<p class="crumb"><a href="{prefix}">Forge</a> / {esc(case_id)}</p>
-<div class="layout"><section><h2>Ledger</h2>{ledger_html}</section><section><h2>Scope</h2>{scope}</section></div>
-<section class="block"><h2>Artifacts</h2>{artifacts_html}</section>
-<section class="block"><h2>Findings</h2>{findings_html}</section>
-<section class="block"><h2>Active grants</h2>{grants_html}</section>
-<section class="block"><h2>Recent audit</h2>{audit_html}</section>'''
-        self.respond(HTTPStatus.OK, shell(self.server.prefix, operator, body))
-
-    def read_form(self, fields, limit=512):
-        """Parse one small urlencoded form with exactly the expected single-valued fields."""
-        lengths = self.headers.get_all("Content-Length", [])
-        if (len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,4}", lengths[0]) or
-                not 1 <= int(lengths[0]) <= limit or self.headers.get("Transfer-Encoding") or
-                self.headers.get_content_type() != "application/x-www-form-urlencoded"):
-            raise ValueError("invalid framing")
-        form = parse_qs(self.rfile.read(int(lengths[0])).decode("ascii"), max_num_fields=len(fields),
-                        keep_blank_values=True, strict_parsing=True, encoding="utf-8", errors="strict")
-        if set(form) != set(fields) or any(len(values) != 1 for values in form.values()):
-            raise ValueError("invalid form")
-        return {key: values[0] for key, values in form.items()}
-
-    def do_POST(self):
-        prefix = self.server.prefix
-        public = {prefix + "login": self.login, prefix + "setup": self.complete_setup}
-        private = {prefix + "inspect": self.inspect, prefix + "pause": self.pause,
-                   prefix + "logout": self.logout, prefix + "account": self.change_password}
-        if self.path not in public and self.path not in private:
-            return self.plain(HTTPStatus.NOT_FOUND, "Not found")
-        # Every form, sign-in included, must come from the Forge's own origin.
-        if self.headers.get_all("Origin", []) != [self.server.origin]:
-            return self.plain(HTTPStatus.FORBIDDEN, "Origin rejected")
-        if self.path in public:
-            return public[self.path]()
-        if not (operator := self.identity()):
-            return self.plain(HTTPStatus.FORBIDDEN, "Sign in required")
-        private[self.path](operator)
-
     def login(self):
         if self.server.throttled():
             return self.login_page("Too many failed attempts. Try again in a few minutes.", HTTPStatus.TOO_MANY_REQUESTS)
         try:
-            form = self.read_form(("username", "password"), FORM_LIMIT)
+            form = self.read_form(("username", "password"))
         except (ValueError, UnicodeError, OSError):
             return self.plain(HTTPStatus.BAD_REQUEST, "Invalid sign-in form")
         username = form["username"].strip().lower()
@@ -499,7 +437,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.server.throttled():
             return self.setup_page("Too many failed attempts. Try again in a few minutes.", HTTPStatus.TOO_MANY_REQUESTS)
         try:
-            form = self.read_form(("username", "code", "password", "confirm"), FORM_LIMIT)
+            form = self.read_form(("username", "code", "password", "confirm"))
         except (ValueError, UnicodeError, OSError):
             return self.plain(HTTPStatus.BAD_REQUEST, "Invalid setup form")
         username = form["username"].strip().lower()
@@ -527,7 +465,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def change_password(self, operator):
         try:
-            form = self.read_form(("current", "password", "confirm"), FORM_LIMIT)
+            form = self.read_form(("current", "password", "confirm"))
         except (ValueError, UnicodeError, OSError):
             return self.plain(HTTPStatus.BAD_REQUEST, "Invalid password form")
         if form["password"] != form["confirm"]:
@@ -539,55 +477,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.account_page(operator, str(error), status=HTTPStatus.BAD_REQUEST)
         except BROWSER_ERRORS:
             return self.plain(HTTPStatus.SERVICE_UNAVAILABLE, "Account service unavailable")
-        content = shell(self.server.prefix, operator, f'<p class="crumb"><a href="{esc(self.server.prefix)}">Forge</a> / '
-                        f'Account</p><section class="auth">{notice("Password changed. Other sessions are signed out.", False)}'
-                        '</section>', "Account")
+        content = shell(self.server.prefix, operator, '<section class="auth">' +
+                        notice("Password changed. Other sessions are signed out.", False) + '</section>', "Account")
         self.respond(HTTPStatus.OK, content, cookie=self.cookie(token, accounts.SESSION_HOURS * 3600))
-
-    def inspect(self, operator):
-        try:
-            form = self.read_form(("case", "artifact"))
-            case_id, digest = form["case"], form["artifact"]
-            values = policy.validate("artifact_summary", {"artifact": digest})
-            status = self.listed_cases().get(case_id)
-        except (ValueError, UnicodeError, OSError):
-            return self.plain(HTTPStatus.BAD_REQUEST, "Invalid case or artifact")
-        if status == "Closed":
-            return self.plain(HTTPStatus.CONFLICT, "Case is closed")
-        if status != "Ready":
-            return self.plain(HTTPStatus.BAD_REQUEST, "Invalid case or artifact")
-        try:
-            broker = server.Broker(self.server.state, case_id, {"artifact_summary"}, audience="forge")
-            reply = broker.call({"name": "artifact_summary", "arguments": values})
-            result = json.loads(reply["content"][0]["text"])
-            return self.dashboard(operator, case_id, digest, result, reply["isError"])
-        except BROWSER_ERRORS:
-            return self.plain(HTTPStatus.SERVICE_UNAVAILABLE, "Case service unavailable")
-
-    def pause(self, operator):
-        try:
-            case_id = self.read_form(("case",))["case"]
-            if not policy.match(case_id, policy.CASE_ID) or case_id not in (listed := self.listed_cases()):
-                raise ValueError("case unavailable")
-        except (ValueError, UnicodeError, OSError):
-            return self.plain(HTTPStatus.BAD_REQUEST, "Invalid case")
-        if listed[case_id] == "Closed":
-            return self.plain(HTTPStatus.CONFLICT, "Case is closed")
-        try:
-            pause_case(self.server.state, case_id, operator)
-        except runtime.RuntimeFailure as error:
-            if "lock" in str(error):
-                return self.plain(HTTPStatus.CONFLICT, "Another operator command holds this case. Pause from the CLI.")
-            if "closed" in str(error):
-                return self.plain(HTTPStatus.CONFLICT, "Case is closed")
-            return self.plain(HTTPStatus.SERVICE_UNAVAILABLE, "Case service unavailable")
-        except BROWSER_ERRORS:
-            return self.plain(HTTPStatus.SERVICE_UNAVAILABLE, "Case service unavailable")
-        self.send_response(HTTPStatus.SEE_OTHER)
-        self.send_header("Location", f"{self.server.prefix}cases/{case_id}")
-        self.send_header("Content-Length", "0")
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
 
 
 def main():
