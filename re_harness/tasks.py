@@ -8,7 +8,7 @@ import uuid
 
 from . import accounts, policy, runtime
 
-KINDS = ("create_case", "ingest", "tool", "chat", "model_test", "report")
+KINDS = ("create_case", "ingest", "tool", "chat", "model_test", "report", "split", "review", "record_finding")
 MAX_RESULT = 2 * 1024 * 1024
 KEEP = 500
 

@@ -6,7 +6,7 @@ import subprocess
 import sys
 import uuid
 
-from . import policy, projection, runtime
+from . import evidence, investigation, policy, projection, runtime
 
 PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"}
 UNIDENTIFIED = "unidentified-grant"
@@ -71,6 +71,9 @@ class Broker:
         self.audience = audience
         # Grants whose excerpts this session released. Model text written after a release may quote them.
         self.released_grants = set()
+        # Grants that earlier text shown to this session's model drew on, set by the caller after replay.
+        self.context_grants = set()
+        self.manifest = None
         if runtime.closed(self.bound):
             runtime.audit(self.folder, session=self.session, case=case_id, audience=audience,
                           decision="intercepted", reason="case_closed")
@@ -87,6 +90,30 @@ class Broker:
             raise policy.Denied("case_paused")
         return current
 
+    def admitted(self):
+        """The case manifest's SHA-256 values, read through a read-only Apprentice and cached for the session."""
+        if self.manifest is None:
+            from .forge import case_ledger  # forge imports this module
+            self.manifest = frozenset(case_ledger(self.current_scope())["artifacts"])
+        return self.manifest
+
+    def state_call(self, name, raw, event):
+        """A case-state tool: the same budget, role, scope and pre-dispatch audit as a sample tool, and no worker."""
+        values = investigation.validate(name, raw)
+        event.update(tool=name, arguments=investigation.audit_fields(values))
+        if name not in self.allowed_tools:
+            raise policy.Denied("tool_outside_role")
+        scope = self.current_scope()
+        runtime.audit(self.folder, **event, decision="dispatched", excerpt=False)
+        context = investigation.Context(self.state, self.case_id, self.folder, self.session, self.audience,
+                                        self.released_grants | self.context_grants,
+                                        active_grant_ids(scope, self.audience), self.admitted)
+        reply, ids = investigation.apply(name, values, context)
+        self.current_scope()
+        decision = "investigation_write" if name in investigation.WRITES else "completed"
+        runtime.audit(self.folder, **event, decision=decision, excerpt=False, **ids)
+        return call_result(reply)
+
     def call(self, params):
         ticket = uuid.uuid4().hex
         event = {"session": self.session, "ticket": ticket, "case": self.case_id, "audience": self.audience,
@@ -98,6 +125,8 @@ class Broker:
             if not isinstance(params, dict) or set(params) != {"name", "arguments"}:
                 raise policy.Denied("invalid_tool_call")
             name = params["name"]
+            if isinstance(name, str) and name in investigation.TOOLS:
+                return self.state_call(name, params["arguments"], event)
             arguments = policy.validate(name, params["arguments"])
             event.update(tool=name, arguments=arguments)
             if name not in self.allowed_tools:
@@ -118,6 +147,7 @@ class Broker:
             scope = self.current_scope()
             if name == "yara_scan" and runtime.yara_rules(scope) != request["rules"]:
                 raise policy.Denied("yara_rules_changed")
+            covering = []
             if include:
                 covering = matching_grants(scope, name, arguments, self.audience)
                 if not covering:
@@ -125,8 +155,11 @@ class Broker:
                 self.released_grants.update(covering)
             # Excerpt-only tools release names in their rows rather than in an evidence_excerpt.
             released = "evidence_excerpt" in reply or (include and name in policy.EXCERPT_ONLY)
-            runtime.audit(self.folder, **event, decision="completed", excerpt=released)
-            return call_result(reply)
+            # Keep exactly what is released, under its content hash, before the release is audited.
+            evidence_id = evidence.record(self.folder, name, arguments, reply, released, self.audience, covering,
+                                          ticket, self.session)
+            runtime.audit(self.folder, **event, decision="completed", excerpt=released, evidence=evidence_id)
+            return call_result({**reply, "evidence_id": evidence_id})
         except policy.Denied as error:
             try:
                 runtime.audit(self.folder, **event, decision="intercepted", reason=str(error))

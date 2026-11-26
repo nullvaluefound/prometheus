@@ -20,6 +20,8 @@ Upstream references for the pinned providers. [Ghidra 12.1.4](https://github.com
 
 ## Exposed tools
 
+Every successful sample-tool reply also carries `evidence_id`: the SHA-256 under which the broker stored exactly that reply in the case's evidence folder (docs/SAFETY.md). Cite it in observations, proposed findings and `finding --evidence evidence:<sha256>`.
+
 | Name | Accepted selectors beyond SHA-256 | Basic result |
 | --- | --- | --- |
 | `artifact_summary` | None | Format hint (`PE candidate`, `ELF`, `Mach-O`, `Mach-O universal`, `ZIP candidate`, `script` or `unknown`), length, string count and numeric header fields. PE adds machine, image base, entry RVA, overlay offset, section, import-library and certificate counts, and up to 96 sections as RVA, raw offset, raw size, virtual size, flags and entropy. ELF adds class, encoding, machine, type, entry, and program and section header counts. Thin Mach-O adds CPU type and file type. Section, import, version and string names are never included |
@@ -46,3 +48,16 @@ Rule text names the results of both scanners, so the summaries show rule names w
 capa runs its own vivisect disassembly, so its addresses can differ from Ghidra's function boundaries. Confirm a capability at its address with `ghidra_xrefs` or a granted decompilation before you cite it as observed. A listed limitation, such as a packer or installer, means capa saw little of the real code.
 
 For cases that require it, an analyst can stage further independently trusted static parsers in a separate reviewed tool image. Typical additions include format-specific archive tools and a signature verifier with an explicit offline revocation policy. Tools that expand the parse or disclosure surface require their own input and output controls before any model integration.
+
+## Case-state tools
+
+These tools read and write the case's investigation store through the broker, with no worker run. Roles get them through the same allowlist as sample tools: `intake` can read and write notes, `native` and `evidence` can also propose findings, and `review` can only read.
+
+| Name | Arguments | Result |
+| --- | --- | --- |
+| `case_overview` | `offset`, `limit` | Open questions, the plan, a page of leads with observation counts, and recent proposals with their check result. Model-written text whose grants are not active for the reader is withheld |
+| `lead_detail` | `lead` | One lead and its latest 50 observations |
+| `add_lead` | `artifact`, `title`, optional `address`, `offset`, `question` | A lead anchored to an admitted SHA-256 |
+| `record_observation` | `kind` (`observed` or `inferred`), `text`, `artifact`, optional `lead`, `evidence` | An observation. `observed` needs at least one evidence id from this case |
+| `update_plan` | `items` (up to 20) | Replaces the plan |
+| `propose_finding` | `claim`, `kind`, `confidence`, `artifacts`, `evidence`, optional `limitations`, `counterevidence`, `question`, `lead` | A candidate with its reference check result. Only the operator records findings |

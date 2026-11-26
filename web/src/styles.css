@@ -349,6 +349,16 @@ td code { overflow-wrap: anywhere; }
 .request-actions input[type="number"] { width: 5rem; }
 .request-list > li { display: block; }
 .waiting-list > li { justify-content: flex-start; }
+.question-list > li, .lead-list > li, .candidate-list > li { display: block; }
+.question, .lead, .candidate { display: grid; gap: .35rem; min-width: 0; }
+.question-head { display: flex; flex-wrap: wrap; align-items: center; gap: .35rem .55rem; min-width: 0; }
+.question-text { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.question-form { border-top: 1px solid var(--line); padding-top: .75rem; }
+.spaced { margin-right: .4rem; }
+.plan { margin: 0; padding-left: 1.4rem; display: grid; gap: .2rem; overflow-wrap: anywhere; }
+.observations > li { padding: .2rem 0; overflow-wrap: anywhere; }
+.evidence-link { margin-left: .3rem; }
+.check-problems { margin: 0; color: var(--err); }
 .msg-thinking { display: inline-flex; align-items: center; gap: .6rem; color: var(--muted); font-style: italic; }
 .dots { display: inline-flex; gap: .2rem; }
 .dots span { width: .38rem; height: .38rem; border-radius: 50%; background: var(--forge); animation: pulse 1.2s ease-in-out infinite; }

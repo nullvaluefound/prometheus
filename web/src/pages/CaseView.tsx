@@ -9,6 +9,7 @@ import { ArtifactsTab } from "./case/ArtifactsTab";
 import { AuditTab } from "./case/AuditTab";
 import { ChatTab } from "./case/ChatTab";
 import { FindingsTab } from "./case/FindingsTab";
+import { InvestigationTab } from "./case/InvestigationTab";
 import { OverviewTab } from "./case/OverviewTab";
 import { RulesTab } from "./case/RulesTab";
 import { ToolsTab, type ToolRun } from "./case/ToolsTab";
@@ -138,6 +139,7 @@ export function CaseView({ id, tab }: { id: string; tab: CaseTab }) {
         {tab === "overview" && <OverviewTab ctx={context} reportTask={reportTask} onReport={setReportTask} />}
         {tab === "artifacts" && <ArtifactsTab ctx={context} policy={policy.data} onSummary={summarize} onTools={openTools} />}
         {tab === "tools" && <ToolsTab ctx={context} policy={policy} runs={runs} runTool={runTool} preset={preset} />}
+        {tab === "investigation" && <InvestigationTab ctx={context} />}
         {tab === "findings" && <FindingsTab ctx={context} />}
         {tab === "chat" && <ChatTab ctx={context} draft={draft} setDraft={setDraft} />}
         {tab === "rules" && <RulesTab ctx={context} policy={policy} />}

@@ -177,6 +177,42 @@ export function TaskLine({ task }: { task: Task }) {
   );
 }
 
+function WaitingLine({ item }: { item: WaitingItem }) {
+  if (item.kind === "grant_request") {
+    return (
+      <>
+        <span className="chip chip-warn">Grant request</span>
+        <CaseLink id={item.case} href={caseHref(item.case, "rules")} />
+        <code>{txt(item.tool)}</code>
+        <code title={txt(item.artifact)}>{short(item.artifact, 12)}</code>
+        <span className="muted small">for {item.audience === "mcp" ? "a cloud or MCP model" : "the local model"}</span>
+        {item.flagged && <span className="chip chip-warn">reason names unverified values</span>}
+        <Time utc={item.utc} relative />
+      </>
+    );
+  }
+  if (item.kind === "candidate") {
+    return (
+      <>
+        <span className="chip chip-info">Proposed finding</span>
+        <CaseLink id={item.case} href={caseHref(item.case, "findings")} />
+        <code>{txt(item.id)}</code>
+        {item.check && <span className="muted small">check {txt(item.check).replace("_", " ")}</span>}
+        {item.verdict && <span className="muted small">review {txt(item.verdict)}</span>}
+        <Time utc={item.utc} relative />
+      </>
+    );
+  }
+  return (
+    <>
+      <span className="chip chip-info">{item.kind === "question_proposed" ? "Proposed sub-question" : "Answer proposed"}</span>
+      <CaseLink id={item.case} href={caseHref(item.case, "investigation")} />
+      <code>{txt(item.id)}</code>
+      <Time utc={item.utc} relative />
+    </>
+  );
+}
+
 function WaitingPanel({ items, count }: { items: WaitingItem[]; count: number }) {
   return (
     <Panel title={count ? `Waiting on you (${count})` : "Waiting on you"}>
@@ -185,14 +221,8 @@ function WaitingPanel({ items, count }: { items: WaitingItem[]; count: number })
       ) : (
         <ul className="rows waiting-list">
           {items.map((item) => (
-            <li key={`${txt(item.case)}:${txt(item.id)}`}>
-              <span className="chip chip-warn">Grant request</span>
-              <CaseLink id={item.case} href={caseHref(item.case, "rules")} />
-              <code>{txt(item.tool)}</code>
-              <code title={txt(item.artifact)}>{short(item.artifact, 12)}</code>
-              <span className="muted small">for {item.audience === "mcp" ? "a cloud or MCP model" : "the local model"}</span>
-              {item.flagged && <span className="chip chip-warn">reason names unverified values</span>}
-              <Time utc={item.utc} relative />
+            <li key={`${txt(item.case)}:${txt(item.kind)}:${txt(item.id)}`}>
+              <WaitingLine item={item} />
             </li>
           ))}
         </ul>

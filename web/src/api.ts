@@ -7,7 +7,16 @@ export type Audience = "local" | "mcp";
 export type Completeness = "complete" | "partial" | "unknown";
 export type Provider = "ollama" | "openai" | "anthropic";
 export type TaskState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
-export type TaskKind = "create_case" | "ingest" | "tool" | "chat" | "model_test" | "report";
+export type TaskKind =
+  | "create_case"
+  | "ingest"
+  | "tool"
+  | "chat"
+  | "model_test"
+  | "report"
+  | "split"
+  | "review"
+  | "record_finding";
 
 export const ROLES: readonly Role[] = ["intake", "native", "evidence", "review"];
 export const AUDIENCES: readonly Audience[] = ["local", "mcp"];
@@ -159,14 +168,132 @@ export interface GrantRequest {
 }
 
 export interface WaitingItem {
-  kind: "grant_request";
+  kind: "grant_request" | "candidate" | "question_proposed" | "question_answer_proposed";
   case: string;
+  id: string;
+  tool?: string;
+  artifact?: string;
+  audience?: Audience;
+  utc: string;
+  flagged?: boolean;
+  check?: CheckResult | null;
+  verdict?: Verdict | null;
+}
+
+/** Model-written rows carry who wrote them; operator rows do not. */
+export interface Authored {
+  author?: "model";
+  session?: string;
+  audience?: Audience;
+  grants?: string[];
+  utc?: string;
+}
+
+export type QuestionState = "proposed" | "open" | "answer_proposed" | "closed" | "withdrawn";
+
+export interface Question extends Authored {
+  id: string;
+  state: QuestionState;
+  text: string;
+  outcome: string;
+  artifacts: string[];
+  parent: string | null;
+  created_by: string;
+  created_utc: string;
+  closed_by: string | null;
+  closed_utc: string | null;
+  note: string | null;
+}
+
+export interface Lead extends Authored {
+  id: string;
+  state: "open" | "claimed" | "done" | "retired" | "stopped";
+  artifact: string;
+  address: string | null;
+  offset: number | null;
+  title: string;
+  question: string | null;
+}
+
+export interface Observation extends Authored {
+  id: string;
+  kind: "observed" | "inferred";
+  text: string;
+  artifact: string;
+  lead: string | null;
+  evidence: string[];
+}
+
+export type CheckResult = "passed" | "failed" | "not_assessed";
+export type Verdict = "supported" | "unsupported" | "insufficient";
+
+export interface CandidateCheck {
+  result: CheckResult;
+  problems: { code: string; ref: string | null }[];
+  utc: string;
+}
+
+export interface Candidate extends Authored {
+  id: string;
+  state: "proposed" | "recorded" | "rejected";
+  claim: string;
+  kind: string;
+  confidence: string;
+  artifacts: string[];
+  evidence: string[];
+  limitations: string | null;
+  counterevidence: string | null;
+  question: string | null;
+  lead: string | null;
+  check: CandidateCheck | null;
+  verdicts: { verdict: Verdict; rationale: string; model: string; utc: string; operator: string }[];
+  finding: string | null;
+  decided_by: string | null;
+  decided_utc: string | null;
+  note: string | null;
+}
+
+export interface Investigation {
+  questions: Question[];
+  leads: Lead[];
+  observations: Observation[];
+  plan: ({ items: string[] } & Authored) | null;
+  candidates: Candidate[];
+}
+
+export interface EvidenceRow {
   id: string;
   tool: string;
   artifact: string;
+  selector: Record<string, string | number>;
+  excerpt: boolean;
   audience: Audience;
   utc: string;
-  flagged: boolean;
+}
+
+export interface EvidenceEntry {
+  id: string;
+  tool: string;
+  arguments: Record<string, string | number>;
+  excerpt: boolean;
+  audience: Audience;
+  grants: string[];
+  ticket: string;
+  session: string;
+  utc: string;
+  reply: unknown;
+}
+
+export interface QuestionInput {
+  text: string;
+  outcome: string;
+  artifacts: string[];
+}
+
+export interface RecordInput {
+  claim?: string;
+  kind?: string;
+  confidence?: string;
 }
 
 export interface DecideInput {
@@ -213,6 +340,7 @@ export interface PolicyLimits {
 
 export interface Policy {
   tools: PolicyTool[];
+  state_tools?: { name: string; description: string; writes: boolean }[];
   denied: string[];
   roles: Record<string, string[]>;
   limits: PolicyLimits;
@@ -370,6 +498,25 @@ export const api = {
   policy: (opts?: Opts) => get<Policy>("policy", opts),
   createGrant: (id: string, grant: GrantInput) => post<Grant>(`cases/${seg(id)}/grants`, grant),
   revokeGrant: (id: string, grant: string) => del<{ revoked: string }>(`cases/${seg(id)}/grants/${seg(grant)}`),
+  investigation: (id: string, opts?: Opts) => get<Investigation>(`cases/${seg(id)}/investigation`, opts),
+  evidence: (id: string, opts?: Opts) => get<{ evidence: EvidenceRow[] }>(`cases/${seg(id)}/evidence`, opts),
+  evidenceEntry: (id: string, evidence: string, opts?: Opts) =>
+    get<EvidenceEntry>(`cases/${seg(id)}/evidence/${seg(evidence)}`, opts),
+  addQuestion: (id: string, input: QuestionInput) => post<Question>(`cases/${seg(id)}/questions`, input),
+  editQuestion: (id: string, question: string, input: QuestionInput) =>
+    put<Question>(`cases/${seg(id)}/questions/${seg(question)}`, input),
+  setQuestionState: (id: string, question: string, state: "open" | "closed" | "withdrawn", note?: string) =>
+    post<Question>(`cases/${seg(id)}/questions/${seg(question)}/state`, { state, note }),
+  splitQuestion: (id: string, question: string) => post<TaskEnvelope>(`cases/${seg(id)}/questions/${seg(question)}/split`),
+  setLeadState: (id: string, lead: string, state: "open" | "retired") =>
+    post<Lead>(`cases/${seg(id)}/leads/${seg(lead)}/state`, { state }),
+  checkCandidate: (id: string, candidate: string) => post<Candidate>(`cases/${seg(id)}/candidates/${seg(candidate)}/check`),
+  reviewCandidate: (id: string, candidate: string) =>
+    post<TaskEnvelope>(`cases/${seg(id)}/candidates/${seg(candidate)}/review`),
+  recordCandidate: (id: string, candidate: string, input: RecordInput) =>
+    post<TaskEnvelope>(`cases/${seg(id)}/candidates/${seg(candidate)}/record`, input),
+  rejectCandidate: (id: string, candidate: string, note?: string) =>
+    post<Candidate>(`cases/${seg(id)}/candidates/${seg(candidate)}/reject`, { note }),
   requests: (id: string, opts?: Opts) => get<{ requests: GrantRequest[] }>(`cases/${seg(id)}/requests`, opts),
   denyAllRequests: (id: string, note?: string) => post<{ denied: string[] }>(`cases/${seg(id)}/requests`, { action: "deny_all", note }),
   decideRequest: (id: string, request: string, input: DecideInput) =>
