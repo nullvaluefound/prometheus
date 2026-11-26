@@ -133,6 +133,8 @@ export interface ChatMessage {
   model?: string;
   operator?: string;
   utc: string;
+  audience?: "local" | "mcp"; // assistant rows: the audience the text was written for
+  grants?: string[]; // assistant rows: excerpt grants the text may quote
 }
 
 export interface Me {

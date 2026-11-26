@@ -151,6 +151,9 @@ class BrokerTests(unittest.TestCase):
             self.assertTrue(mcp.call(ask)["isError"])
             worker.assert_not_called()
             self.assertFalse(local.call(ask)["isError"])
+        # The fixture grant has no ID, so the release is recorded with a marker no active grant matches.
+        self.assertEqual(local.released_grants, {server.UNIDENTIFIED})
+        self.assertEqual(mcp.released_grants, set())
         with patch.object(runtime, "worker", side_effect=revoked):
             self.assertTrue(local.call(ask)["isError"])
 

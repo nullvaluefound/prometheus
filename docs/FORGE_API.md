@@ -90,6 +90,8 @@ interface ChatMessage {
   text: string;               // assistant/user text; for role "tool" a one-line summary
   tool?: string; decision?: "completed" | "intercepted" | "failed"; reason?: string;
   model?: string; operator?: string; utc: string;
+  audience?: "local" | "mcp"; // assistant rows: the audience the text was written for
+  grants?: string[];           // assistant rows: grant ids whose excerpts the text may quote
 }
 ```
 
@@ -131,7 +133,7 @@ interface ChatMessage {
 
 ### Chat
 - `GET api/cases/{id}/chat` returns `{ messages: ChatMessage[], busy: boolean }`.
-- `POST api/cases/{id}/chat` with `{ message }` (1–6000 chars) returns `202 {task}` (kind `chat`). The model runs through the broker with the case's role and tool allowlist. Tool calls and intercepted calls appear as `role: "tool"` messages. Requires `settings.model`. It returns 409 if the model is cloud and `allow_cloud` is false.
+- `POST api/cases/{id}/chat` with `{ message }` (1–6000 chars) returns `202 {task}` (kind `chat`). The model runs through the broker with the case's role and tool allowlist. Tool calls and intercepted calls appear as `role: "tool"` messages. Earlier assistant text is replayed to the model only while every grant in its `grants` is active for the model's audience; otherwise the model sees a withheld placeholder (docs/SAFETY.md). Requires `settings.model`. It returns 409 if the model is cloud and `allow_cloud` is false.
 - `DELETE api/cases/{id}/chat` clears the conversation and returns `{ cleared: true }`.
 
 ### Tasks

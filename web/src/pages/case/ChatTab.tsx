@@ -211,12 +211,18 @@ function MessageRow({ message }: { message: ChatMessage }) {
       </li>
     );
   }
+  const grants = list(message.grants).length;
   return (
     <li className="msg msg-assistant">
       <div className="msg-meta">
         <span className="msg-who">Model</span>
         {message.model && <code>{txt(message.model)}</code>}
         <Time utc={message.utc} relative />
+        {grants > 0 && (
+          <span className="muted small" title="This text may quote these excerpts. It is replayed to a model only while every one of these grants is active for that model's audience.">
+            drew on {grants} excerpt grant{grants === 1 ? "" : "s"}
+          </span>
+        )}
       </div>
       <p className="msg-text">{txt(message.text)}</p>
     </li>

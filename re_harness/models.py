@@ -32,6 +32,8 @@ INSTRUCTIONS = ("You are assisting an authorized defensive, static-only malware 
                 "names, strings or decompilation until an operator grants an excerpt; a denial is expected and you "
                 "should say what grant would help rather than retrying. Cite artifact SHA-256 values and addresses for "
                 "every claim and state uncertainty.")
+WITHHELD = ("[An earlier answer is withheld from this model. It drew on excerpts that are not granted to this "
+            "model's audience now.]")
 
 
 class ModelError(ValueError):
@@ -322,8 +324,38 @@ def test(config):
     return {"ok": True, "detail": (text.strip() or "The model answered with no text.")[:200]}
 
 
+def replayable(row, active):
+    """Model text can quote excerpts it saw. Replay it only while every grant it drew on is active for this audience.
+
+    A row from before rows were stamped has unknown provenance, so it is withheld.
+    """
+    grants = row.get("grants")
+    return (row.get("audience") in ("local", "mcp") and isinstance(grants, list) and
+            all(isinstance(grant, str) and grant in active for grant in grants))
+
+
+def replay(adapter, history, scope, audience):
+    """Feed earlier turns to the adapter under the excerpt rule. Returns the grants the replayed text drew on."""
+    active = server.active_grant_ids(scope, audience)
+    inherited = set()
+    for row in history[-MAX_HISTORY:]:
+        if row.get("role") == "user" and isinstance(row.get("text"), str):
+            adapter.user(row["text"])
+        elif row.get("role") == "assistant" and row.get("text"):
+            if replayable(row, active):
+                adapter.assistant_text(row["text"])
+                inherited.update(row["grants"])
+            else:
+                adapter.assistant_text(WITHHELD)
+    return inherited
+
+
 def converse(state, case_id, config, settings, history, message, operator):
-    """Run one user turn through the broker. Returns the display rows to append to the chat."""
+    """Run one user turn through the broker. Returns the display rows to append to the chat.
+
+    Each assistant row is stamped with the audience it was written for and every grant whose excerpts it may quote:
+    the grants this turn released plus those of the earlier text it was shown.
+    """
     if not isinstance(message, str) or not 1 <= len(message) <= MAX_PROMPT:
         raise ModelError(f"Send a message of 1-{MAX_PROMPT} characters.")
     cloud = is_cloud(config)
@@ -332,16 +364,17 @@ def converse(state, case_id, config, settings, history, message, operator):
     role = settings.get("role") if settings.get("role") in local_model.ROLES else "evidence"
     allowed = set(settings.get("tools") or ()) & local_model.ROLES[role]
     broker = server.Broker(state, case_id, allowed, audience="mcp" if cloud else "local")
-    broker.current_scope()
+    scope = broker.current_scope()
     system = INSTRUCTIONS + "\n\n" + (runtime.ROOT / "agents" / role / "AGENTS.md").read_text(encoding="utf-8")
     adapter = ADAPTERS[config["provider"]](config, system, tool_specs(allowed))
-    for row in history[-MAX_HISTORY:]:
-        if row.get("role") == "user":
-            adapter.user(row["text"])
-        elif row.get("role") == "assistant" and row.get("text"):
-            adapter.assistant_text(row["text"])
+    inherited = replay(adapter, history, scope, broker.audience)
     adapter.user(message)
     rows = []
+
+    def stamped(found):
+        grants = sorted(inherited | broker.released_grants)
+        return [{**row, "audience": broker.audience, "grants": grants} if row["role"] == "assistant" else row
+                for row in found]
     runtime.audit(broker.folder, case=case_id, session=broker.session, decision="forge_chat_started", role=role,
                   provider=config["provider"], cloud=cloud, operator=operator, via="forge")
     try:
@@ -352,7 +385,7 @@ def converse(state, case_id, config, settings, history, message, operator):
                 runtime.audit(broker.folder, case=case_id, session=broker.session, decision="forge_chat_completed",
                               role=role, operator=operator, via="forge")
                 rows.append({"role": "assistant", "text": text or "(no answer)", "model": config["model"]})
-                return rows
+                return stamped(rows)
             if text:
                 rows.append({"role": "assistant", "text": text, "model": config["model"]})
             pairs = []

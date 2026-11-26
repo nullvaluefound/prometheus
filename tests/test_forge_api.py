@@ -1,5 +1,8 @@
+import datetime as dt
 import json
 import os
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -220,6 +223,104 @@ class ForgeApiTests(ForgeServer, unittest.TestCase):
         release.set()
         self.assertEqual(self.wait(first)["state"], "succeeded")
         self.assertEqual(self.api("GET", "tasks/" + "f" * 32)[0], 404)
+
+
+class ScriptedAdapter:
+    """A model adapter that records what it is shown and replies from a script."""
+    script = []
+    last = None
+
+    def __init__(self, config, system, tools):
+        self.system, self.tools, self.seen, self.steps = system, tools, [], list(ScriptedAdapter.script)
+        ScriptedAdapter.last = self
+
+    def user(self, text):
+        self.seen.append(("user", text))
+
+    def assistant_text(self, text):
+        self.seen.append(("assistant", text))
+
+    def step(self):
+        return self.steps.pop(0)
+
+    def results(self, pairs):
+        self.seen.append(("results", [text for _, text in pairs]))
+
+
+class ChatReplayTests(unittest.TestCase):
+    """Earlier model text reaches a model only while the grants it drew on are active for that model's audience."""
+
+    LOCAL = {"provider": "ollama", "base_url": "http://127.0.0.1:11434", "model": "lab"}
+    CLOUD = {"provider": "ollama", "base_url": "https://llm.example.com", "model": "hosted"}
+    SETTINGS = {"role": "evidence", "tools": ["artifact_strings", "artifact_summary"], "allow_cloud": True}
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.state = Path(directory.name)
+        self.digest = "a" * 64
+        write_case(self.state, "review", "sha256:" + self.digest)
+        folder = runtime.case_path(self.state, "review")
+        soon = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=10)).isoformat()
+        past = "2026-01-01T00:00:00+00:00"
+        self.arguments = {"artifact": self.digest, "offset": 0, "limit": 20}
+        grants = [{"id": "g" * 32, "tool": "artifact_strings", "arguments": self.arguments, "audience": "local",
+                   "expires_utc": soon},
+                  {"id": "e" * 32, "tool": "artifact_strings", "arguments": self.arguments, "audience": "local",
+                   "expires_utc": past},
+                  {"id": "m" * 32, "tool": "artifact_strings", "arguments": self.arguments, "audience": "mcp",
+                   "expires_utc": soon}]
+        atomic_json(folder / "scope.json", {**runtime.read_json(folder / "scope.json"), "grants": grants})
+        patcher = patch.dict(models.ADAPTERS, {"ollama": ScriptedAdapter})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.history = [
+            {"role": "user", "text": "first question"},
+            {"role": "assistant", "text": "quoted a local excerpt", "audience": "local", "grants": ["g" * 32]},
+            {"role": "assistant", "text": "quoted an expired excerpt", "audience": "local", "grants": ["e" * 32]},
+            {"role": "assistant", "text": "written before stamping"},
+            {"role": "tool", "tool": "artifact_summary", "decision": "completed", "text": "artifact_summary completed"},
+            {"role": "assistant", "text": "drew on no excerpt", "audience": "local", "grants": []},
+        ]
+
+    def run_turn(self, config, script):
+        ScriptedAdapter.script = script
+        return models.converse(self.state, "review", config, self.SETTINGS, self.history, "next", "analyst")
+
+    def test_local_replay_withholds_expired_and_unstamped_text(self):
+        rows = self.run_turn(self.LOCAL, [("Answer.", [])])
+        self.assertEqual(ScriptedAdapter.last.seen, [
+            ("user", "first question"), ("assistant", "quoted a local excerpt"), ("assistant", models.WITHHELD),
+            ("assistant", models.WITHHELD), ("assistant", "drew on no excerpt"), ("user", "next")])
+        # The answer was written after seeing text that quoted grant g, so it inherits that grant.
+        self.assertEqual(rows, [{"role": "assistant", "text": "Answer.", "model": "lab", "audience": "local",
+                                 "grants": ["g" * 32]}])
+
+    def test_a_cloud_model_never_sees_text_built_on_local_grants(self):
+        rows = self.run_turn(self.CLOUD, [("Answer.", [])])
+        seen = ScriptedAdapter.last.seen
+        self.assertNotIn(("assistant", "quoted a local excerpt"), seen)
+        self.assertIn(("assistant", "drew on no excerpt"), seen)
+        self.assertEqual((rows[0]["audience"], rows[0]["grants"]), ("mcp", []))
+
+    def test_rows_record_the_grants_a_turn_released(self):
+        call = {"id": None, "name": "artifact_strings", "arguments": dict(self.arguments)}
+        reply = {"tool": "artifact_strings", "artifact": self.digest, "strings": []}
+        with patch.object(runtime, "worker", return_value=(0, json.dumps(reply).encode())), \
+                patch.object(models.server.projection, "project", side_effect=lambda value, *args: value):
+            rows = self.run_turn(self.CLOUD, [("Looking.", [call]), ("Done.", [])])
+        assistant = [row for row in rows if row["role"] == "assistant"]
+        self.assertEqual([row["grants"] for row in assistant], [["m" * 32], ["m" * 32]])
+        self.assertEqual([row["decision"] for row in rows if row["role"] == "tool"], ["completed"])
+
+    def test_replay_rule(self):
+        active = {"g" * 32}
+        self.assertTrue(models.replayable({"audience": "local", "grants": []}, active))
+        self.assertTrue(models.replayable({"audience": "mcp", "grants": ["g" * 32]}, active))
+        for row in ({"audience": "local", "grants": ["x" * 32]}, {"audience": "other", "grants": []},
+                    {"audience": "local"}, {"audience": "local", "grants": "g" * 32}, {"grants": []}):
+            with self.subTest(row=row):
+                self.assertFalse(models.replayable(row, active))
 
 
 class ModelAdapterTests(unittest.TestCase):
