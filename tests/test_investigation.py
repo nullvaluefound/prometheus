@@ -156,8 +156,12 @@ class StateToolTests(CaseState):
         bad = self.reply(broker.call(ask("propose_finding", claim="Decoder at 0x5120.", kind="observed",
                                           confidence="low", artifacts=[DIGEST], evidence=[])))
         self.assertEqual(bad["check"]["result"], "failed")
-        # Models get problem codes only; the operator sees which reference failed.
-        self.assertEqual(set(bad["check"]["problems"]), {"address_not_in_evidence", "observed_without_evidence"})
+        # The model sees which of its own values failed, so it can fix the claim.
+        self.assertEqual({(row["code"], row["ref"]) for row in bad["check"]["problems"]},
+                         {("address_not_in_evidence", "0x5120"), ("observed_without_evidence", None)})
+        again = self.reply(broker.call(ask("propose_finding", claim="Decoder at 0x5120.", kind="observed",
+                                           confidence="low", artifacts=[DIGEST], evidence=[])))
+        self.assertEqual(again["reason"], "duplicate_proposal")
         stored = investigation.load(self.state, "review")["candidates"]
         self.assertEqual([(row["id"], row["state"], row["finding"]) for row in stored],
                          [("C1", "proposed", None), ("C2", "proposed", None)])
@@ -320,6 +324,113 @@ class ReviewFixTests(CaseState):
                 action()
         investigation.release_candidate(self.state, "review", "C1")
         self.assertEqual(investigation.load(self.state, "review")["candidates"][0]["state"], "proposed")
+
+
+class DerivedFieldTests(CaseState):
+    """The broker adds arithmetic a small model gets wrong: entry VA, its section, ELF entry in hex."""
+
+    def summarize(self, summary):
+        reply = {"tool": "artifact_summary", "artifact": DIGEST, "artifact_bytes": 16, "summary": summary}
+        with patch.object(runtime, "worker", return_value=(0, json.dumps(reply).encode())):
+            return self.reply(self.broker().call(ask("artifact_summary", artifact=DIGEST)))
+
+    def test_pe_entry_va_and_section(self):
+        sections = [{"rva": "0x1000", "raw_offset": 512, "raw_size": 512, "virtual_size": 4096, "flags": "0x60000020",
+                     "entropy": 5.1},
+                    {"rva": "0x3000", "raw_offset": 1024, "raw_size": 0, "virtual_size": 8192, "flags": "0xe0000020",
+                     "entropy": 0.0}]
+        pe = {"parsed": True, "sections_count": 2, "import_libraries_count": 1, "certificate_bytes": 0,
+              "machine": "0x14c", "entry_rva": "0x3010", "image_base": "0x400000", "overlay_offset": None,
+              "sections": sections}
+        reply = self.summarize({"size": 16, "format_hint": "PE candidate", "strings_count": 0,
+                                "strings_truncated": False, "pe": pe})
+        self.assertEqual(reply["derived"], {"entry_va": "0x403010", "entry_section": 1})
+        self.assertEqual(evidence.load(self.folder, reply["evidence_id"])["reply"]["derived"]["entry_va"], "0x403010")
+        claim = self.reply(self.broker().call(ask("propose_finding", claim="Entry point VA 0x403010.", kind="observed",
+                                                  confidence="high", artifacts=[DIGEST],
+                                                  evidence=[reply["evidence_id"]])))
+        self.assertEqual(claim["check"]["result"], "passed")
+
+    def test_elf_entry_in_hex(self):
+        reply = self.summarize({"size": 16, "format_hint": "ELF", "strings_count": 0, "strings_truncated": False,
+                                "elf": {"elf_class": 2, "data_encoding": 1, "machine": 62, "e_type": 3,
+                                        "e_entry": 4160, "phnum": 13, "shnum": 31}})
+        self.assertEqual(reply["derived"], {"e_entry_hex": "0x1040"})
+
+
+class FactRuleTests(ReviewFixTests):
+    """ARTEX's fact methodology: facts are held to their evidence, carry a source, and findings rest on facts."""
+
+    def sample_evidence(self):
+        """An import-names reply: content the sample's author controls, released under grant g."""
+        self.grant()
+        scope = runtime.read_json(self.folder / "scope.json")
+        scope["grants"][0].update(tool="artifact_imports", arguments={"artifact": DIGEST, "offset": 0, "limit": 20})
+        atomic_json(self.folder / "scope.json", scope)
+        reply = {"tool": "artifact_imports", "artifact": DIGEST, "artifact_bytes": 16,
+                 "summary": {"rows": [{"kind": "pe_import", "name": "ExitProcess", "address": "0x2040"}]}}
+        return evidence.record(self.folder, "artifact_imports", {"artifact": DIGEST, "offset": 0, "limit": 20}, reply,
+                               True, "local", ["g" * 32], "t" * 32, "s" * 32)
+
+    def test_an_observed_fact_is_held_to_its_evidence(self):
+        summary = self.summary_evidence()
+        broker = self.broker()
+        refused = self.reply(broker.call(ask("record_observation", kind="observed", text="Decoder at 0x5120.",
+                                             artifact=DIGEST, evidence=[summary])))
+        self.assertEqual(refused["reason"], "address_not_in_evidence")
+        self.assertIn("guidance", json.loads(models.boundary.for_model(json.dumps(refused), True)))
+        inferred = self.reply(broker.call(ask("record_observation", kind="inferred", text="Decoder at 0x5120?",
+                                              artifact=DIGEST, evidence=[summary])))
+        self.assertEqual(inferred["status"], "recorded")
+        self.reply(broker.call(ask("record_observation", kind="observed", text="Entry point 0x401000.",
+                                   artifact=DIGEST, evidence=[summary])))
+        rows = investigation.load(self.state, "review")["observations"]
+        self.assertEqual([(row["kind"], row["sources"]) for row in rows],
+                         [("inferred", ["tool_output"]), ("observed", ["tool_output"])])
+        guessed = self.reply(broker.call(ask("record_observation", kind="inferred", text="Probably packed.",
+                                             artifact=DIGEST)))
+        self.assertEqual(guessed["status"], "recorded")
+        self.assertEqual(investigation.load(self.state, "review")["observations"][-1]["sources"], ["inference"])
+
+    def test_sources_come_from_the_tool_not_the_model(self):
+        names = self.sample_evidence()
+        broker = self.broker()
+        broker.released_grants.add("g" * 32)
+        self.reply(broker.call(ask("record_observation", kind="observed", text="Imports ExitProcess at 0x2040.",
+                                   artifact=DIGEST, evidence=[names])))
+        self.assertEqual(investigation.load(self.state, "review")["observations"][0]["sources"], ["sample_content"])
+
+    def test_findings_can_rest_on_observations(self):
+        summary = self.summary_evidence()
+        broker = self.broker()
+        broker.call(ask("record_observation", kind="observed", text="Entry point 0x401000.", artifact=DIGEST,
+                        evidence=[summary]))
+        reply = self.reply(broker.call(ask("propose_finding", claim="The entry point is 0x401000.", kind="observed",
+                                           confidence="high", artifacts=[DIGEST], observations=["O1"])))
+        self.assertEqual(reply["check"]["result"], "passed")
+        candidate = investigation.load(self.state, "review")["candidates"][0]
+        self.assertEqual((candidate["observations"], candidate["evidence"], candidate["check"]["sources"]),
+                         (["O1"], [summary], ["tool_output"]))
+        self.assertEqual(self.reply(broker.call(ask("propose_finding", claim="x", kind="inferred", confidence="low",
+                                                    artifacts=[DIGEST], observations=["O9"])))["reason"],
+                         "unknown_observation")
+
+    def test_an_answer_needs_a_tool_s_own_result_not_only_sample_content(self):
+        names = self.sample_evidence()
+        question = investigation.add_question(self.state, "review", "Imports?", "Names", [DIGEST], "analyst")["id"]
+
+        def seed(data):
+            data["run"] = {"id": "R1", "state": "running", "questions": [question]}
+            data["candidates"] += [
+                {"id": "C1", "state": "proposed", "artifacts": [DIGEST], "evidence": [names],
+                 "check": {"result": "passed", "problems": [], "sources": ["sample_content"]}},
+                {"id": "C2", "state": "proposed", "artifacts": [DIGEST], "evidence": [self.summary_evidence()],
+                 "check": {"result": "passed", "problems": []}}]  # older proposal: no sources recorded
+        investigation.update(self.state, "review", seed)
+        with self.assertRaisesRegex(investigation.InvestigationError, "answer_needs_tool_output"):
+            investigation.propose_answer(self.state, "review", "R1", question, ["C1"], {})
+        answered = investigation.propose_answer(self.state, "review", "R1", question, ["C1", "C2"], {})
+        self.assertEqual(answered["state"], "answer_proposed")
 
 
 class ReviewRunTests(CaseState):

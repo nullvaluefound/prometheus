@@ -6,6 +6,7 @@ import { Badge, ConfirmButton, Dialog, Empty, ErrorNote, Loading, Panel, Time } 
 import { isRecord, list, short, txt } from "../../format";
 import { errorMessage, isTerminal, useResource, useTask } from "../../hooks";
 import type { CaseContext } from "../CaseView";
+import { SourceBadge } from "./InvestigationTab";
 
 const KINDS = ["observed", "inferred", "corroborated", "unknown"];
 const CONFIDENCE = ["low", "medium", "high"];
@@ -115,6 +116,7 @@ function CandidateCard({ ctx, candidate, reload }: { ctx: CaseContext; candidate
             {CHECK_LABEL[check.result] ?? txt(check.result)}
           </Badge>
         )}
+        {check && <SourceBadge sources={list<string>(check.sources)} />}
         {verdict && <Badge tone={verdict.verdict === "supported" ? "ok" : "warn"}>review: {txt(verdict.verdict)}</Badge>}
         <Badge tone="muted" title="Written by a model. Untrusted text.">
           model, {txt(candidate.audience)}

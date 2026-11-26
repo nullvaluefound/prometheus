@@ -60,6 +60,16 @@ GUIDANCE = {
     "not_requestable": "This call cannot be requested. Carry on without this excerpt.",
     "invalid_note": "Send note_grant_need with exactly a request id and a short reason.",
     "invalid_reason": "Give a short, non-empty reason.",
+    "duplicate_proposal": "You already proposed exactly this claim. If its check failed, change the claim to fix the "
+                          "listed problem instead of proposing it again.",
+    "answer_needs_tool_output": "Every cited proposal rests only on content the sample's author controls (string "
+                                "text, import names or matched bytes). Back the answer with a proposal that cites "
+                                "a tool's own result too: the header, capa, or Ghidra's analysis.",
+    "unknown_observation": "No such observation. Use an O id from lead_detail or a record_observation reply.",
+    "address_not_in_evidence": "An address in your text does not appear in the evidence you cited. Write it as the "
+                               "evidence shows it, cite the result that shows it, or record the fact as inferred.",
+    "claim_names_unadmitted_sha256": "Your text names a SHA-256 that is not an admitted artifact. Use the artifact's "
+                                     "exact SHA-256.",
     "too_many_leads_this_round": "That is the most leads one planning round may add. Carry on with the others.",
     "investigation_stopped": "The investigation is no longer running. Stop calling tools and write your wrap-up.",
     "investigation_settling": "The investigation's budget is spent. Stop calling tools and write your wrap-up.",

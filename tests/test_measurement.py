@@ -182,6 +182,38 @@ class SkillTests(unittest.TestCase):
         self.turn("review", "../../etc/passwd", "x" * 80)
         self.assertEqual([(row["name"], row["count"]) for row in skills.gaps(self.state)], [("invalid-name", 2)])
 
+    def test_every_visible_skill_exists_and_says_when_to_use_it(self):
+        for role, names in skills.VISIBLE.items():
+            for name in names:
+                with self.subTest(role=role, name=name):
+                    skill = skills.read(name)
+                    self.assertIsNotNone(skill)
+                    self.assertGreater(len(skill["description"]), 40)
+                    self.assertLess(len(skill["body"]), skills.MAX_BODY)
+
+    def test_skills_name_only_tools_that_exist(self):
+        """A small model calls what the skill tells it to, so a skill must never name a tool it does not have."""
+        import re
+        from re_harness import investigation, policy
+        real = set(policy.TOOLS) | set(investigation.TOOLS) | {"note_grant_need", "load_skill", "submit_verdict"}
+        suffixes = ("_summary", "_strings", "_imports", "_functions", "_xrefs", "_decompile", "_inspect", "_scan",
+                    "_triage", "_overview", "_detail", "_lead", "_observation", "_plan", "_finding", "_need")
+        for name in {name for names in skills.VISIBLE.values() for name in names}:
+            body = skills.read(name)["body"]
+            for token in set(re.findall(r"`([a-z]+(?:_[a-z]+)+)`", body)):
+                if token.endswith(suffixes):
+                    with self.subTest(skill=name, token=token):
+                        self.assertIn(token, real)
+
+    def test_pinned_skills_load_into_the_prompt_and_leave_the_listing(self):
+        with patch.dict(skills.PINNED, {"evidence": ("static-triage",)}):
+            text = skills.listing("evidence")
+        self.assertTrue(text.startswith("## Procedure: static-triage\n\n**Rules first:**"))
+        self.assertNotIn("# Static triage", text)
+        self.assertNotIn("- `static-triage`:", text)
+        self.assertIn("- `recording-evidence`:", text)
+        self.assertIn("- `static-triage`:", skills.listing("evidence"))
+
     def test_frontmatter_is_split_from_the_body(self):
         fields, body = skills.parse("---\nname: a\ndescription: Does b.\n---\n\n# Title\n")
         self.assertEqual((fields, body), ({"name": "a", "description": "Does b."}, "# Title"))
@@ -199,7 +231,8 @@ class OutcomeApiTests(ForgeServer, unittest.TestCase):
         self.assertEqual((status, card["grants"]["requested"]), (200, 1))
         self.assertEqual(self.api("GET", "cases/offscope/outcome")[0], 404)
         policy = self.api("GET", "policy")[1]
-        self.assertEqual([row["name"] for row in policy["skills"]["review"]], ["static-re-evidence"])
+        self.assertEqual([row["name"] for row in policy["skills"]["review"]],
+                         ["recording-evidence", "capa-yara", "import-analysis", "static-re-evidence"])
         self.assertEqual(policy["skill_gaps"], [])
 
 

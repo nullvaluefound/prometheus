@@ -19,13 +19,19 @@ TOOL = "load_skill"
 TEXT = "Load the full procedure of one skill listed in your instructions, by its name."
 SCHEMA = {"type": "object", "properties": {"name": {"type": "string", "pattern": "^" + NAME + "$"}},
           "required": ["name"], "additionalProperties": False}
-# Which skills each role may load. Review checks findings, so it sees the evidence procedure only.
+# Which skills each role may load. The model-facing procedures (static-triage and the skills it points to) are
+# written for small models: exact calls, decision tables and a record-before-you-answer rule. The static-re-* and
+# static-malware-re skills describe the operator workflow for external MCP clients.
+TRIAGE = ("static-triage", "pe-triage", "elf-triage", "string-triage", "capa-yara", "recording-evidence")
 VISIBLE = {
-    "intake": ("static-malware-re",),
-    "native": ("static-malware-re", "static-re-native"),
-    "evidence": ("static-malware-re", "static-re-evidence"),
-    "review": ("static-re-evidence",),
+    "intake": TRIAGE + ("static-malware-re",),
+    "native": TRIAGE + ("import-analysis", "function-analysis", "static-malware-re", "static-re-native"),
+    "evidence": TRIAGE + ("import-analysis", "static-malware-re", "static-re-evidence"),
+    "review": ("recording-evidence", "capa-yara", "import-analysis", "static-re-evidence"),
 }
+# Skills already loaded into the prompt for a role, because a small model may never call load_skill. Pinned skills
+# are left out of the load_skill listing. Change this only on a benchmark comparison (docs/SKILLS.md).
+PINNED = {}
 LOCK = threading.Lock()
 
 
@@ -69,12 +75,22 @@ def visible(role):
     return rows
 
 
+def untitled(body):
+    """A skill body without its own top-level title, so it nests under the prompt's heading."""
+    first, _, rest = body.partition("\n")
+    return rest.lstrip("\n") if first.startswith("# ") else body
+
+
 def listing(role):
-    rows = visible(role)
-    if not rows:
-        return ""
-    return ("## Skills you can load\n\nCall `load_skill` with a name to read its procedure when the task calls for it.\n\n"
-            + "\n".join(f"- `{name}`: {description}" for name, description in rows))
+    """The prompt section for a role: pinned skill bodies, then the names and descriptions of the rest."""
+    pinned = [skill for skill in map(read, PINNED.get(role, ())) if skill]
+    rows = [(name, text) for name, text in visible(role) if name not in {skill["name"] for skill in pinned}]
+    parts = [f"## Procedure: {skill['name']}\n\n" + untitled(skill["body"]) for skill in pinned]
+    if rows:
+        parts.append("## Skills you can load\n\nCall `load_skill` with a name to read its procedure when the task "
+                     "calls for it. Load `static-triage` first if you have not read it.\n\n"
+                     + "\n".join(f"- `{name}`: {description}" for name, description in rows))
+    return "\n\n".join(parts)
 
 
 def gaps_path(state):

@@ -87,37 +87,58 @@ def shown_by_call(entry):
     return set()
 
 
-def check(case_folder, candidate, admitted):
-    """Return {result: passed | failed | not_assessed, problems: [{code, ref}], utc}. Problems hold ids, not text."""
-    problems = []
-    try:
-        manifest = admitted()
-    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
-        return {"result": "not_assessed", "problems": [{"code": "manifest_unreadable", "ref": None}], "utc": now()}
-    for digest in candidate.get("artifacts") or []:
-        if digest not in manifest:
-            problems.append({"code": "artifact_not_admitted", "ref": digest})
-    cited, seen = [], set()
-    for evidence_id in candidate.get("evidence") or []:
+# Evidence whose content the sample's author controls: string text, import and section names, matched bytes. ARTEX
+# calls this target_response and never lets it prove a goal alone. Header facts, capa verdicts and Ghidra's analysis
+# are the tools' own results (tool_output).
+SAMPLE_CONTENT_TOOLS = frozenset({"artifact_strings", "artifact_imports", "yara_scan"})
+
+
+def source_of(entry):
+    """Where one evidence entry's content came from, decided by the Forge from the tool, never by the model."""
+    return "sample_content" if entry.get("tool") in SAMPLE_CONTENT_TOOLS and entry.get("excerpt") else "tool_output"
+
+
+def references(case_folder, text, evidence_ids, manifest):
+    """Check a text against the evidence it cites. Returns (problems, cited ids, sources)."""
+    problems, cited, seen, sources = [], [], set(), set()
+    for evidence_id in evidence_ids:
         try:
             entry = evidence.load(case_folder, evidence_id)
         except evidence.EvidenceError as error:
             problems.append({"code": str(error), "ref": evidence_id})
             continue
         cited.append(evidence_id)
+        sources.add(source_of(entry))
         numbers(entry.get("reply"), seen)
         seen |= shown_by_call(entry)
-    claim = candidate.get("claim") or ""
-    named = addresses(claim)
-    for token in sorted(named):
+    for token in sorted(addresses(text or "")):
         if policy.match(token, policy.DIGEST):
             if token not in manifest and token not in cited:
                 problems.append({"code": "claim_names_unadmitted_sha256", "ref": token})
         elif token not in seen:
             problems.append({"code": "address_not_in_evidence", "ref": token})
+    return problems, cited, sorted(sources)
+
+
+def check(case_folder, candidate, admitted):
+    """Return {result: passed | failed | not_assessed, problems: [{code, ref}], sources, utc}. No text in problems.
+
+    sources says where the cited evidence came from: tool_output, sample_content, both, or neither.
+    """
+    try:
+        manifest = admitted()
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return {"result": "not_assessed", "problems": [{"code": "manifest_unreadable", "ref": None}], "sources": [],
+                "utc": now()}
+    problems = [{"code": "artifact_not_admitted", "ref": digest} for digest in candidate.get("artifacts") or []
+                if digest not in manifest]
+    found, cited, sources = references(case_folder, candidate.get("claim") or "", candidate.get("evidence") or [],
+                                       manifest)
+    problems += found
     if candidate.get("kind") in ("observed", "corroborated") and not cited:
         problems.append({"code": "observed_without_evidence", "ref": None})
-    return {"result": "failed" if problems else "passed", "problems": problems[:32], "utc": now()}
+    return {"result": "failed" if problems else "passed", "problems": problems[:32], "sources": sources,
+            "utc": now()}
 
 
 def brief(candidate):

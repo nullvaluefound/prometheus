@@ -29,6 +29,7 @@ Use the SHA-256 from intake for subsequent analysis. `blank` starts a new worker
 | --- | --- |
 | [Operator runbook](docs/OPERATIONS.md) | Install, admit and derive artifacts, export evidence, preserve the baseline and recover from a failed run |
 | [Model hookup](docs/MODELS.md) | Use local Ollama or a case-bound MCP client and grant a specific evidence excerpt |
+| [Model skills](docs/SKILLS.md) | The procedures local models load, how facts must rest on evidence, and how a skill change is measured |
 | [Interception and containment](docs/SAFETY.md) | Check exactly what the gateway and Docker enforce and how to pause a case |
 | [Tool inventory](docs/TOOLS.md) | Identify required dependencies, exposed capabilities and optional analyst tools |
 | [Forge deployment](docs/DEPLOY.md) | Configure a Linux VM, operator accounts, the Forge app and a VPN-backed reverse proxy |

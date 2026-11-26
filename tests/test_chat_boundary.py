@@ -133,6 +133,18 @@ class ChatTurnTests(unittest.TestCase):
         completed = [event for event in self.audit() if event["decision"] == "forge_chat_completed"]
         self.assertEqual(completed[0]["reason"], "turn_budget_wrapup")
 
+    def test_a_session_that_recorded_nothing_is_asked_once_to_record(self):
+        summary = call("artifact_summary", artifact=DIGEST)
+        ScriptedAdapter.script = [("", [summary]), ("It is an ELF.", []), ("Recorded.", [])]
+        rows = models.converse(self.state, "review", self.LOCAL, self.SETTINGS, [], "go", "analyst",
+                               plan=models.Plan(require_record=True))
+        self.assertEqual([row["text"] for row in rows if row["role"] == "assistant"], ["It is an ELF.", "Recorded."])
+        self.assertIn(("user", models.RECORD_NUDGE), ScriptedAdapter.last.seen)
+        self.assertEqual(sum(event["decision"] == "record_nudged" for event in self.audit()), 1)
+        # Without the flag, or once something was recorded, the first answer ends the turn.
+        ScriptedAdapter.script = [("", [summary]), ("It is an ELF.", [])]
+        self.assertEqual(self.run_turn(list(ScriptedAdapter.script))[-1]["text"], "It is an ELF.")
+
     def test_a_grant_denial_files_a_request_for_exactly_that_call(self):
         decompile = call("ghidra_decompile", artifact=DIGEST, address="0x00401000")
         first = self.run_turn([("", [call("artifact_summary", artifact=DIGEST), decompile]), ("", [])])

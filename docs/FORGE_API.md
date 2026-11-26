@@ -131,13 +131,15 @@ interface Question {
 interface Lead { id: string; state: string; artifact: string; address: string | null; offset: number | null;
                  title: string; question: string | null; }
 interface Observation { id: string; kind: "observed" | "inferred"; text: string; artifact: string;
-                        lead: string | null; evidence: string[]; }
+                        lead: string | null; evidence: string[];
+                        sources?: ("tool_output" | "sample_content" | "inference")[]; }
 interface Candidate {
   id: string; state: "proposed" | "recording" | "recorded" | "rejected";   // recording: a record task holds it
   claim: string; kind: string; confidence: string; artifacts: string[]; evidence: string[];
   limitations: string | null; counterevidence: string | null; question: string | null; lead: string | null;
+  observations?: string[];     // observation ids the proposal rests on; their evidence is in evidence
   check: { result: "passed" | "failed" | "not_assessed"; problems: { code: string; ref: string | null }[];
-           utc: string } | null;
+           sources?: ("tool_output" | "sample_content")[]; utc: string } | null;
   verdicts: { verdict: "supported" | "unsupported" | "insufficient"; rationale: string; model: string;
               utc: string; operator: string }[];
   finding: string | null; decided_by: string | null; decided_utc: string | null; note: string | null;

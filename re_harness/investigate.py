@@ -413,7 +413,7 @@ def lead_run(state, case_id, run, lead, config, settings, operator):
     role = run["lead_role"]
     # The case's tool allowlist narrows the lead role, as it narrows chat.
     tools = set(local_model.ROLES[role]) & set(settings.get("tools") or ())
-    plan = models.Plan(purpose="investigation_lead", allowed=tools, context=grants)
+    plan = models.Plan(purpose="investigation_lead", allowed=tools, context=grants, require_record=True)
     plan.interrupt = interrupt(state, case_id, run_id, plan)
     try:
         rows = models.converse(state, case_id, config, {"role": role, "tools": sorted(tools),
@@ -497,7 +497,7 @@ def planner_tools(state, case_id, run_id):
                  "grants": sorted(turn.broker.released_grants | turn.broker.context_grants)}
         local_call(turn, "propose_answer", {"question": arguments["question"], "candidates": arguments["candidates"]},
                    lambda: investigation.propose_answer(state, case_id, run_id, arguments["question"],
-                                                        arguments["candidates"], stamp))
+                                                        arguments["candidates"], stamp, case_folder(state, case_id)))
         text = json.dumps({"status": "answer_proposed", "question": arguments["question"]})
         return text, False, text, {}
 

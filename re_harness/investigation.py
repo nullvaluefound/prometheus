@@ -42,11 +42,13 @@ TOOLS = {
     "lead_detail": "Read one lead and its observations.",
     "add_lead": "Add a lead to investigate, anchored to an admitted artifact SHA-256 and optionally an address or "
                 "offset.",
-    "record_observation": "Record an observation. kind observed needs at least one evidence id from a tool result "
-                          "in this case; otherwise use inferred.",
+    "record_observation": "Record one fact from your tool results: what you saw, including what you looked for and "
+                          "did not find. kind observed needs the evidence id of each result it relies on, and every "
+                          "address in the text must appear in that evidence; otherwise use inferred.",
     "update_plan": "Replace the case's investigation plan with up to 20 short steps.",
-    "propose_finding": "Propose a finding for the operator to review. Cite admitted artifacts and evidence ids. "
-                       "A deterministic check runs on it; only the operator records findings.",
+    "propose_finding": "Propose a finding for the operator to review. Cite admitted artifacts, and the observations "
+                       "(O ids) or evidence ids it rests on. A deterministic check runs on it; only the operator "
+                       "records findings.",
 }
 READS = frozenset({"case_overview", "lead_detail"})
 WRITES = frozenset(TOOLS) - READS
@@ -83,9 +85,10 @@ SCHEMAS = {
     "propose_finding": schema({"claim": text(2000), "kind": {"type": "string", "enum": list(FINDING_KINDS)},
                                "confidence": {"type": "string", "enum": list(CONFIDENCE)},
                                "artifacts": array(DIGEST, 16, 1), "evidence": array(DIGEST, 16),
+                               "observations": array(pattern(OBSERVATION_ID), 16),
                                "limitations": text(1000, 0), "counterevidence": text(1000, 0),
                                "question": pattern(QUESTION_ID), "lead": pattern(LEAD_ID)},
-                              ["claim", "kind", "confidence", "artifacts", "evidence"]),
+                              ["claim", "kind", "confidence", "artifacts"]),
 }
 
 
@@ -312,7 +315,7 @@ class Context:
                 "grants": sorted(set(self.grants) | set(extra)), "utc": now()}
 
     def cited(self, evidence_ids):
-        """Check cited evidence and return the grants it was released under.
+        """Check cited evidence and return the grants it was released under (see cited_sources for provenance).
 
         Evidence that carries an excerpt counts only while every grant it was released under is active for this
         session's audience. Otherwise a model without the grant could test guesses about the excerpt against the
@@ -371,10 +374,15 @@ def apply(name, values, context):
         return {"status": "recorded", "lead": lead}, {"lead": lead}, taint
     if name == "record_observation":
         context.require_admitted([values["artifact"]])
+        from . import review  # review imports this module
         cited = values.get("evidence") or []
         if values["kind"] == "observed" and not cited:
             raise InvestigationError("observed_needs_evidence")
         released = context.cited(cited)
+        # An observed fact is held to what its evidence shows, like a proposal (ARTEX: write only what you saw).
+        problems, _, sources = review.references(context.case_folder, values["text"], cited, context.admitted())
+        if values["kind"] == "observed" and problems:
+            raise InvestigationError(problems[0]["code"])
 
         def change(data):
             if values.get("lead"):
@@ -383,7 +391,7 @@ def apply(name, values, context):
                 raise InvestigationError("too_many_observations")
             row = {"id": next_id(data, "O"), "kind": values["kind"], "text": values["text"],
                    "artifact": values["artifact"], "lead": values.get("lead"), "evidence": cited,
-                   **context.stamp(released)}
+                   "sources": sources or ["inference"], **context.stamp(released)}
             data["observations"].append(row)
             return row["id"]
         row = update(state, case_id, change)
@@ -396,7 +404,13 @@ def apply(name, values, context):
     if name == "propose_finding":
         from . import review  # review imports this module
         context.require_admitted(values["artifacts"])
-        released = context.cited(values.get("evidence") or [])
+        # Observations cited by id bring their evidence: a finding rests on facts, and facts on evidence.
+        stored = load(state, case_id)["observations"]
+        facts = [find(stored, observation, "unknown_observation") for observation in values.get("observations") or []]
+        evidence_ids = list(dict.fromkeys((values.get("evidence") or []) +
+                                          [item for fact in facts for item in fact.get("evidence") or []]))[:32]
+        released = context.cited(evidence_ids)
+        values = {**values, "evidence": evidence_ids}
         manifest = context.admitted()  # read before the lock: it can start a ledger Apprentice
 
         def change(data):
@@ -405,18 +419,23 @@ def apply(name, values, context):
                     find(data[rows], values[key], reason)
             if len(data["candidates"]) >= MAX_CANDIDATES:
                 raise InvestigationError("too_many_candidates")
+            if any(row.get("claim") == values["claim"] and row.get("session") == context.session
+                   for row in data["candidates"]):
+                raise InvestigationError("duplicate_proposal")
             row = {"id": next_id(data, "C"), "state": "proposed",
                    **{key: values.get(key) for key in ("claim", "kind", "confidence", "artifacts", "evidence",
-                                                       "limitations", "counterevidence", "question", "lead")},
+                                                       "observations", "limitations", "counterevidence", "question",
+                                                       "lead")},
                    **context.stamp(released), "verdicts": [], "finding": None, "decided_by": None,
                    "decided_utc": None, "note": None}
             row["check"] = review.check(context.case_folder, row, lambda: manifest)
             data["candidates"].append(row)
             return row["id"], row["check"]
         candidate, result = update(state, case_id, change)
-        # Models get the result and problem codes; the refs stay for the operator.
+        # The refs are the model's own values (addresses and SHA-256 values in its claim) checked against evidence it
+        # may see: excerpt evidence needs active grants to be cited, so naming the failing value leaks nothing.
         return ({"status": "proposed", "candidate": candidate,
-                 "check": {"result": result["result"], "problems": sorted({row["code"] for row in result["problems"]})}},
+                 "check": {"result": result["result"], "problems": result["problems"][:8]}},
                 {"candidate": candidate, "check": result["result"]}, taint)
     raise InvestigationError("unknown_tool")
 
@@ -580,12 +599,17 @@ def add_verdict(state, case_id, candidate_id, verdict):
     return update(state, case_id, change)
 
 
-def propose_answer(state, case_id, run_id, question_id, candidate_ids, stamp):
+def propose_answer(state, case_id, run_id, question_id, candidate_ids, stamp, case_folder=None):
     """Mark a run question answer_proposed, only with proposals whose check passed and that cite its artifacts.
+
+    An answer also needs at least one cited proposal that rests on a tool's own result, not only on content the
+    sample's author controls (ARTEX's prove_goal rule for target_response).
 
     The marker is advice to the operator: it records no finding, labels no proposal, and only the operator closes
     the question.
     """
+    case_folder = case_folder or state / "cases" / case_id
+
     def change(data):
         run = data.get("run")
         if not run or run.get("id") != run_id:
@@ -598,12 +622,22 @@ def propose_answer(state, case_id, run_id, question_id, candidate_ids, stamp):
         if question["state"] not in ("open", "answer_proposed"):
             raise InvestigationError("question_not_open")
         named = set(question.get("artifacts") or [])
+        sources = set()
         for candidate_id in candidate_ids:
             row = find(data["candidates"], candidate_id, "unknown_candidate")
             if row.get("state") == "rejected" or (row.get("check") or {}).get("result") != "passed":
                 raise InvestigationError("candidate_check_not_passed")
             if not named & set(row.get("artifacts") or []):
                 raise InvestigationError("candidate_not_for_question")
+            known = (row.get("check") or {}).get("sources")
+            if known is None:  # proposed before checks recorded sources: read them from its evidence
+                from . import review  # review imports this module
+                known = [review.source_of(evidence.load(case_folder, item)) for item in row.get("evidence") or []
+                         if evidence.exists(case_folder, item)]
+            sources.update(known)
+        # ARTEX's prove_goal rule: content the sample's author controls never proves an answer alone.
+        if "tool_output" not in sources:
+            raise InvestigationError("answer_needs_tool_output")
         question["state"] = "answer_proposed"
         question["answer"] = {"candidates": list(dict.fromkeys(candidate_ids)), "run": run_id, "author": "model",
                               **stamp, "utc": now()}

@@ -212,6 +212,28 @@ def imports_page(value, limit):
             "total_rows": number(value["total_rows"], policy.MAX_IMPORT_ROWS), "limitations": list(limitations)}
 
 
+def derived(reply):
+    """Arithmetic on validated artifact_summary fields, so a model never has to convert or add addresses itself.
+
+    PE: the entry point's virtual address (image_base + entry_rva) and the index of the section that holds it.
+    ELF: the entry address in hex. No judgments, only numbers the projected fields already imply.
+    """
+    summary = reply.get("summary") if isinstance(reply.get("summary"), dict) else {}
+    found = {}
+    pe = summary.get("pe")
+    if isinstance(pe, dict) and pe.get("parsed") and "entry_rva" in pe:
+        entry = int(pe["entry_rva"], 16)
+        found["entry_va"] = hex(int(pe["image_base"], 16) + entry)
+        found["entry_section"] = next((index for index, section in enumerate(pe["sections"])
+                                       if int(section["rva"], 16) <= entry <
+                                       int(section["rva"], 16) + max(section["virtual_size"], section["raw_size"])),
+                                      None)
+    elf = summary.get("elf")
+    if isinstance(elf, dict) and "e_entry" in elf:
+        found["e_entry_hex"] = hex(elf["e_entry"])
+    return {**reply, "derived": found} if found else reply
+
+
 def approved_excerpt(value):
     object_fields(value, {"trust", "text", "sha256_of_serialized_result", "serialized_bytes", "truncated"})
     if value["trust"] != "untrusted_sample_derived_data" or not isinstance(value["text"], str):
