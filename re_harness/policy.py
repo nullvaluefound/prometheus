@@ -9,6 +9,23 @@ MAX_ARTIFACT = 128 * 1024 * 1024
 MAX_EXCERPT = 8192
 MAX_TOOL_CALLS = 32
 MAX_LINE = 128 * 1024
+MAX_YARA_RULES = 1024 * 1024
+YARA_IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]{0,127}"
+YARA_STRING = r"\$[A-Za-z0-9_]{0,127}"
+# Only data-parsing modules. console writes to stdout, and others are not compiled in.
+YARA_MODULES = frozenset({"pe", "elf", "math", "hash", "dotnet", "string", "time"})
+CAPA_TEXT = r"[ -~]{1,200}"
+CAPA_NAMESPACE = r"[a-z0-9][a-z0-9/_.-]{0,127}"
+CAPA_ENUM = r"[a-z0-9_]{1,16}"
+ATTACK_ID = r"T[0-9]{4}(?:\.[0-9]{3})?"
+MBC_ID = r"[A-Z][0-9]{4}(?:\.[a-z0-9]{3})?"
+MAX_IMPORT_NAME = 256
+MAX_IMPORT_ROWS = 8192
+IMPORT_NAME = r"[ -~]{0,256}"
+IMPORT_KINDS = frozenset({"pe_section", "pe_library", "pe_import", "pe_delay_library", "pe_delay_import",
+                          "elf_needed", "elf_import", "elf_export"})
+IMPORT_LIMITATIONS = frozenset({"pefile_unavailable", "pe_parse_failed", "elf_parse_failed", "unsupported_format",
+                                "sections_capped", "libraries_capped", "functions_capped", "rows_capped"})
 
 TOOLS = {
     "artifact_summary": "Verify one artifact and summarize its headers and string count.",
@@ -18,10 +35,16 @@ TOOLS = {
     "ghidra_decompile": "Produce a bounded Ghidra decompilation excerpt under an operator grant.",
     "rea_inspect": "Inspect a native binary with REA's static Ghidra provider.",
     "rea_decompile": "Produce a bounded REA decompilation excerpt under an operator grant.",
+    "yara_scan": "Page the case's operator-imported YARA rule matches with string offsets. Matched bytes require "
+                 "an operator grant.",
+    "capa_triage": "Page capa capability matches from the pinned capa rules, with ATT&CK and MBC IDs and "
+                   "function addresses.",
+    "artifact_imports": "Page PE section and import names, or ELF needed libraries and dynamic symbols, under an "
+                        "operator grant.",
 }
 ADDRESSED = {"ghidra_xrefs", "ghidra_decompile", "rea_decompile"}
-PAGED = {"artifact_strings", "ghidra_functions", "ghidra_xrefs"}
-EXCERPT_ONLY = {"ghidra_decompile", "rea_decompile"}
+PAGED = {"artifact_strings", "ghidra_functions", "ghidra_xrefs", "yara_scan", "capa_triage", "artifact_imports"}
+EXCERPT_ONLY = {"ghidra_decompile", "rea_decompile", "artifact_imports"}
 
 
 class Denied(ValueError):

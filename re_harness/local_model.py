@@ -7,10 +7,11 @@ import re
 from . import policy, runtime, server
 
 ROLES = {
-    "intake": {"artifact_summary", "artifact_strings"},
+    "intake": {"artifact_summary", "artifact_strings", "yara_scan", "capa_triage"},
     "native": set(policy.TOOLS),
-    "evidence": {"artifact_summary", "artifact_strings", "ghidra_functions", "ghidra_xrefs"},
-    "review": {"artifact_summary", "ghidra_functions", "ghidra_xrefs"},
+    "evidence": {"artifact_summary", "artifact_strings", "artifact_imports", "ghidra_functions", "ghidra_xrefs",
+                 "yara_scan", "capa_triage"},
+    "review": {"artifact_summary", "artifact_imports", "ghidra_functions", "ghidra_xrefs", "yara_scan", "capa_triage"},
 }
 MAX_TURNS = 8
 MAX_MODEL_RESPONSE = 128 * 1024
@@ -36,9 +37,13 @@ def ollama(port, path, payload=None):
 def installed(port, model):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}", model) or model.endswith(":cloud"):
         return False
-    tags = ollama(port, "/api/tags")["models"]
-    return any(item["name"] == model and item.get("size", 0) > 0
-               and not item.get("remote_model") and not item.get("remote_host") for item in tags)
+    reply = ollama(port, "/api/tags")
+    tags = reply.get("models") if isinstance(reply, dict) else None
+    if not isinstance(tags, list):
+        raise runtime.RuntimeFailure("Unexpected local model listing")
+    return any(isinstance(item, dict) and item.get("name") == model and isinstance(item.get("size"), int)
+               and item["size"] > 0 and not item.get("remote_model") and not item.get("remote_host")
+               for item in tags)
 
 
 def chat(state, case_id, port, model, role, question):
@@ -53,29 +58,40 @@ def chat(state, case_id, port, model, role, question):
     tools = [{"type": "function", "function": {"name": name, "description": policy.TOOLS[name],
               "parameters": policy.tool_schema(name)}} for name in sorted(ROLES[role])]
     runtime.audit(broker.folder, case=case_id, session=broker.session, decision="local_model_started", role=role)
-    for _ in range(MAX_TURNS):
-        broker.current_scope()
-        result = ollama(port, "/api/chat", {"model": model, "messages": messages, "tools": tools,
-                                          "stream": False, "options": {"num_predict": 1400, "temperature": 0}})
-        message = result["message"]
-        if result.get("done") is not True or message.get("role") != "assistant":
-            raise runtime.RuntimeFailure("Unexpected local model response")
-        calls = message.get("tool_calls") or []
-        text = message.get("content", "")
-        if not isinstance(text, str) or not isinstance(calls, list) or len(calls) > 4:
-            raise runtime.RuntimeFailure("Local model exceeded its tool-call budget")
-        if not calls:
+    try:
+        for _ in range(MAX_TURNS):
             broker.current_scope()
-            runtime.audit(broker.folder, case=case_id, session=broker.session, decision="local_model_completed", role=role)
-            # Keep terminal control characters out of human-facing model text.
-            return "".join(ch for ch in text if ch in "\n\t" or ch.isprintable())
-        messages.append({key: message[key] for key in ("role", "content", "tool_calls", "thinking") if key in message})
-        for call in calls:
-            function = call.get("function", {}) if isinstance(call, dict) else {}
-            if not isinstance(function, dict):
-                function = {}
-            reply = broker.call({"name": function.get("name"), "arguments": function.get("arguments")})
-            name = function.get("name")
-            safe_name = name if isinstance(name, str) and name in ROLES[role] else "intercepted"
-            messages.append({"role": "tool", "tool_name": safe_name, "content": reply["content"][0]["text"]})
-    raise runtime.RuntimeFailure("Local model turn budget exhausted")
+            result = ollama(port, "/api/chat", {"model": model, "messages": messages, "tools": tools,
+                                              "stream": False, "options": {"num_predict": 1400, "temperature": 0}})
+            message = result.get("message") if isinstance(result, dict) else None
+            if not isinstance(message, dict) or result.get("done") is not True or message.get("role") != "assistant":
+                raise runtime.RuntimeFailure("Unexpected local model response")
+            calls = message.get("tool_calls") or []
+            text = message.get("content", "")
+            if not isinstance(text, str) or not isinstance(calls, list) or len(calls) > 4:
+                raise runtime.RuntimeFailure("Local model exceeded its tool-call budget")
+            if not calls:
+                broker.current_scope()
+                runtime.audit(broker.folder, case=case_id, session=broker.session, decision="local_model_completed",
+                              role=role)
+                # Keep terminal control characters out of human-facing model text.
+                return "".join(ch for ch in text if ch in "\n\t" or ch.isprintable())
+            messages.append({key: message[key] for key in ("role", "content", "tool_calls", "thinking")
+                             if key in message})
+            for call in calls:
+                function = call.get("function", {}) if isinstance(call, dict) else {}
+                if not isinstance(function, dict):
+                    function = {}
+                reply = broker.call({"name": function.get("name"), "arguments": function.get("arguments")})
+                name = function.get("name")
+                safe_name = name if isinstance(name, str) and name in ROLES[role] else "intercepted"
+                messages.append({"role": "tool", "tool_name": safe_name, "content": reply["content"][0]["text"]})
+        raise runtime.RuntimeFailure("Local model turn budget exhausted")
+    except Exception:
+        # A fixed reason keeps sample-derived exception text out of the audit log.
+        try:
+            runtime.audit(broker.folder, case=case_id, session=broker.session, decision="local_model_failed",
+                          role=role, reason="local_model_session_failed")
+        except (OSError, runtime.RuntimeFailure):
+            pass
+        raise

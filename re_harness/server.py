@@ -47,17 +47,23 @@ class Broker:
     def __init__(self, state, case_id, allowed_tools=None, audience="mcp"):
         self.state = state
         self.case_id = case_id
-        self.folder, self.bound = runtime.load_case(state, case_id)
+        self.folder, self.bound = runtime.load_case(state, case_id, allow_closed=True)
         self.session = uuid.uuid4().hex
         self.calls = 0
         self.allowed_tools = set(policy.TOOLS) if allowed_tools is None else allowed_tools
         self.audience = audience
+        if runtime.closed(self.bound):
+            runtime.audit(self.folder, session=self.session, case=case_id, audience=audience,
+                          decision="intercepted", reason="case_closed")
+            raise runtime.RuntimeFailure("Case is closed")
 
     def current_scope(self):
-        _, current = runtime.load_case(self.state, self.case_id)
+        _, current = runtime.load_case(self.state, self.case_id, allow_closed=True)
         for key in ("engine", "image", "volume"):
             if current[key] != self.bound[key]:
                 raise policy.Denied("scope_changed_restart_session")
+        if runtime.closed(current):
+            raise policy.Denied("case_closed")
         if current["paused"]:
             raise policy.Denied("case_paused")
         return current
@@ -81,16 +87,23 @@ class Broker:
             include = grant_active(scope, name, arguments, self.audience)
             if name in policy.EXCERPT_ONLY and not include:
                 raise policy.Denied("operator_excerpt_grant_required")
+            request = {"tool": name, "arguments": arguments, "excerpt": include}
+            if name == "yara_scan":
+                request["rules"] = event["rules"] = runtime.yara_rules(scope)
             runtime.audit(self.folder, **event, decision="dispatched", excerpt=include)
-            request = json.dumps({"tool": name, "arguments": arguments, "excerpt": include}).encode("ascii")
-            code, raw = runtime.worker(scope, ["analyze"], request=request)
+            code, raw = runtime.worker(scope, ["analyze"], request=json.dumps(request).encode("ascii"),
+                                       timeout=runtime.tool_timeout(name))
             if code:
                 raise runtime.RuntimeFailure("offline_worker_failed")
-            reply = projection.project(strict_json(raw), name, arguments, include)
+            reply = projection.project(strict_json(raw), name, arguments, include, request.get("rules"))
             scope = self.current_scope()
+            if name == "yara_scan" and runtime.yara_rules(scope) != request["rules"]:
+                raise policy.Denied("yara_rules_changed")
             if include and not grant_active(scope, name, arguments, self.audience):
                 raise policy.Denied("excerpt_grant_expired_or_revoked")
-            runtime.audit(self.folder, **event, decision="completed", excerpt="evidence_excerpt" in reply)
+            # Excerpt-only tools release names in their rows rather than in an evidence_excerpt.
+            released = "evidence_excerpt" in reply or (include and name in policy.EXCERPT_ONLY)
+            runtime.audit(self.folder, **event, decision="completed", excerpt=released)
             return call_result(reply)
         except policy.Denied as error:
             try:

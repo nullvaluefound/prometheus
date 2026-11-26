@@ -30,11 +30,21 @@ python -m re_harness.cli triage case-001 $sha
 python -m re_harness.cli derive case-001 $sha base64 0x120 256
 ```
 
+## Scan with YARA and capa
+
+```powershell
+python -m re_harness.cli yara-rules case-001 'C:\Rules\reviewed.yar'
+python -m re_harness.cli inspect case-001 yara_scan $sha --output 'C:\Restricted\yara.json'
+python -m re_harness.cli inspect case-001 capa_triage $sha --full --output 'C:\Restricted\capa.json'
+```
+
+`yara-rules` imports one reviewed rule file of at most 1 MiB into the case. A later import replaces it. The compile error or refused module is printed when a file is rejected. The case audit and `scope.json` record the rules' SHA-256 and rule count. The new rules retire any `yara_scan` grants. Models call `yara_scan` and `capa_triage` with an artifact and a page. Grant either tool with the same `--offset` and `--limit` to release matched bytes or the full capa detail.
+
 `derive` accepts `slice`, `base64`, `gzip` and `zlib`, with a file offset and input byte length. It admits the result under its own hash and records the method and parent. Compressed decoding accepts one complete stream bounded to 64 MiB of output. For a separately reviewed and recovered local file, use `ingest` with `--parent SHA256 --relation 'resource ID and method'`. Policy limits each admitted file to 128 MiB and each case to 256 unique artifacts and 4 GiB of artifact bytes. Track triage and report file growth independently of those artifact limits. A file count or format cap limits coverage, so record it in findings.
 
 Compare manifests by exact release and actual artifacts. Capture partial transfers and conditional alternatives distinctly. Carry out any live collection under the case's authorization in a separate acquisition environment. There is no network acquisition operation in this workspace.
 
-## Capture evidence and close
+## Capture evidence and report
 
 ```powershell
 python -m re_harness.cli inspect case-001 ghidra_decompile $sha --address 0x401000 --full --output 'C:\Restricted\function.json'
@@ -45,12 +55,36 @@ python -m re_harness.cli export case-001 report.md 'C:\Restricted\report.md'
 python -m re_harness.cli export case-001 evidence.json 'C:\Restricted\evidence.json'
 ```
 
-`inspect --full` writes the bounded structured provider response to the operator's chosen local path and prints its SHA-256. Cite that path and hash in findings if retained. Export only to a restricted directory. Use the artifact SHA-256 to export its verified bytes under an inert `.bin` extension. Use `<sha256>.triage.json` to export persisted triage. `report` creates an editable scaffold and an evidence JSON record. Review defanging and secret handling before distribution.
+`inspect --full` writes the bounded structured provider response to the operator's chosen local path and prints its SHA-256. Cite that path and hash in findings if retained. Export only to a restricted directory. Use the artifact SHA-256 to export its verified bytes under an inert `.bin` extension. Use `<sha256>.triage.json` to export persisted triage. `report` creates an editable scaffold and an evidence JSON record that name the case image and imported YARA rules SHA-256. `--claim` accepts up to 2000 characters and `--evidence` up to 16 entries of 500 characters. `--source` and `--relation` take plain labels of up to 160 characters without URLs. Review defanging and secret handling before distribution.
+
+The ledger is append-only. To correct or withdraw a finding, record its replacement with `--supersedes F0001`. The new finding records the ID it replaces. The target must exist and must not already be superseded. The report keeps superseded findings in a struck-through **Superseded** subsection that names the replacement, and Coverage counts only current findings.
+
+```powershell
+python -m re_harness.cli finding case-001 --artifact $sha --kind observed --confidence high --claim 'Configuration selects the beta channel' --evidence 'Offset 0x5120 in native capture' --supersedes F0001
+```
 
 Record observed, inferred, corroborated and unknown findings with evidence locators and confidence. Report analyzed artifact coverage, exact versus rolling variants, unresolved conditionals, unavailable files and static limitations. Include pertinent file and process behavior and defensive indicators. Use hashes, transfer details and access-controlled configuration when needed for handoff.
 
+## Close a case
+
+```powershell
+python -m re_harness.cli close case-001
+python -m re_harness.cli export case-001 report.md 'C:\Restricted\closed-report.md'
+```
+
+`close CASE` runs only from the operator CLI. Under the operator lock it verifies the ledger and refuses to close if verification fails. It then generates the report with the case image and YARA rules SHA-256, records `closed` and `closed_utc` in `scope.json`, retires every grant and audits `case_closed` with the report and `case.json` SHA-256 and the retired grant IDs. Closure is irreversible. There is no reopen. Use a new case ID for further work.
+
+The evidence volume is retained. A closed case refuses broker and Forge tool calls, `ask`, `serve`, `hookup`, `ingest`, `derive`, `triage`, `finding`, `report`, `inspect`, `grant`, `revoke`, `pause`, `resume`, `yara-rules` and `init` with `Case is closed`. Broker refusals are audited with the reason `case_closed`. `status`, `verify`, `export`, `cases` and `grants` keep working, and the Forge shows the case page read-only.
+
 ## Pause and recover
 
-`pause CASE` immediately closes new broker actions and suppresses in-flight model-facing results when the broker next checks scope. Stop the caller to interrupt analysis promptly. `resume CASE` reopens the same validated scope and does not extend expiry. Audit records are local under `cases/<case-id>/audit.jsonl` inside the operator state directory.
+`pause CASE`, or **Pause case** on the case's Forge page, immediately closes new broker actions and suppresses in-flight model-facing results when the broker next checks scope. Stop the caller to interrupt analysis promptly. `resume CASE` reopens the same validated scope and does not extend grant expiry. `grant` is refused while a case is paused. Audit records are local under `cases/<case-id>/audit.jsonl` inside the operator state directory. Each worker-backed command records `operator_requested` and then `operator_completed` or `operator_failed` with a fixed reason. The records carry the validated `inspect` tool, artifact and arguments, the `export` item, the admitted SHA-256 for `ingest` and `derive` and the capture SHA-256 for `inspect`.
+
+```powershell
+python -m re_harness.cli cases
+python -m re_harness.cli grants case-001
+```
+
+`cases` lists each case's ID, paused, initialized and closed state, image ID and imported YARA rules SHA-256 without changing scope. `grants CASE` lists active grants with their ID, tool, artifact, selector, audience and UTC expiry. It removes expired grants from `scope.json` and audits the removal.
 
 After an interrupted operator command, establish whether its container still exists and whether a mutation already completed before retrying. An interrupted `init` can be rerun. An initialized case with a missing volume is an integrity incident. Restore its original evidence from trusted retention or use a new case ID. If a lock remains, check that its recorded process is gone and that the corresponding Docker worker stopped before removing only that exact lock. Avoid prune, volume removal and factory reset during recovery of an evidence case.

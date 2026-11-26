@@ -12,3 +12,6 @@ __pycache__/
 *.tar.gz
 .static-re-harness/
 forge.env
+.codex/
+.claude/
+CLAUDE.local.md

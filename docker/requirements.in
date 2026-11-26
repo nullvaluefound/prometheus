@@ -2,3 +2,5 @@ mcp>=1.30,<2
 requests>=2.32,<3
 pyghidra>=3.1,<4
 pefile==2024.8.26
+yara-python==4.5.4
+flare-capa==10.0.0

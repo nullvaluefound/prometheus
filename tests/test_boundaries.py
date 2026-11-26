@@ -42,6 +42,54 @@ class InputTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 projection.project(payload, "artifact_summary", {"artifact": DIGEST}, False)
 
+    def test_projection_header_fields_are_numeric_and_bounded(self):
+        section = {"rva": "0x1000", "raw_offset": 512, "raw_size": 512, "virtual_size": 400, "flags": "0x60000020",
+                   "entropy": 6.125}
+        pe = {"parsed": True, "sections_count": 1, "import_libraries_count": 2, "certificate_bytes": 0,
+              "machine": "0x8664", "entry_rva": "0x1a2b", "image_base": "0x140000000", "overlay_offset": None,
+              "sections": [section]}
+        elf = {"elf_class": 2, "data_encoding": 1, "machine": 62, "e_type": 3, "e_entry": 2**64 - 1, "phnum": 9,
+               "shnum": 31}
+        valid = [("PE candidate", "pe", pe), ("PE candidate", "pe", {**pe, "overlay_offset": 4096}),
+                 ("PE candidate", "pe", {"parsed": False, "sections_count": 0, "import_libraries_count": 0,
+                                         "certificate_bytes": 0}),
+                 ("PE candidate", "pe", {**pe, "sections_count": 200, "sections": [section] * 96}),
+                 ("PE candidate", "pe", {**pe, "sections": [{**section, "entropy": 0.0}]}),
+                 ("ELF", "elf", elf), ("ELF", "elf", {"elf_class": 1, "data_encoding": 2, "machine": 3}),
+                 ("Mach-O", "macho", {"cputype": 0x0100000C, "filetype": 2})]
+        for kind, key, fields in valid:
+            summary = {**SUMMARY["summary"], "format_hint": kind, key: fields}
+            with self.subTest(valid=fields):
+                self.assertEqual(projection.technical_summary(summary), summary)
+        invalid = [("pe", {**pe, "name": ".text"}), ("pe", {**pe, "sections": [{**section, "name": ".text"}]}),
+                   ("pe", {**pe, "parsed": False}), ("pe", {k: v for k, v in pe.items() if k != "sections"}),
+                   ("pe", {**pe, "machine": "0x18664"}), ("pe", {**pe, "entry_rva": "0x1A2B"}),
+                   ("pe", {**pe, "image_base": "140000000"}), ("pe", {**pe, "image_base": "0x" + "f" * 17}),
+                   ("pe", {**pe, "entry_rva": "0x1000\n"}), ("pe", {**pe, "entry_rva": 4096}),
+                   ("pe", {**pe, "overlay_offset": -1}), ("pe", {**pe, "overlay_offset": "0x400"}),
+                   ("pe", {**pe, "overlay_offset": True}), ("pe", {**pe, "sections": [section] * 2}),
+                   ("pe", {**pe, "sections_count": 200, "sections": [section] * 97}),
+                   ("pe", {**pe, "sections": section}), ("pe", {**pe, "sections": [".text"]}),
+                   ("pe", {**pe, "sections": [{**section, "raw_size": 2**32}]}),
+                   ("pe", {**pe, "sections": [{**section, "rva": "UPX0"}]}),
+                   ("pe", {**pe, "sections": [{**section, "entropy": 8.5}]}),
+                   ("pe", {**pe, "sections": [{**section, "entropy": -0.5}]}),
+                   ("pe", {**pe, "sections": [{**section, "entropy": 6}]}),
+                   ("pe", {**pe, "sections": [{**section, "entropy": 6.1234}]}),
+                   ("pe", {**pe, "sections": [{**section, "entropy": float("nan")}]}),
+                   ("elf", {**elf, "e_entry": 2**64}), ("elf", {**elf, "phnum": 65536}),
+                   ("elf", {**elf, "interpreter": "/lib/ld.so"}),
+                   ("elf", {k: v for k, v in elf.items() if k != "shnum"}),
+                   ("macho", {"cputype": 2**32, "filetype": 2}), ("macho", {"cputype": 7}),
+                   ("macho", {"cputype": 7, "filetype": 2, "endian": "little"})]
+        kinds = {"pe": "PE candidate", "elf": "ELF", "macho": "Mach-O"}
+        for key, fields in invalid:
+            summary = {**SUMMARY["summary"], "format_hint": kinds[key], key: fields}
+            with self.subTest(invalid=fields), self.assertRaises(ValueError):
+                projection.technical_summary(summary)
+        with self.assertRaises(ValueError):
+            projection.technical_summary({**SUMMARY["summary"], "imports": ["KERNEL32.dll"]})
+
     def test_bounded_decode_and_single_stream(self):
         data = gzip.compress(b"safe fixture")
         self.assertEqual(decoding.decode("gzip", data), b"safe fixture")
@@ -52,7 +100,7 @@ class InputTests(unittest.TestCase):
             decoding.decode("gzip", data)
 
     def test_report_defangs_mixed_case_scheme(self):
-        self.assertEqual(case.defang("HtTpS://example.invalid"), "hxxps://example.invalid")
+        self.assertEqual(case.defang("HtTpS://example.invalid"), "hxxps://example[.]invalid")
 
 
 class BrokerTests(unittest.TestCase):
