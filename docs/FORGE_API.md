@@ -13,6 +13,7 @@ The Forge web app is a React single-page app served at the Forge base path (for 
 - **Times:** ISO-8601 UTC strings.
 - **Untrusted text:** strings that come from samples (strings, symbols, decompilation, YARA/capa names, ledger fields) are untrusted. Render them as text, never as HTML or links.
 - **Long work:** anything that runs an Apprentice (Docker) is queued as a task. The endpoint returns `202 {"task": Task}`, and the app polls `GET api/tasks/{id}`. Tasks run one at a time, in order.
+- **Live updates:** `GET api/events` is a `text/event-stream` of `change` events whose data is `{ "topics": string[] }`. Topics are `tasks`, `waiting`, `case:<id>`, `chat:<id>`, `requests:<id>` and `investigation:<id>`, or `*` when the stream fell behind. They carry no content: the app re-reads the named data through the API. A stream sends a keepalive comment every 15 seconds and ends after five minutes. A Forge limited to some cases sends no topics for other cases.
 
 ## Types
 
@@ -54,6 +55,7 @@ interface CaseDetail {
   ledger: { title: string; artifacts: Artifact[]; findings: Finding[] } | null; // null when the ledger is unavailable
   grants: Grant[];
   pending_requests: number;   // grant requests waiting on an operator
+  waiting: number;            // items for this case on the waiting list
   audit: AuditEvent[];        // newest first, at most 50
 }
 interface CaseSettings {
@@ -108,8 +110,9 @@ interface GrantRequest {        // filed by the Forge from a broker denial; only
   note: string | null;         // the operator's note on denial
 }
 interface WaitingItem {
-  kind: "grant_request" | "candidate" | "question_proposed" | "question_answer_proposed";
-  case: string; id: string; utc: string;
+  kind: "grant_request" | "candidate" | "question_proposed" | "question_answer_proposed" | "task_failed";
+  case: string | null; id: string; utc: string;
+  title?: string; error?: string | null;                                           // failed tasks
   tool?: string; artifact?: string; audience?: "local" | "mcp"; flagged?: boolean;  // grant requests
   check?: "passed" | "failed" | "not_assessed" | null; verdict?: string | null;      // candidates
 }
@@ -206,6 +209,7 @@ interface EvidenceEntry {        // the exact reply the broker released, under i
 - `GET api/tasks?case=<id>` returns `{ tasks: Task[] }`, newest first, at most 100.
 - `GET api/tasks/{id}` returns `Task`.
 - `POST api/tasks/{id}/cancel` returns `Task`. Only queued tasks can be cancelled; any other state returns 409.
+- `POST api/tasks/{id}/dismiss` takes a failed task off the waiting list and returns `Task`. A failed task stays on the list for 24 hours unless dismissed. Any other state returns 409 `task_not_failed`.
 
 ### Models (plug and play)
 - `GET api/models` returns `{ models: ModelConfig[] }`.

@@ -13,7 +13,9 @@ const CHECK_LABEL: Record<string, string> = { passed: "References resolve", fail
 
 /** Findings that models proposed. A check and a review run advise; only the operator records or rejects one. */
 export function CandidatesPanel({ ctx }: { ctx: CaseContext }) {
-  const data = useResource((signal) => api.investigation(ctx.id, { signal }), `investigation:${ctx.id}`, () => 15000);
+  const data = useResource((signal) => api.investigation(ctx.id, { signal }), `investigation:${ctx.id}`, () => 15000, [
+    `investigation:${ctx.id}`,
+  ]);
   const candidates = list<Candidate>(data.data?.candidates).filter(isRecord);
   const open = candidates.filter((row) => row.state === "proposed" || row.state === "recording");
   const decided = candidates.filter((row) => row.state === "recorded" || row.state === "rejected").slice(-10).reverse();

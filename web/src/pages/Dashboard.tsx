@@ -4,7 +4,8 @@ import { NewCaseDialog } from "../components/NewCaseDialog";
 import { AuditTable } from "../components/AuditTable";
 import { CaseLink, Empty, ErrorNote, Loading, Panel, RefreshButton, StatusChip, TaskChip, Time } from "../components/ui";
 import { fmtCount, list, plural, short, txt } from "../format";
-import { useDocumentTitle, useResource } from "../hooks";
+import { errorMessage, useDocumentTitle, useResource } from "../hooks";
+import { useToast } from "../components/toast";
 import { caseHref } from "../router";
 
 const STATUSES: CaseStatus[] = ["Ready", "Paused", "Pending", "Closed"];
@@ -15,7 +16,11 @@ function busy(overview: Overview): boolean {
 
 export function Dashboard() {
   useDocumentTitle("Dashboard");
-  const overview = useResource((signal) => api.overview({ signal }), "overview", (data) => (busy(data) ? 2000 : 15000));
+  const overview = useResource((signal) => api.overview({ signal }), "overview", (data) => (busy(data) ? 2000 : 15000), [
+    "tasks",
+    "waiting",
+    "case:*",
+  ]);
   const [creating, setCreating] = useState(false);
   const data = overview.data;
 
@@ -33,12 +38,12 @@ export function Dashboard() {
       <NewCaseDialog open={creating} onClose={() => setCreating(false)} onCreated={overview.reload} />
       {overview.error && <ErrorNote message={overview.error} onRetry={overview.reload} />}
       {!data && !overview.error && <Loading label="Loading the overview…" />}
-      {data && <DashboardBody data={data} onNewCase={() => setCreating(true)} />}
+      {data && <DashboardBody data={data} onNewCase={() => setCreating(true)} onChange={overview.reload} />}
     </>
   );
 }
 
-function DashboardBody({ data, onNewCase }: { data: Overview; onNewCase: () => void }) {
+function DashboardBody({ data, onNewCase, onChange }: { data: Overview; onNewCase: () => void; onChange: () => void }) {
   const cases = list<Overview["cases"][number]>(data.cases);
   const apprentices = list<Overview["apprentices"][number]>(data.apprentices);
   const recent = list<Task>(data.tasks?.recent);
@@ -86,7 +91,7 @@ function DashboardBody({ data, onNewCase }: { data: Overview; onNewCase: () => v
         </section>
       </div>
 
-      <WaitingPanel items={list<WaitingItem>(data.waiting?.items)} count={data.waiting?.count ?? 0} />
+      <WaitingPanel items={list<WaitingItem>(data.waiting?.items)} count={data.waiting?.count ?? 0} onChange={onChange} />
 
       <Panel title="Cases" actions={<a href="#/cases">All cases</a>}>
         {cases.length === 0 ? (
@@ -177,7 +182,30 @@ export function TaskLine({ task }: { task: Task }) {
   );
 }
 
-function WaitingLine({ item }: { item: WaitingItem }) {
+function WaitingLine({ item, onChange }: { item: WaitingItem; onChange: () => void }) {
+  const toast = useToast();
+  if (item.kind === "task_failed") {
+    const dismiss = async () => {
+      try {
+        await api.dismissTask(item.id);
+        onChange();
+      } catch (error) {
+        toast(errorMessage(error), "err");
+      }
+    };
+    return (
+      <>
+        <span className="chip chip-err">Task failed</span>
+        {item.case && <CaseLink id={item.case} href={caseHref(item.case)} />}
+        <span>{txt(item.title)}</span>
+        <span className="muted small">{txt(item.error)}</span>
+        <Time utc={item.utc} relative />
+        <button type="button" className="btn-secondary btn-small" onClick={() => void dismiss()}>
+          Dismiss
+        </button>
+      </>
+    );
+  }
   if (item.kind === "grant_request") {
     return (
       <>
@@ -213,7 +241,7 @@ function WaitingLine({ item }: { item: WaitingItem }) {
   );
 }
 
-function WaitingPanel({ items, count }: { items: WaitingItem[]; count: number }) {
+function WaitingPanel({ items, count, onChange }: { items: WaitingItem[]; count: number; onChange: () => void }) {
   return (
     <Panel title={count ? `Waiting on you (${count})` : "Waiting on you"}>
       {items.length === 0 ? (
@@ -222,7 +250,7 @@ function WaitingPanel({ items, count }: { items: WaitingItem[]; count: number })
         <ul className="rows waiting-list">
           {items.map((item) => (
             <li key={`${txt(item.case)}:${txt(item.kind)}:${txt(item.id)}`}>
-              <WaitingLine item={item} />
+              <WaitingLine item={item} onChange={onChange} />
             </li>
           ))}
         </ul>

@@ -20,6 +20,7 @@ export function RequestsPanel({ ctx }: { ctx: CaseContext }) {
     (signal) => api.requests(ctx.id, { signal }),
     `requests:${ctx.id}`,
     (data) => (list<GrantRequest>(data.requests).some((row) => row.state === "pending") ? 10000 : 30000),
+    [`requests:${ctx.id}`],
   );
   const rows = list<GrantRequest>(requests.data?.requests).filter(isRecord);
   const pending = rows.filter((row) => row.state === "pending");

@@ -15,14 +15,97 @@ export interface Resource<T> {
   reload: () => void;
 }
 
+// ---- Live change notices -------------------------------------------------------------------------------------
+// One EventSource on api/events per tab. Each notice names changed topics, such as "tasks" or "chat:<case>"; the
+// views that show those topics re-read them through the API. While the stream is open, polling slows to a safety net.
+
+type Listener = (topics: string[]) => void;
+const listeners = new Set<Listener>();
+let source: EventSource | null = null;
+let liveOpen = false;
+let everOpened = false;
+let retryTimer: number | undefined;
+
+function notify(topics: string[]) {
+  listeners.forEach((listener) => listener(topics));
+}
+
+function connect() {
+  if (source || typeof EventSource === "undefined") return;
+  source = new EventSource("api/events");
+  source.onopen = () => {
+    liveOpen = true;
+    // After a reconnect, anything may have changed while the stream was down.
+    if (everOpened) notify(["*"]);
+    everOpened = true;
+  };
+  source.addEventListener("change", (event) => {
+    let topics: string[] = [];
+    try {
+      const data: unknown = JSON.parse((event as MessageEvent<string>).data);
+      const raw = typeof data === "object" && data !== null ? (data as { topics?: unknown }).topics : null;
+      topics = Array.isArray(raw) ? raw.filter((topic): topic is string => typeof topic === "string") : [];
+    } catch {
+      return;
+    }
+    notify(topics);
+  });
+  source.onerror = () => {
+    liveOpen = false;
+    if (source && source.readyState === EventSource.CLOSED) {
+      source = null;
+      window.clearTimeout(retryTimer);
+      retryTimer = window.setTimeout(() => {
+        if (listeners.size) connect();
+      }, 30000);
+    }
+  };
+}
+
+export function isLive(): boolean {
+  return liveOpen;
+}
+
+function matches(wanted: string[], changed: string[]): boolean {
+  if (changed.includes("*")) return true;
+  return changed.some((topic) =>
+    wanted.some((pattern) => (pattern.endsWith(":*") ? topic.startsWith(pattern.slice(0, -1)) : pattern === topic)),
+  );
+}
+
+/** Run onChange (debounced) when the Forge says one of these topics changed. "case:*" matches every case. */
+export function useLive(topics: readonly string[] | undefined, onChange: () => void): void {
+  const ref = useRef(onChange);
+  ref.current = onChange;
+  const key = (topics ?? []).join("|");
+  useEffect(() => {
+    if (!key) return;
+    const wanted = key.split("|");
+    let timer: number | undefined;
+    const listener: Listener = (changed) => {
+      if (!matches(wanted, changed)) return;
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => ref.current(), 200);
+    };
+    listeners.add(listener);
+    connect();
+    return () => {
+      listeners.delete(listener);
+      window.clearTimeout(timer);
+    };
+  }, [key]);
+}
+
 /**
  * Load data and optionally keep polling it. `poll` returns the next delay in milliseconds, or null to stop.
+ * `topics` reloads the data when the Forge reports a change to any of them.
  * A change in `key` clears the old data; `reload()` keeps it on screen while the new copy loads.
  */
 export function useResource<T>(
   load: (signal: AbortSignal) => Promise<T>,
   key: string,
   poll?: (data: T) => number | null,
+  topics?: readonly string[],
 ): Resource<T> {
   const [state, setState] = useState<{ key: string; data?: T; error: string | null; status: number | null; loading: boolean }>(
     { key, error: null, status: null, loading: true },
@@ -44,8 +127,10 @@ export function useResource<T>(
         : { key, data: undefined, error: null, status: null, loading: true },
     );
 
-    const schedule = (delay: number | null | undefined) => {
-      if (!alive || !delay) return;
+    const schedule = (requested: number | null | undefined) => {
+      if (!alive || !requested) return;
+      // Live notices trigger reloads, so polling only needs to catch what a dropped stream missed.
+      const delay = isLive() ? Math.max(requested, 20000) : requested;
       timer = window.setTimeout(() => {
         if (document.hidden) schedule(delay);
         else run();
@@ -87,6 +172,7 @@ export function useResource<T>(
   }, [key, tick]);
 
   const reload = useCallback(() => setTick((value) => value + 1), []);
+  useLive(topics, reload);
   const current = state.key === key;
   return {
     data: current ? state.data : undefined,
