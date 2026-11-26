@@ -12,9 +12,12 @@ every question. No model output ends a run, issues a grant, calls a sample tool 
 finding.
 """
 
+import datetime as dt
+import hashlib
 import json
 import threading
 import time
+import uuid
 
 from . import boundary, grant_requests, investigation, local_model, models, policy, review, runtime, server
 from .case import now
@@ -195,29 +198,56 @@ def check_answered(state, case_id, by):
     return run
 
 
+def reopen_claimed(data):
+    for lead in data["leads"]:
+        if lead.get("state") == "claimed":
+            lead["state"] = "open"
+    if data.get("run"):
+        data["run"]["current_lead"] = None
+
+
+def utc_seconds(value):
+    try:
+        return dt.datetime.fromisoformat(value).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
 def recover(state, case_ids):
-    """After a restart, every live run waits in paused for the operator, and an interrupted lead is open again."""
+    """After a restart, every live run waits in paused for the operator, and any interrupted lead is open again.
+
+    No step runs at startup, so every claimed lead is reopened, whatever the run's state. The outage is not active
+    time: a live run's active time is counted only up to its last saved change.
+    """
     for case_id in case_ids:
         try:
             run = current(state, case_id)
-            if not run or run["state"] not in ("queued", "running", "settling"):
+            if not run:
                 continue
 
-            def reopen(value, data):
-                for lead in data["leads"]:
-                    if lead.get("state") == "claimed":
-                        lead["state"] = "open"
-                value["current_lead"] = None
-            transition(state, case_id, run["id"], "paused", "forge", change=reopen,
-                       allowed={**TRANSITIONS, "queued": ("paused",), "running": ("paused",), "settling": ("paused",)})
+            def settle_clock(data):
+                reopen_claimed(data)
+                value = data["run"]
+                since, last = value.get("active_since"), utc_seconds(value.get("updated_utc"))
+                if isinstance(since, (int, float)):
+                    value["spent"]["active_seconds"] += max(0.0, (last or since) - since)
+                    value["active_since"] = None
+            investigation.update(state, case_id, settle_clock)
+            if run["state"] in ("queued", "running", "settling"):
+                transition(state, case_id, run["id"], "paused", "forge",
+                           allowed={**TRANSITIONS, "queued": ("paused",), "running": ("paused",),
+                                    "settling": ("paused",)})
         except (InvestigationError, OSError, ValueError):
             continue
 
 
 # ---- One step ----------------------------------------------------------------------------------------------------
 
-def interrupt(state, case_id, run_id):
-    """A broker stop check for the run's sessions: stop when the run is no longer running or its budget is spent."""
+def interrupt(state, case_id, run_id, plan=None, settling_ok=False):
+    """A broker stop check for the run's sessions: stop when the run is no longer running or its budget is spent.
+
+    The session's own broker calls and tokens so far count against the budget, so one session cannot overrun it.
+    """
     def check():
         try:
             run = current(state, case_id)
@@ -225,8 +255,13 @@ def interrupt(state, case_id, run_id):
             return "investigation_stopped"
         if not run or run.get("id") != run_id or run["state"] not in ACTIVE:
             return "investigation_stopped"
-        if run["state"] == "settling":
+        if run["state"] == "settling" and not settling_ok:
             return "investigation_settling"
+        broker = getattr(plan, "broker", None)
+        if broker is not None:
+            live = models.usage(getattr(plan, "adapter", None))
+            run["spent"]["calls"] += broker.calls
+            run["spent"]["tokens"] += live["tokens_in"] + live["tokens_out"]
         return "investigation_budget_spent" if over_budget(run) else None
     return check
 
@@ -262,23 +297,31 @@ def step(state, case_id, config, settings, operator):
         return {"run": run_id, "state": run["state"], "did": "nothing", "next": False}
     try:
         did = advance(state, case_id, run, config, settings, operator)
-    except InvestigationError:
-        raise
-    except Exception as error:
-        message = str(error) if isinstance(error, models.ModelError) else "The step failed. Check the case audit."
-
-        def failed(value, data):
-            value["error"] = message[:300]
-            for lead in data["leads"]:
-                if lead.get("state") == "claimed":
-                    lead["state"] = "open"
-            value["current_lead"] = None
+    except BaseException as error:
+        investigation.update(state, case_id, lambda data: reopen_claimed(data))
+        reason = str(error) if isinstance(error, policy.Denied) else None
         latest = current(state, case_id)
-        if latest and latest["id"] == run_id and latest["state"] not in TERMINAL:
+        live = latest and latest["id"] == run_id and latest["state"] not in TERMINAL
+        if reason == "case_paused" and live:
+            # The operator paused the case mid-step: the run pauses with it and can resume.
+            if latest["state"] != "paused":
+                transition(state, case_id, run_id, "paused", "forge")
+            return {"run": run_id, "state": "paused", "did": "paused", "next": False}
+        if reason in ("case_closed", "scope_changed_restart_session") and live:
+            transition(state, case_id, run_id, "cancelled", "forge",
+                       change=lambda value, _: value.update(error="The case closed or its toolchain changed."))
+            return {"run": run_id, "state": "cancelled", "did": "cancelled", "next": False}
+        if isinstance(error, InvestigationError) and reason in ("unknown_run", "invalid_transition"):
+            # The run ended or was replaced while this step worked; its own guarded writes refused.
+            return {"run": run_id, "state": latest["state"] if latest else None, "did": "superseded",
+                    "next": False}
+        message = str(error) if isinstance(error, models.ModelError) else "The step failed. Check the case audit."
+        if live and isinstance(error, Exception):
+            change = lambda value, _: value.update(error=message[:300])  # noqa: E731
             if latest["state"] == "paused":
-                change_run(state, case_id, run_id, lambda value, data: failed(value, data))
+                change_run(state, case_id, run_id, change)
             else:
-                transition(state, case_id, run_id, "failed", "forge", change=failed)
+                transition(state, case_id, run_id, "failed", "forge", change=change)
         raise
     latest = current(state, case_id)
     state_now = latest["state"] if latest and latest["id"] == run_id else None
@@ -304,10 +347,13 @@ def advance(state, case_id, run, config, settings, operator):
                    None)
     if pending:
         change_run(state, case_id, run_id, lambda value, _: value["reviewed"].append(pending["id"]))
+        metrics = {}
         try:
-            review.run(state, case_id, config, settings, pending["id"], operator)
+            review.run(state, case_id, config, settings, pending["id"], operator, metrics=metrics)
         except models.ModelError:
             pass  # a review that gives no verdict is advice not given; the operator can rerun it
+        finally:
+            account(state, case_id, run_id, metrics)
         return "reviewed " + pending["id"]
     lead = next((row for row in data["leads"] if row.get("state") == "open" and
                  (row.get("question") in run["questions"] or row.get("question") is None)), None)
@@ -365,28 +411,60 @@ def lead_run(state, case_id, run, lead, config, settings, operator):
                 "ids, and propose findings with propose_finding. Finish with a short wrap-up: what you established, "
                 "with SHA-256 values and addresses, and what is still open.")
     role = run["lead_role"]
-    plan = models.Plan(purpose="investigation_lead", allowed=set(local_model.ROLES[role]), context=grants,
-                       interrupt=interrupt(state, case_id, run_id))
-    stopped = False
+    # The case's tool allowlist narrows the lead role, as it narrows chat.
+    tools = set(local_model.ROLES[role]) & set(settings.get("tools") or ())
+    plan = models.Plan(purpose="investigation_lead", allowed=tools, context=grants)
+    plan.interrupt = interrupt(state, case_id, run_id, plan)
     try:
-        rows = models.converse(state, case_id, config, {"role": role, "tools": sorted(local_model.ROLES[role]),
+        rows = models.converse(state, case_id, config, {"role": role, "tools": sorted(tools),
                                                         "allow_cloud": settings.get("allow_cloud")},
                                [], prompt[:models.MAX_PROMPT], operator, plan=plan)
         answer = rows[-1] if rows and rows[-1]["role"] == "assistant" else {"text": ""}
-        stopped = plan.interrupt() is not None
-    except BaseException:
+    finally:
         account(state, case_id, run_id, plan.metrics)
-        raise
+    plan.broker = None  # the session is over; its calls are now in spent
+    stopped = plan.interrupt() is not None
 
-    def finish(value, data_):
+    def finish(data_):
+        # Keyed by lead, not run: the wrap-up and the lead's state survive a run that ended meanwhile.
         row = investigation.find(data_["leads"], lead["id"], "unknown_lead")
         row["state"] = "stopped" if stopped else "done"
         row["summary"] = {"text": investigation.clean(answer.get("text") or "")[:4000], "author": "model",
                           "session": plan.metrics.get("session"), "audience": plan.metrics.get("audience"),
-                          "grants": plan.metrics.get("grants", []), "utc": now()}
-        value["current_lead"] = None
-    change_run(state, case_id, run_id, finish)
-    account(state, case_id, run_id, plan.metrics)
+                          "grants": plan.metrics.get("grants", []), "utc": now(), "run": run_id}
+        if data_.get("run") and data_["run"].get("current_lead") == lead["id"]:
+            data_["run"]["current_lead"] = None
+    investigation.update(state, case_id, finish)
+
+
+def require_running(data, run_id):
+    run = data.get("run")
+    if not run or run.get("id") != run_id or run.get("state") != "running":
+        raise InvestigationError("investigation_stopped")
+
+
+def local_call(turn, name, ids, write):
+    """A planner tool that writes the store: the broker's stop check, call budget and audit, like a broker call.
+
+    ids holds only ids and hashes, so the audit keeps no text.
+    """
+    broker = turn.broker
+    stopped = broker.interrupt() if broker.interrupt is not None else None
+    if stopped:
+        raise InvestigationError(stopped)
+    if broker.calls >= policy.MAX_TOOL_CALLS:
+        raise InvestigationError("session_budget_exhausted")
+    broker.calls += 1
+    event = {"session": broker.session, "ticket": uuid.uuid4().hex, "case": broker.case_id,
+             "audience": broker.audience, "tool": name, "arguments": ids}
+    runtime.audit(broker.folder, **event, decision="dispatched", excerpt=False)
+    try:
+        result = write()
+    except InvestigationError as error:
+        runtime.audit(broker.folder, **event, decision="intercepted", reason=str(error))
+        raise
+    runtime.audit(broker.folder, **event, decision="investigation_write", excerpt=False)
+    return result
 
 
 def planner_tools(state, case_id, run_id):
@@ -397,12 +475,15 @@ def planner_tools(state, case_id, run_id):
         if not isinstance(arguments, dict) or not policy.match(arguments.get("lead"), investigation.LEAD_ID):
             raise InvestigationError("unknown_lead")
 
-        def change(data):
-            row = investigation.find(data["leads"], arguments["lead"], "unknown_lead")
-            if row["state"] != "open":
-                raise InvestigationError("lead_not_open")
-            row["state"] = "retired"
-        investigation.update(state, case_id, change)
+        def write():
+            def change(data):
+                require_running(data, run_id)
+                row = investigation.find(data["leads"], arguments["lead"], "unknown_lead")
+                if row["state"] != "open":
+                    raise InvestigationError("lead_not_open")
+                row["state"] = "retired"
+            investigation.update(state, case_id, change)
+        local_call(turn, "retire_lead", {"lead": arguments["lead"]}, write)
         text = json.dumps({"status": "retired", "lead": arguments["lead"]})
         return text, False, text, {}
 
@@ -414,7 +495,9 @@ def planner_tools(state, case_id, run_id):
             raise InvestigationError("invalid_arguments")
         stamp = {"session": turn.broker.session, "audience": turn.broker.audience,
                  "grants": sorted(turn.broker.released_grants | turn.broker.context_grants)}
-        investigation.propose_answer(state, case_id, run_id, arguments["question"], arguments["candidates"], stamp)
+        local_call(turn, "propose_answer", {"question": arguments["question"], "candidates": arguments["candidates"]},
+                   lambda: investigation.propose_answer(state, case_id, run_id, arguments["question"],
+                                                        arguments["candidates"], stamp))
         text = json.dumps({"status": "answer_proposed", "question": arguments["question"]})
         return text, False, text, {}
 
@@ -432,7 +515,12 @@ def planner_tools(state, case_id, run_id):
         record = {"text": clean, "flags": flags, "author": "model", "session": turn.broker.session,
                   "audience": turn.broker.audience,
                   "grants": sorted(turn.broker.released_grants | turn.broker.context_grants), "utc": now()}
-        change_run(state, case_id, run_id, lambda value, _: value.update(need=record))
+        def write():
+            def change(value, data):
+                require_running(data, run_id)
+                value.update(need=record)
+            change_run(state, case_id, run_id, change)
+        local_call(turn, "state_need", {"text_sha256": hashlib.sha256(clean.encode("utf-8")).hexdigest()}, write)
         reply = json.dumps({"status": "noted"})
         return reply, False, reply, {}
 
@@ -471,8 +559,8 @@ def planner_round(state, case_id, run, config, settings, operator):
               f"Add at most {MAX_LEADS_PER_ROUND} leads. Start with case_overview.")
     tools, _ = planner_tools(state, case_id, run_id)
     body = (runtime.ROOT / "agents" / "planner" / "AGENTS.md").read_text(encoding="utf-8")
-    plan = models.Plan(purpose="investigation_planner", allowed=set(PLANNER_TOOLS), role_body=body, extra=tools,
-                       interrupt=interrupt(state, case_id, run_id))
+    plan = models.Plan(purpose="investigation_planner", allowed=set(PLANNER_TOOLS), role_body=body, extra=tools)
+    plan.interrupt = interrupt(state, case_id, run_id, plan)
     try:
         models.converse(state, case_id, config, {"role": "review", "tools": [], "allow_cloud": settings.get("allow_cloud")},
                         [], prompt, operator, plan=plan)
@@ -496,6 +584,9 @@ def settle(state, case_id, run, config, settings, operator):
     data = investigation.load(state, case_id)
     overview = investigation.overview(data, 0, 50, active, taint)
     body = (runtime.ROOT / "agents" / "planner" / "AGENTS.md").read_text(encoding="utf-8")
+    runtime.audit(case_folder(state, case_id), case=case_id, decision="investigation_settle_started", run=run_id,
+                  provider=config["provider"], cloud=cloud, purpose="investigation_settle", via="forge",
+                  grants=sorted(taint))
     adapter = models.ADAPTERS[config["provider"]](config, boundary.system_prompt(body), [])
     adapter.user(SETTLE + "\n\n" + boundary.envelope(json.dumps(overview, ensure_ascii=True)))
     text, _ = adapter.step(final=True)  # no tools offered, and nothing is dispatched from it
@@ -527,7 +618,11 @@ class Supervisor:
 
     def loop(self):
         while not self.stopped.wait(self.interval):
-            for case_id in self.case_ids():
+            try:
+                case_ids = self.case_ids()
+            except (OSError, ValueError, RuntimeError):
+                continue
+            for case_id in case_ids:
                 try:
                     run = current(self.state, case_id)
                     if run and run["state"] in ("queued", *ACTIVE):

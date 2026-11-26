@@ -23,6 +23,7 @@ CHAT_ROWS = 400
 ROLES = tuple(local_model.ROLES)
 SETTINGS_LOCK = threading.Lock()
 CHAT_LOCK = threading.Lock()
+SCHEDULE_LOCK = threading.Lock()  # one step chain per case: the busy check and the submit happen together
 DECIDE_LOCK = threading.Lock()  # one grant per request, even when two operators approve at once
 
 
@@ -340,12 +341,19 @@ class Api:
         return [case for case in case_ids(self.state) if not self.app.visible or case in self.app.visible]
 
     def schedule_step(self, case_id, chained=False):
-        """Queue the next step of a case's run, unless one is already queued. Each step re-reads the case model."""
-        if not chained and self.app.tasks.busy(case_id, "investigate"):
-            return None
-        run = investigate.current(self.state, case_id)
-        if not run:
-            return None
+        """Queue the next step of a case's run, unless one is already queued. Each step re-reads the case model.
+
+        chained is set only by a step that is finishing, so its own task does not count as busy.
+        """
+        with SCHEDULE_LOCK:
+            if not chained and self.app.tasks.busy(case_id, "investigate"):
+                return None
+            run = investigate.current(self.state, case_id)
+            if not run or run["state"] not in ("queued", *investigate.ACTIVE):
+                return None
+            return self.submit_step(case_id, run)
+
+    def submit_step(self, case_id, run):
         operator = run.get("started_by") or "forge"
 
         def job():
@@ -358,8 +366,8 @@ class Api:
                                            change=lambda value, _: value.update(error=error.message))
                 raise tasks.TaskError(error.message) from error
             result = investigate.step(self.state, case_id, config, settings, operator)
-            if result["next"]:
-                self.schedule_step(case_id, chained=True)
+            # Chain to whatever run is current, so a run started while this step worked does not wait a heartbeat.
+            self.schedule_step(case_id, chained=True)
             return result
         return self.app.tasks.submit("investigate", case_id, f"Investigation {run['id']} step in {case_id}", operator,
                                      job)
@@ -1191,6 +1199,11 @@ class Api:
             # A running step stops cooperatively: cancelling its run makes the next broker call refuse.
             self.run_write(lambda: investigate.operator_action(self.state, current["case"], "cancel", operator))
             return HTTPStatus.OK, self.app.tasks.get(args[0])
+        if current and current["kind"] == "investigate" and current["state"] == "queued" and current["case"]:
+            # Dropping a queued step pauses its run, so the heartbeat does not queue the next one.
+            run = investigate.current(self.state, current["case"])
+            if run and run["state"] in ("queued", *investigate.ACTIVE):
+                self.run_write(lambda: investigate.operator_action(self.state, current["case"], "pause", operator))
         try:
             task = self.app.tasks.cancel(args[0])
         except KeyError as error:

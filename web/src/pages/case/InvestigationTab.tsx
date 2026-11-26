@@ -315,6 +315,12 @@ function LeadsPanel({ ctx, data, reload }: { ctx: CaseContext; data: Investigati
               )}
             </div>
             <p className="question-text">{txt(lead.title)}</p>
+            {lead.summary && (
+              <p className="small">
+                <span className="muted">Wrap-up (untrusted model text): </span>
+                {txt(lead.summary.text)}
+              </p>
+            )}
             <ObservationList caseId={ctx.id} rows={observations.filter((row) => row.lead === lead.id)} />
           </li>
         ))}

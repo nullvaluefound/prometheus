@@ -17,7 +17,8 @@ SUMMARY = {"tool": "artifact_summary", "artifact": DIGEST, "artifact_bytes": 16,
            "summary": {"size": 16, "format_hint": "ELF", "strings_count": 0, "strings_truncated": False,
                        "entry": "0x401000"}}
 CONFIG = {"provider": "ollama", "base_url": "http://127.0.0.1:11434", "model": "lab"}
-SETTINGS = {"model": "lab", "allow_cloud": False, "role": "evidence", "tools": []}
+SETTINGS = {"model": "lab", "allow_cloud": False, "role": "evidence",
+            "tools": sorted(models.local_model.ROLES["evidence"])}
 
 
 def call(name, **arguments):
@@ -193,6 +194,109 @@ class RunTests(unittest.TestCase):
         self.assertEqual(self.step()["state"], "paused")
 
 
+class RunReviewFixTests(RunTests):
+    """The runner review's findings: mid-step pauses, stuck leads, in-session budgets, audited planner tools."""
+
+    def lead_ready(self, **budgets):
+        self.question()
+        run = self.start(**budgets)
+        self.step(("", [call("add_lead", artifact=DIGEST, title="x")]), ("", []))
+        return run
+
+    def test_pausing_the_case_mid_lead_pauses_the_run(self):
+        self.lead_ready()
+
+        def pause(adapter):
+            atomic_json(self.folder / "scope.json", {**runtime.read_json(self.folder / "scope.json"), "paused": True})
+            return "", [call("artifact_summary", artifact=DIGEST)]
+        result = self.step(("", [call("artifact_summary", artifact=DIGEST)]), pause, ("", []))
+        self.assertEqual((result["state"], result["next"]), ("paused", False))
+        self.assertEqual(self.data()["leads"][0]["state"], "open")
+        investigate.operator_action(self.state, "review", "resume", "analyst")
+        self.assertEqual(self.run_state()["state"], "running")
+
+    def test_a_lead_never_stays_claimed_when_its_run_is_replaced(self):
+        self.lead_ready()
+
+        def replace(adapter):
+            investigate.operator_action(self.state, "review", "cancel", "analyst")
+            investigate.start(self.state, "review", "analyst", {DIGEST})
+            return "", [call("artifact_summary", artifact=DIGEST)]
+        self.step(("", [call("artifact_summary", artifact=DIGEST)]), replace, ("Partial wrap-up.", []))
+        lead = self.data()["leads"][0]
+        self.assertEqual((lead["state"], lead["summary"]["text"], lead["summary"]["run"]),
+                         ("stopped", "Partial wrap-up.", "R1"))
+        self.assertEqual(self.run_state()["id"], "R2")
+
+    def test_recovery_reopens_claimed_leads_of_paused_runs_and_skips_downtime(self):
+        run = self.lead_ready()
+
+        def crash(data):
+            data["leads"][0]["state"] = "claimed"
+            data["run"]["current_lead"] = "L1"
+            data["run"]["active_since"] = 1000.0
+            data["run"]["spent"]["active_seconds"] = 0.0
+            data["run"]["updated_utc"] = "1970-01-01T00:18:20+00:00"  # 1100 seconds
+        investigation.update(self.state, "review", crash)
+        investigate.recover(self.state, ["review"])
+        run = self.run_state()
+        self.assertEqual((run["state"], run["current_lead"], run["active_since"]), ("paused", None, None))
+        self.assertEqual(run["spent"]["active_seconds"], 100.0)
+        self.assertEqual(self.data()["leads"][0]["state"], "open")
+        investigate.operator_action(self.state, "review", "resume", "analyst")
+        investigate.operator_action(self.state, "review", "pause", "analyst")
+
+        def claim(data):
+            data["leads"][0]["state"] = "claimed"
+        investigation.update(self.state, "review", claim)
+        investigate.recover(self.state, ["review"])
+        self.assertEqual(self.data()["leads"][0]["state"], "open")
+
+    def test_a_session_stops_when_its_own_calls_spend_the_budget(self):
+        self.lead_ready(calls=8)
+        spent = self.run_state()["spent"]["calls"]  # the planner round's calls count too
+        runtime.worker.reset_mock()
+        many = ("", [call("artifact_summary", artifact=DIGEST)] * 4)
+        self.step(many, many, ("Wrapped.", []))  # the eighth call is refused, then the wrap-up step
+        # Without the live check this session would make 12 worker calls.
+        self.assertEqual(runtime.worker.call_count, 8 - spent)
+        self.assertEqual(self.run_state()["spent"]["calls"], 8)
+        lead = self.data()["leads"][0]
+        self.assertEqual((lead["state"], lead["summary"]["text"]), ("stopped", "Wrapped."))
+
+    def test_planner_tools_are_audited_and_refused_once_the_run_stops(self):
+        question = self.question()
+        self.start()
+
+        def cancel_then_write(adapter):
+            investigate.operator_action(self.state, "review", "cancel", "analyst")
+            return "", [call("propose_answer", question=question, candidates=["C1"]),
+                        call("state_need", need="Anything."), call("retire_lead", lead="L1")]
+        self.step(cancel_then_write, ("", []))
+        reasons = [json.loads(text)["reason"] for text in last_results(ScriptedAdapter.last)]
+        self.assertEqual(reasons, ["investigation_stopped"] * 3)
+        self.assertEqual(self.data()["questions"][0]["state"], "open")
+        self.assertIsNone(self.run_state()["need"])
+
+    def test_planner_writes_are_audited_with_ids_only(self):
+        question = self.question()
+        self.start()
+        self.step(("", [call("state_need", need="Grant the decoder at 0x401000, please.")]), ("", []))
+        events = [json.loads(line) for line in (self.folder / "audit.jsonl").read_text().splitlines()
+                  if '"state_need"' in line]
+        self.assertEqual([event["decision"] for event in events], ["dispatched", "investigation_write"])
+        self.assertNotIn("decoder", json.dumps(events))
+        self.assertIn("text_sha256", events[0]["arguments"])
+
+    def test_lead_workers_get_only_the_case_s_allowed_tools(self):
+        self.lead_ready()
+        ScriptedAdapter.script = [("Done.", [])]
+        investigate.step(self.state, "review", CONFIG, {**SETTINGS, "tools": ["artifact_summary"]}, "analyst")
+        offered = {name for name, _, _ in ScriptedAdapter.last.tools}
+        self.assertIn("artifact_summary", offered)
+        self.assertFalse(offered & {"ghidra_functions", "artifact_strings", "propose_finding", "note_grant_need"})
+
+
 @unittest.skipUnless(os.name == "posix", "Forge uses Linux Unix sockets")
 class RunApiTests(ForgeServer, unittest.TestCase):
     def setUp(self):
@@ -207,9 +311,14 @@ class RunApiTests(ForgeServer, unittest.TestCase):
                                                  "tools": ["artifact_summary"]})
 
     def wait_for_steps(self):
-        for task in self.api("GET", "tasks?case=review")[1]["tasks"]:
-            if task["kind"] == "investigate":
-                self.wait(task)
+        """Wait until no investigation step is queued or running, including steps chained after the first."""
+        for _ in range(200):
+            live = [task for task in self.api("GET", "tasks?case=review")[1]["tasks"]
+                    if task["kind"] == "investigate" and task["state"] in ("queued", "running")]
+            if not live:
+                return
+            self.wait(live[0])
+        raise AssertionError("investigation steps did not settle")
 
     def test_the_operator_starts_steers_and_ends_a_run(self):
         self.assertEqual(self.api("POST", "cases/review/investigation/start", {})[1]["error"], "no_usable_question")
@@ -235,6 +344,29 @@ class RunApiTests(ForgeServer, unittest.TestCase):
         self.assertTrue(self.api("POST", "cases/review/investigation/acknowledge", {})[1]["acknowledged"])
         status, question = self.api("POST", "cases/review/questions/Q1/state", {"state": "closed"})
         self.assertEqual(status, 200)
+
+    def test_closing_the_last_question_answers_a_waiting_run(self):
+        self.api("POST", "cases/review/questions", {"text": "Is it an ELF?", "outcome": "Its format",
+                                                    "artifacts": [self.digest]})
+        ScriptedAdapter.script = [("Nothing to plan.", [])]
+        self.api("POST", "cases/review/investigation/start", {})
+        self.wait_for_steps()
+        self.assertEqual(self.api("GET", "cases/review/investigation")[1]["run"]["state"], "waiting")
+        self.api("POST", "cases/review/questions/Q1/state", {"state": "closed"})
+        self.assertEqual(self.api("GET", "cases/review/investigation")[1]["run"]["state"], "answered")
+
+    def test_dropping_a_queued_step_pauses_its_run(self):
+        self.api("POST", "cases/review/questions", {"text": "Is it an ELF?", "outcome": "Its format",
+                                                    "artifacts": [self.digest]})
+        release = __import__("threading").Event()
+        blocker = self.app.tasks.submit("report", "review", "slow", "analyst", lambda: release.wait(5) and {})
+        self.api("POST", "cases/review/investigation/start", {})
+        queued = next(task for task in self.api("GET", "tasks?case=review")[1]["tasks"]
+                      if task["kind"] == "investigate")
+        self.assertEqual(self.api("POST", f"tasks/{queued['id']}/cancel")[1]["state"], "cancelled")
+        release.set()
+        self.wait(blocker)
+        self.assertEqual(self.api("GET", "cases/review/investigation")[1]["run"]["state"], "paused")
 
 
 if __name__ == "__main__":

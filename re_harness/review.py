@@ -127,8 +127,12 @@ def brief(candidate):
             + boundary.envelope(json.dumps(fields, ensure_ascii=True, indent=1)))
 
 
-def run(state, case_id, config, settings, candidate_id, operator):
-    """One review session for one candidate. Returns the verdict record, or raises ModelError."""
+def run(state, case_id, config, settings, candidate_id, operator, metrics=None):
+    """One review session for one candidate. Returns the verdict record, or raises ModelError.
+
+    metrics, if given, receives the session's broker calls and tokens, whether or not a verdict came.
+    """
+    metrics = {} if metrics is None else metrics
     cloud = models.is_cloud(config)
     if cloud and not settings.get("allow_cloud"):
         raise models.ModelError("This case does not allow cloud models.")
@@ -152,6 +156,9 @@ def run(state, case_id, config, settings, candidate_id, operator):
     runtime.audit(broker.folder, case=case_id, session=broker.session, decision="review_started",
                   candidate=candidate_id, provider=config["provider"], cloud=cloud, operator=operator, via="forge")
     verdict = None
+
+    def measure():
+        metrics.update(calls=broker.calls, **models.usage(adapter))
     try:
         for _ in range(models.MAX_TURNS):
             broker.current_scope()
@@ -182,10 +189,12 @@ def run(state, case_id, config, settings, candidate_id, operator):
             if verdict:
                 break
     except Exception:
+        measure()
         runtime.audit(broker.folder, case=case_id, session=broker.session, decision="review_failed",
                       candidate=candidate_id, reason="review_session_failed", operator=operator, via="forge",
                       provider=config["provider"], cloud=cloud, **models.usage(adapter))
         raise
+    measure()
     if verdict is None:
         runtime.audit(broker.folder, case=case_id, session=broker.session, decision="review_failed",
                       candidate=candidate_id, reason="no_verdict", operator=operator, via="forge",

@@ -225,6 +225,7 @@ export interface Lead extends Authored {
   offset: number | null;
   title: string;
   question: string | null;
+  summary?: ({ text: string; run?: string } & Authored) | null;
 }
 
 export interface Observation extends Authored {

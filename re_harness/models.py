@@ -402,6 +402,7 @@ class Plan:
     def __init__(self, purpose="chat", allowed=None, role_body=None, extra=None, context=(), interrupt=None):
         self.purpose, self.allowed, self.role_body, self.extra = purpose, allowed, role_body, extra or {}
         self.context, self.interrupt, self.metrics = set(context), interrupt, {}
+        self.broker = self.adapter = None  # set by converse, so a stop check can see the live session
 
 
 class Turn:
@@ -432,6 +433,9 @@ class Turn:
             try:
                 self.broker.current_scope()
                 return self.extra[name][2](self, arguments)
+            except (OSError, runtime.RuntimeFailure):
+                text = json.dumps({"status": "failed", "reason": "audit_unavailable"})
+                return text, True, boundary.for_model(text, True, name, self.role), {}
             except policy.Denied as denied:
                 text = json.dumps({"status": "denied", "reason": str(denied)})
                 return text, True, boundary.for_model(text, True, name, self.role), {}
@@ -535,6 +539,7 @@ def converse(state, case_id, config, settings, history, message, operator, plan=
     specs = tool_specs(allowed - set(plan.extra), turn.requests, turn.skills) + [
         (name, text, schema) for name, (text, schema, _) in plan.extra.items()]
     adapter = ADAPTERS[config["provider"]](config, system, specs)
+    plan.broker, plan.adapter = broker, adapter
     inherited = replay(adapter, history, scope, broker.audience)
     broker.context_grants.update(inherited)
     adapter.user(message)

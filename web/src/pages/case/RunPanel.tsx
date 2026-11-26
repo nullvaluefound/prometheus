@@ -3,7 +3,7 @@ import { api, type Investigation, type InvestigationRun } from "../../api";
 import { useToast } from "../../components/toast";
 import { SideQuestion } from "../../components/SideQuestion";
 import { Badge, ConfirmButton, Note, Panel, Time } from "../../components/ui";
-import { fmtCount, fmtDuration, list, short, txt } from "../../format";
+import { fmtCount, list, short, txt } from "../../format";
 import { errorMessage } from "../../hooks";
 import type { CaseContext } from "../CaseView";
 
@@ -19,6 +19,13 @@ const TONE: Record<string, "ok" | "warn" | "info" | "muted" | "err"> = {
   cancelled: "muted",
 };
 const TERMINAL = ["answered", "exhausted", "failed", "cancelled"];
+
+function seconds(total: number): string {
+  const value = Math.max(0, Math.round(total));
+  if (value < 60) return `${value}s`;
+  const minutes = Math.floor(value / 60);
+  return minutes < 60 ? `${minutes}m ${value % 60}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
 
 /** The case's investigation run: a planner and lead workers pursuing the open questions, under budgets. */
 export function RunPanel({ ctx, data, reload }: { ctx: CaseContext; data: Investigation; reload: () => void }) {
@@ -101,7 +108,7 @@ function RunState({ run }: { run: InvestigationRun }) {
         <div>
           <dt>Active time</dt>
           <dd>
-            {fmtDuration(0, active * 1000) || "0s"} of {run.budgets.minutes} min <span className="muted small">· stops counting while paused or waiting</span>
+            {seconds(active)} of {run.budgets.minutes} min <span className="muted small">· stops counting while paused or waiting</span>
           </dd>
         </div>
         <div>

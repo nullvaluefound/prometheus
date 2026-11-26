@@ -590,6 +590,8 @@ def propose_answer(state, case_id, run_id, question_id, candidate_ids, stamp):
         run = data.get("run")
         if not run or run.get("id") != run_id:
             raise InvestigationError("unknown_run")
+        if run.get("state") != "running":
+            raise InvestigationError("investigation_stopped")
         if question_id not in run.get("questions", []):
             raise InvestigationError("question_not_in_run")
         question = find(data["questions"], question_id, "unknown_question")
