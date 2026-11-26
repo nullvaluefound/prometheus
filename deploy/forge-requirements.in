@@ -1,0 +1,2 @@
+# Host packages for the Forge service venv. Lock with: uv pip compile deploy/forge-requirements.in --generate-hashes --python-version 3.12 --python-platform x86_64-manylinux_2_28 --no-header -o deploy/forge-requirements.txt
+anthropic==2.14.0

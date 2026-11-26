@@ -31,7 +31,8 @@ Use the SHA-256 from intake for subsequent analysis. `blank` starts a new worker
 | [Model hookup](docs/MODELS.md) | Use local Ollama or a case-bound MCP client and grant a specific evidence excerpt |
 | [Interception and containment](docs/SAFETY.md) | Check exactly what the gateway and Docker enforce and how to pause a case |
 | [Tool inventory](docs/TOOLS.md) | Identify required dependencies, exposed capabilities and optional analyst tools |
-| [Forge deployment](docs/DEPLOY.md) | Configure a Linux VM, authentication and a VPN-backed reverse proxy |
+| [Forge deployment](docs/DEPLOY.md) | Configure a Linux VM, operator accounts, the Forge app and a VPN-backed reverse proxy |
+| [Forge API](docs/FORGE_API.md) | The JSON API behind the Forge app: cases, uploads, tools, grants, chat, models and tasks |
 | [Case instructions](AGENTS.md) | Choose the appropriate analyst or operator role |
 
 Run `python -m unittest discover -s tests` for the host-side checks. Run `python -m tests.smoke` after provisioning for a disposable end-to-end case using the built-in benign fixture.

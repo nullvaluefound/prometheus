@@ -1,0 +1,347 @@
+// Typed client for the Forge JSON API in docs/FORGE_API.md. Every path is relative to the base path.
+// Values in these types can carry untrusted sample text. Render them only as React text children.
+
+export type CaseStatus = "Ready" | "Paused" | "Closed" | "Pending";
+export type Role = "intake" | "native" | "evidence" | "review";
+export type Audience = "local" | "mcp";
+export type Completeness = "complete" | "partial" | "unknown";
+export type Provider = "ollama" | "openai" | "anthropic";
+export type TaskState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+export type TaskKind = "create_case" | "ingest" | "tool" | "chat" | "model_test" | "report";
+
+export const ROLES: readonly Role[] = ["intake", "native", "evidence", "review"];
+export const AUDIENCES: readonly Audience[] = ["local", "mcp"];
+export const COMPLETENESS: readonly Completeness[] = ["complete", "partial", "unknown"];
+export const PROVIDERS: readonly Provider[] = ["ollama", "openai", "anthropic"];
+
+export interface CaseRow {
+  id: string;
+  title: string | null;
+  status: CaseStatus;
+  model: string | null;
+  allow_cloud: boolean;
+  artifacts: number | null;
+  findings: number | null;
+  updated_utc: string | null;
+}
+
+export interface Provenance {
+  source: string;
+  completeness: string;
+  parent: string | null;
+  relation: string;
+  acquired_utc: string;
+}
+
+export interface Artifact {
+  sha256: string;
+  size: number | null;
+  provenance: Provenance[];
+}
+
+export interface Finding {
+  id: string;
+  kind: string;
+  confidence: string;
+  claim: string;
+  evidence: string[];
+  artifacts: string[];
+  superseded_by?: string | null;
+}
+
+export interface Grant {
+  id: string;
+  tool: string;
+  artifact: string;
+  selector: Record<string, string | number>;
+  audience: Audience;
+  expires_utc: string;
+}
+
+export interface AuditEvent {
+  utc: string;
+  decision: string;
+  tool?: string;
+  audience?: string;
+  reason?: string;
+  operation?: string;
+  operator?: string;
+  via?: string;
+  artifact?: string;
+  address?: string;
+}
+
+export type CaseAuditEvent = AuditEvent & { case: string };
+
+export interface CaseSettings {
+  model: string | null;
+  allow_cloud: boolean;
+  role: Role;
+  tools: string[];
+}
+
+export interface Ledger {
+  title: string;
+  artifacts: Artifact[];
+  findings: Finding[];
+}
+
+export interface CaseDetail {
+  id: string;
+  title: string | null;
+  status: CaseStatus;
+  image: string;
+  engine: string;
+  yara_rules: { sha256: string; rules: number } | null;
+  settings: CaseSettings;
+  ledger: Ledger | null;
+  grants: Grant[];
+  audit: AuditEvent[];
+}
+
+export interface Task {
+  id: string;
+  kind: TaskKind;
+  case: string | null;
+  title: string;
+  state: TaskState;
+  operator: string;
+  created_utc: string;
+  started_utc: string | null;
+  finished_utc: string | null;
+  result: unknown | null;
+  error: string | null;
+}
+
+export interface ModelConfig {
+  id: string;
+  name: string;
+  provider: Provider;
+  base_url: string;
+  model: string;
+  cloud: boolean;
+  has_key: boolean;
+}
+
+export interface ChatMessage {
+  id: string;
+  role: "user" | "assistant" | "tool";
+  text: string;
+  tool?: string;
+  decision?: "completed" | "intercepted" | "failed";
+  reason?: string;
+  model?: string;
+  operator?: string;
+  utc: string;
+}
+
+export interface Me {
+  user: string;
+  session_expires_utc: string;
+}
+
+export interface Apprentice {
+  name: string;
+  verified: boolean;
+}
+
+export interface Overview {
+  cases: CaseRow[];
+  apprentices: Apprentice[];
+  tasks: { queued: number; running: Task | null; recent: Task[] };
+  models: number;
+  audit: CaseAuditEvent[];
+}
+
+export interface PolicyTool {
+  name: string;
+  description: string;
+  excerpt_only: boolean;
+  paged: boolean;
+  addressed: boolean;
+  timeout_s: number;
+}
+
+export interface PolicyLimits {
+  max_tool_calls: number;
+  max_excerpt_bytes: number;
+  max_artifact_bytes: number;
+  chat_max_turns: number;
+  chat_max_calls_per_turn: number;
+}
+
+export interface Policy {
+  tools: PolicyTool[];
+  denied: string[];
+  roles: Record<string, string[]>;
+  limits: PolicyLimits;
+}
+
+export interface ChatState {
+  messages: ChatMessage[];
+  busy: boolean;
+}
+
+export interface TaskEnvelope {
+  task: Task;
+}
+
+export interface ToolArgs {
+  artifact: string;
+  address?: string;
+  offset?: number;
+  limit?: number;
+}
+
+export interface GrantInput extends ToolArgs {
+  tool: string;
+  audience: Audience;
+  minutes: number;
+}
+
+export interface ModelInput {
+  id: string;
+  name: string;
+  provider: Provider;
+  base_url: string;
+  model: string;
+  api_key?: string;
+}
+
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code: string;
+
+  constructor(status: number, code: string, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+export function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+const FALLBACK: Record<number, string> = {
+  400: "The Forge did not accept this request.",
+  401: "Sign in to continue.",
+  403: "The Forge refused this request.",
+  404: "Not found.",
+  409: "This conflicts with the current state. Refresh and try again.",
+  413: "The request body is larger than the Forge accepts.",
+  429: "Too many requests. Wait a moment and try again.",
+  503: "The case service is unavailable. Try again shortly.",
+};
+
+function fallbackMessage(status: number): string {
+  return FALLBACK[status] ?? (status >= 500 ? "The Forge hit a server error." : `The request failed (HTTP ${status}).`);
+}
+
+function field(data: unknown, key: string): string | null {
+  if (typeof data !== "object" || data === null) return null;
+  const value = (data as Record<string, unknown>)[key];
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+interface RequestOptions {
+  json?: unknown;
+  blob?: Blob;
+  signal?: AbortSignal;
+}
+
+let redirecting = false;
+
+async function request<T>(method: string, path: string, options: RequestOptions = {}): Promise<T> {
+  const headers: Record<string, string> = { Accept: "application/json" };
+  let body: BodyInit | undefined;
+  if (options.json !== undefined) {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify(options.json);
+  } else if (options.blob !== undefined) {
+    headers["Content-Type"] = "application/octet-stream";
+    body = options.blob;
+  }
+  let response: Response;
+  try {
+    response = await fetch("api/" + path, {
+      method,
+      headers,
+      body,
+      credentials: "same-origin",
+      cache: "no-store",
+      signal: options.signal,
+    });
+  } catch (error) {
+    if (isAbortError(error)) throw error;
+    throw new ApiError(0, "network", "The Forge could not be reached. Check the connection and try again.");
+  }
+  if (response.status === 401) {
+    if (!redirecting) {
+      redirecting = true;
+      window.location.href = "login";
+    }
+    throw new ApiError(401, "sign_in_required", FALLBACK[401]);
+  }
+  const text = await response.text();
+  let data: unknown = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = null;
+    }
+  }
+  if (!response.ok) {
+    const message = field(data, "message") ?? fallbackMessage(response.status);
+    throw new ApiError(response.status, field(data, "error") ?? `http_${response.status}`, message.slice(0, 500));
+  }
+  if (data === null) throw new ApiError(response.status, "invalid_response", "The Forge sent an unreadable response.");
+  return data as T;
+}
+
+type Opts = { signal?: AbortSignal };
+const seg = encodeURIComponent;
+const get = <T>(path: string, opts?: Opts) => request<T>("GET", path, { signal: opts?.signal });
+const post = <T>(path: string, json?: unknown) => request<T>("POST", path, { json });
+const put = <T>(path: string, json: unknown) => request<T>("PUT", path, { json });
+const del = <T>(path: string) => request<T>("DELETE", path);
+
+export const api = {
+  me: (opts?: Opts) => get<Me>("me", opts),
+  overview: (opts?: Opts) => get<Overview>("overview", opts),
+
+  cases: (opts?: Opts) => get<{ cases: CaseRow[] }>("cases", opts),
+  createCase: (id: string, title: string) => post<TaskEnvelope>("cases", { id, title }),
+  caseDetail: (id: string, opts?: Opts) => get<CaseDetail>(`cases/${seg(id)}`, opts),
+  pauseCase: (id: string) => post<{ status: CaseStatus }>(`cases/${seg(id)}/pause`),
+  resumeCase: (id: string) => post<{ status: CaseStatus }>(`cases/${seg(id)}/resume`),
+  saveSettings: (id: string, settings: CaseSettings) => put<CaseSettings>(`cases/${seg(id)}/settings`, settings),
+  uploadArtifact: (id: string, file: Blob, source: string, completeness: Completeness) =>
+    request<TaskEnvelope>("POST", `cases/${seg(id)}/artifacts?${new URLSearchParams({ source, completeness })}`, {
+      blob: file,
+    }),
+  runTool: (id: string, tool: string, args: ToolArgs) => post<TaskEnvelope>(`cases/${seg(id)}/tools/${seg(tool)}`, args),
+  report: (id: string) => post<TaskEnvelope>(`cases/${seg(id)}/report`),
+  audit: (id: string, opts?: Opts) => get<{ audit: AuditEvent[] }>(`cases/${seg(id)}/audit`, opts),
+
+  policy: (opts?: Opts) => get<Policy>("policy", opts),
+  createGrant: (id: string, grant: GrantInput) => post<Grant>(`cases/${seg(id)}/grants`, grant),
+  revokeGrant: (id: string, grant: string) => del<{ revoked: string }>(`cases/${seg(id)}/grants/${seg(grant)}`),
+
+  chat: (id: string, opts?: Opts) => get<ChatState>(`cases/${seg(id)}/chat`, opts),
+  sendChat: (id: string, message: string) => post<TaskEnvelope>(`cases/${seg(id)}/chat`, { message }),
+  clearChat: (id: string) => del<{ cleared: boolean }>(`cases/${seg(id)}/chat`),
+
+  tasks: (caseId: string | null, opts?: Opts) =>
+    get<{ tasks: Task[] }>(caseId ? `tasks?${new URLSearchParams({ case: caseId })}` : "tasks", opts),
+  task: (id: string, opts?: Opts) => get<Task>(`tasks/${seg(id)}`, opts),
+  cancelTask: (id: string) => post<Task>(`tasks/${seg(id)}/cancel`),
+
+  models: (opts?: Opts) => get<{ models: ModelConfig[] }>("models", opts),
+  createModel: (model: ModelInput) => post<ModelConfig>("models", model),
+  updateModel: (id: string, model: ModelInput) => put<ModelConfig>(`models/${seg(id)}`, model),
+  deleteModel: (id: string) => del<{ deleted: string }>(`models/${seg(id)}`),
+  testModel: (id: string) => post<TaskEnvelope>(`models/${seg(id)}/test`),
+};

@@ -69,3 +69,36 @@ jobs:
             exit 1
           fi
           grep -qE 'YaraTests[^)]*\) \.\.\. ok' "$log"
+
+  web:
+    name: Forge web app build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      - name: Install pinned dependencies
+        working-directory: web
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Type-check and build
+        working-directory: web
+        run: |
+          npx tsc --noEmit
+          npm run build
+      - name: Require the committed build to match its source
+        run: |
+          if ! git diff --exit-code -- re_harness/forge_web; then
+            echo "::error::re_harness/forge_web is stale. Run npm run build in web/ and commit the output."
+            exit 1
+          fi
+          test -z "$(git status --porcelain -- re_harness/forge_web)"
+      - name: Keep the build free of inline code
+        run: |
+          # "! grep" would not fail under bash -e, so test the match explicitly.
+          if grep -nE '<script>|<style|style=' re_harness/forge_web/index.html; then exit 1; fi
+          # react-dom itself names the prop, so check the app's own source rather than the bundle.
+          if grep -rnE 'dangerouslySetInnerHTML|innerHTML|style=\{\{|eval\(' web/src; then exit 1; fi
