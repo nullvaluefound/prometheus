@@ -3,6 +3,7 @@ import type { Finding } from "../../api";
 import { Empty, Note, Panel } from "../../components/ui";
 import { isRecord, list, short, txt } from "../../format";
 import type { CaseContext } from "../CaseView";
+import { CandidatesPanel } from "./CandidatesPanel";
 
 export function FindingsTab({ ctx }: { ctx: CaseContext }) {
   const ledger = ctx.detail.ledger;
@@ -12,6 +13,8 @@ export function FindingsTab({ ctx }: { ctx: CaseContext }) {
   const shown = showSuperseded ? findings : findings.filter((item) => !item.superseded_by);
 
   return (
+    <div className="stack">
+    <CandidatesPanel ctx={ctx} />
     <Panel
       title="Findings"
       actions={
@@ -84,5 +87,6 @@ export function FindingsTab({ ctx }: { ctx: CaseContext }) {
       )}
       <p className="muted small">Findings are analyst claims about untrusted evidence. Check the cited evidence before relying on one.</p>
     </Panel>
+    </div>
   );
 }

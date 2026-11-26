@@ -258,6 +258,7 @@ function SettingsPanel({ ctx, policy }: { ctx: CaseContext; policy: Resource<Pol
   const roleNames = roles ? ROLES.filter((name) => Array.isArray(roles[name])) : ROLES;
   const roleTools = roles ? list<string>(roles[role]) : [];
   const toolInfo = new Map(usableTools(policy.data).map((tool) => [tool.name, tool]));
+  const stateTools = new Set(list<{ name: string }>(policy.data?.state_tools).map((tool) => txt(tool.name)));
   const modelList = list<ModelConfig>(models.data?.models);
   const selected = modelList.find((item) => item.id === model);
   const conflict = Boolean(selected?.cloud) && !allowCloud;
@@ -385,6 +386,14 @@ function SettingsPanel({ ctx, policy }: { ctx: CaseContext; policy: Resource<Pol
                             <>
                               {" "}
                               <Badge tone="warn">grant</Badge>
+                            </>
+                          )}
+                          {stateTools.has(name) && (
+                            <>
+                              {" "}
+                              <Badge tone="info" title="Reads or writes the case's investigation notes through the broker. It never runs a worker.">
+                                case state
+                              </Badge>
                             </>
                           )}
                         </span>

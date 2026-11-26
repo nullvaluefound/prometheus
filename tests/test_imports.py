@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from re_harness import case, local_model, policy, projection, providers, runtime, server, worker
+from re_harness import case, evidence, local_model, policy, projection, providers, runtime, server, worker
 
 try:
     import pefile
@@ -106,10 +106,16 @@ class BrokerTests(unittest.TestCase):
         self.assertFalse(result["isError"], result)
         self.assertEqual(json.loads(backend.call_args.kwargs["request"]),
                          {"tool": "artifact_imports", "arguments": PAGE, "excerpt": True})
-        self.assertEqual(json.loads(result["content"][0]["text"]), reply())
+        released = json.loads(result["content"][0]["text"])
+        evidence_id = released.pop("evidence_id")
+        self.assertEqual(released, reply())
         events = [json.loads(line) for line in (self.folder / "audit.jsonl").read_text(encoding="ascii").splitlines()]
         self.assertEqual([event.get("excerpt") for event in events if event["decision"] in ("dispatched", "completed")],
                          [True, True])
+        # The broker kept exactly what it released, under the id it gave the model and the audit.
+        self.assertEqual(events[-1]["evidence"], evidence_id)
+        stored = evidence.load(self.folder, evidence_id)
+        self.assertEqual((stored["reply"], stored["excerpt"], stored["tool"]), (reply(), True, "artifact_imports"))
 
     def test_granted_call_withholds_rows_outside_contract(self):
         self.grant()

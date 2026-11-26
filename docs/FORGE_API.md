@@ -66,7 +66,7 @@ interface CaseSettings {
 type TaskState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 interface Task {
   id: string;                 // 32 hex
-  kind: "create_case" | "ingest" | "tool" | "chat" | "model_test" | "report";
+  kind: "create_case" | "ingest" | "tool" | "chat" | "model_test" | "report" | "split" | "review" | "record_finding";
   case: string | null;
   title: string;              // human label, e.g. "capa_triage on 3f2a…"
   state: TaskState;
@@ -108,8 +108,39 @@ interface GrantRequest {        // filed by the Forge from a broker denial; only
   note: string | null;         // the operator's note on denial
 }
 interface WaitingItem {
-  kind: "grant_request"; case: string; id: string; tool: string; artifact: string; audience: "local" | "mcp";
-  utc: string; flagged: boolean;
+  kind: "grant_request" | "candidate" | "question_proposed" | "question_answer_proposed";
+  case: string; id: string; utc: string;
+  tool?: string; artifact?: string; audience?: "local" | "mcp"; flagged?: boolean;  // grant requests
+  check?: "passed" | "failed" | "not_assessed" | null; verdict?: string | null;      // candidates
+}
+
+// Investigation state. Rows a model wrote carry author "model", audience, grants, session and utc. Treat their text
+// as untrusted.
+interface Question {
+  id: string;                  // Q1, Q2, ...
+  state: "proposed" | "open" | "answer_proposed" | "closed" | "withdrawn";
+  text: string; outcome: string; artifacts: string[]; parent: string | null;
+  created_by: string; created_utc: string; closed_by: string | null; closed_utc: string | null; note: string | null;
+}
+interface Lead { id: string; state: string; artifact: string; address: string | null; offset: number | null;
+                 title: string; question: string | null; }
+interface Observation { id: string; kind: "observed" | "inferred"; text: string; artifact: string;
+                        lead: string | null; evidence: string[]; }
+interface Candidate {
+  id: string; state: "proposed" | "recording" | "recorded" | "rejected";   // recording: a record task holds it
+  claim: string; kind: string; confidence: string; artifacts: string[]; evidence: string[];
+  limitations: string | null; counterevidence: string | null; question: string | null; lead: string | null;
+  check: { result: "passed" | "failed" | "not_assessed"; problems: { code: string; ref: string | null }[];
+           utc: string } | null;
+  verdicts: { verdict: "supported" | "unsupported" | "insufficient"; rationale: string; model: string;
+              utc: string; operator: string }[];
+  finding: string | null; decided_by: string | null; decided_utc: string | null; note: string | null;
+}
+interface Investigation { questions: Question[]; leads: Lead[]; observations: Observation[];
+                          plan: { items: string[] } | null; candidates: Candidate[]; }
+interface EvidenceEntry {        // the exact reply the broker released, under its content SHA-256
+  id: string; tool: string; arguments: Record<string, string | number>; excerpt: boolean;
+  audience: "local" | "mcp"; grants: string[]; ticket: string; session: string; utc: string; reply: unknown;
 }
 ```
 
@@ -143,6 +174,7 @@ interface WaitingItem {
   ```
   { tools: { name, description, excerpt_only: boolean, paged: boolean, addressed: boolean, timeout_s: number }[],
     denied: string[],                    // tools the broker always refuses, e.g. run_ghidra_script
+    state_tools: { name, description, writes: boolean }[],  // case-state tools, dispatched by the broker without a worker
     roles: Record<string, string[]>,     // role -> tools
     limits: { max_tool_calls: number, max_excerpt_bytes: number, max_artifact_bytes: number,
               chat_max_turns: number, chat_max_calls_per_turn: number } }
@@ -152,6 +184,18 @@ interface WaitingItem {
 - `GET api/cases/{id}/requests` returns `{ requests: GrantRequest[] }`: pending requests oldest first, then the newest 50 decided.
 - `POST api/cases/{id}/requests/{request}/decide` with `{ decision: "approve", minutes }` (1–60) issues a grant for exactly the request's tool, arguments and audience and returns the decided `GrantRequest`. `{ decision: "deny", note? }` (note up to 200 characters) records the denial. A request that is already decided returns 409 `request_already_decided`; a paused case returns 409 `grant_refused`. A closed case can deny but not approve.
 - `POST api/cases/{id}/requests` with `{ action: "deny_all", note? }` denies every pending request and returns `{ denied: string[] }`.
+
+### Investigation, evidence and proposed findings
+- `GET api/cases/{id}/investigation` returns `Investigation`: everything, for the operator.
+- `GET api/cases/{id}/evidence` returns `{ evidence: {id, tool, artifact, selector, excerpt, audience, utc}[] }`, newest 200. `GET api/cases/{id}/evidence/{sha256}` returns `EvidenceEntry`, or 404 if it is absent or fails its hash check.
+- `POST api/cases/{id}/questions` with `{ text, outcome, artifacts }` adds an open question. Text is 1–500 characters, outcome up to 300, and up to 8 artifacts, each admitted to the case (400 `artifact_not_admitted` otherwise). `PUT api/cases/{id}/questions/{qid}` takes the same body and returns 409 `question_closed` for a closed question.
+- `POST api/cases/{id}/questions/{qid}/state` with `{ state: "open" | "closed" | "withdrawn", note? }` accepts a proposed question, closes, reopens or withdraws one. Only the operator closes a question.
+- `POST api/cases/{id}/questions/{qid}/split` returns `202 {task}` (kind `split`). The case model, with no tools, proposes sub-questions from the question's text; the result is `{ proposed: string[] }` and each waits as `proposed`.
+- `POST api/cases/{id}/leads/{lid}/state` with `{ state: "open" | "retired" }`.
+- `POST api/cases/{id}/candidates/{cid}/check` re-runs the reference check and returns the `Candidate`.
+- `POST api/cases/{id}/candidates/{cid}/review` returns `202 {task}` (kind `review`) for one review session. The result is `{ candidate, verdict }`.
+- `POST api/cases/{id}/candidates/{cid}/record` with optional `{ claim, kind, confidence }` edits returns `202 {task}` (kind `record_finding`). It records a ledger finding through the operator `finding` path with the candidate's artifacts and `evidence:<sha256>` locators, and the result is `{ candidate, finding }`.
+- `POST api/cases/{id}/candidates/{cid}/reject` with `{ note? }` returns the `Candidate`. A decided candidate, or one a record task holds, returns 409 `candidate_already_decided`. An unreadable investigation store returns 503 `investigation_unreadable`.
 
 ### Chat
 - `GET api/cases/{id}/chat` returns `{ messages: ChatMessage[], busy: boolean }`.

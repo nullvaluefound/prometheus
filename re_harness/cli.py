@@ -12,7 +12,7 @@ import sys
 import tempfile
 import uuid
 
-from . import accounts, decoding, local_model, policy, runtime, server
+from . import accounts, decoding, evidence, local_model, policy, runtime, server
 from .case import atomic_json, hashes
 
 EXCERPTS = tuple(name for name in policy.TOOLS if name != "artifact_summary")
@@ -300,6 +300,11 @@ def run_operation(args, record, options):
 
 def operator_action(args):
     folder = runtime.case_path(STATE, args.case)
+    if args.command == "finding":
+        # The ledger lives in the evidence volume; evidence:<sha256> locators name host-side tool evidence.
+        absent = evidence.missing(folder, args.evidence)
+        if absent:
+            raise runtime.RuntimeFailure("Unknown evidence id " + absent[0][:16] + "... in this case")
     with runtime.operator_lock(folder):
         _, record = runtime.load_case(STATE, args.case, allow_closed=args.command in CLOSED_READS)
         event = {"case": args.case, "operation": args.command}

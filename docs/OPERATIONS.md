@@ -57,6 +57,8 @@ python -m re_harness.cli export case-001 evidence.json 'C:\Restricted\evidence.j
 
 `inspect --full` writes the bounded structured provider response to the operator's chosen local path and prints its SHA-256. Cite that path and hash in findings if retained. Export only to a restricted directory. Use the artifact SHA-256 to export its verified bytes under an inert `.bin` extension. Use `<sha256>.triage.json` to export persisted triage. `report` creates an editable scaffold and an evidence JSON record that name the case image and imported YARA rules SHA-256. `--claim` accepts up to 2000 characters and `--evidence` up to 16 entries of 500 characters. `--source` and `--relation` take plain labels of up to 160 characters without URLs. Review defanging and secret handling before distribution.
 
+An `--evidence` value of the form `evidence:<sha256>` names a broker evidence entry in the case's host folder. The CLI refuses the finding if that entry is absent or fails its hash check. The Forge records proposed findings this way, citing each one's evidence.
+
 The ledger is append-only. To correct or withdraw a finding, record its replacement with `--supersedes F0001`. The new finding records the ID it replaces. The target must exist and must not already be superseded. The report keeps superseded findings in a struck-through **Superseded** subsection that names the replacement, and Coverage counts only current findings.
 
 ```powershell

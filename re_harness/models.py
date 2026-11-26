@@ -12,7 +12,7 @@ import subprocess
 import threading
 from urllib.parse import urlsplit
 
-from . import accounts, boundary, forge, grant_requests, local_model, policy, runtime, server
+from . import accounts, boundary, grant_requests, local_model, policy, runtime, server
 
 PROVIDERS = ("ollama", "openai", "anthropic")
 MODEL_ID = r"[a-z0-9][a-z0-9-]{0,31}"
@@ -188,7 +188,7 @@ NOTE_SCHEMA = {"type": "object", "properties": {
 
 
 def tool_specs(names, requests=False):
-    specs = [(name, policy.TOOLS[name], policy.tool_schema(name)) for name in sorted(names)]
+    specs = [local_model.tool_spec(name) for name in sorted(names)]
     return specs + ([(NOTE_TOOL, NOTE_TEXT, NOTE_SCHEMA)] if requests else [])
 
 
@@ -374,16 +374,13 @@ class Turn:
         self.state, self.case_id, self.broker, self.role, self.allowed = state, case_id, broker, role, allowed
         self.requests = bool(allowed & policy.EXCERPT_ONLY)
         self.seen = set()  # SHA-256 values and addresses this session's tool output named
-        self.manifest = None
 
     def names(self):
         return self.allowed | ({NOTE_TOOL} if self.requests else set())
 
     def admitted(self):
-        """The case manifest's SHA-256 values, read once per turn through a read-only Apprentice."""
-        if self.manifest is None:
-            self.manifest = set(forge.case_ledger(self.broker.current_scope())["artifacts"])
-        return self.manifest
+        """The case manifest's SHA-256 values, read once per session through a read-only Apprentice."""
+        return self.broker.admitted()
 
     def dispatch(self, name, arguments):
         """Return (display_text, is_error, model_text, extra) for one call."""
@@ -468,11 +465,13 @@ def converse(state, case_id, config, settings, history, message, operator):
                                     requests=turn.requests)
     adapter = ADAPTERS[config["provider"]](config, system, tool_specs(allowed, turn.requests))
     inherited = replay(adapter, history, scope, broker.audience)
+    broker.context_grants.update(inherited)
     adapter.user(message)
     rows = []
 
     def stamped(found):
-        grants = sorted(inherited | broker.released_grants)
+        # context_grants holds the replayed history's grants and those of stored text a case-state read showed.
+        grants = sorted(inherited | broker.released_grants | broker.context_grants)
         return [{**row, "audience": broker.audience, "grants": grants} if row["role"] == "assistant" else row
                 for row in found]
 
@@ -535,6 +534,41 @@ def tool_row(name, reply_text, error, request=None):
     if request:
         row.update(request=request, text=row["text"] + " (grant request pending with the operator)")
     return row
+
+
+SPLIT = ("You help an authorized defensive, static-only malware analysis case plan its work. Split the operator's "
+         "question into two to five narrower sub-questions that static analysis of the named artifacts could answer. "
+         "Give each a checkable outcome: what a tool result would have to show. Reply with only JSON of the form "
+         '{"questions": [{"text": "...", "outcome": "..."}]}.')
+
+
+def split_question(config, question):
+    """Ask the case model, with no tools, to split one operator question. Returns [(text, outcome)].
+
+    The model sees only operator text. Its sub-questions are stored as proposed and reach an investigation only after
+    the operator accepts them.
+    """
+    adapter = ADAPTERS[config["provider"]](config, SPLIT, [])
+    adapter.user(json.dumps({"question": question.get("text"), "outcome": question.get("outcome"),
+                             "artifacts": question.get("artifacts") or []}, ensure_ascii=True))
+    text, _ = adapter.step(final=True)
+    start, end = text.find("{"), text.rfind("}")
+    try:
+        value = json.loads(text[start:end + 1]) if start >= 0 else None
+    except ValueError:
+        value = None
+    rows = value.get("questions") if isinstance(value, dict) else None
+    if not isinstance(rows, list):
+        raise ModelError("The model did not return sub-questions in the expected form.")
+    found = []
+    for row in rows[:5]:
+        if isinstance(row, dict) and isinstance(row.get("text"), str) and isinstance(row.get("outcome"), str):
+            text_, outcome = clean(row["text"]).strip()[:500], clean(row["outcome"]).strip()[:300]
+            if text_:
+                found.append((" ".join(text_.split()), " ".join(outcome.split())))
+    if not found:
+        raise ModelError("The model did not return any usable sub-questions.")
+    return found
 
 
 def default_tools(role):

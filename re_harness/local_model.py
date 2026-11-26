@@ -4,15 +4,25 @@ import http.client
 import json
 import re
 
-from . import boundary, policy, runtime, server
+from . import boundary, investigation, policy, runtime, server
 
+# Case-state tools dispatch through the broker like sample tools, with no worker run (investigation.py).
+NOTES = {"case_overview", "lead_detail", "add_lead", "record_observation", "update_plan"}
 ROLES = {
-    "intake": {"artifact_summary", "artifact_strings", "yara_scan", "capa_triage"},
-    "native": set(policy.TOOLS),
+    "intake": {"artifact_summary", "artifact_strings", "yara_scan", "capa_triage"} | NOTES,
+    "native": set(policy.TOOLS) | set(investigation.TOOLS),
     "evidence": {"artifact_summary", "artifact_strings", "artifact_imports", "ghidra_functions", "ghidra_xrefs",
-                 "yara_scan", "capa_triage"},
-    "review": {"artifact_summary", "artifact_imports", "ghidra_functions", "ghidra_xrefs", "yara_scan", "capa_triage"},
+                 "yara_scan", "capa_triage"} | set(investigation.TOOLS),
+    "review": {"artifact_summary", "artifact_imports", "ghidra_functions", "ghidra_xrefs", "yara_scan", "capa_triage",
+               "case_overview", "lead_detail"},
 }
+
+
+def tool_spec(name):
+    """(name, description, JSON schema) for a sample tool or a case-state tool."""
+    if name in investigation.TOOLS:
+        return investigation.spec(name)
+    return name, policy.TOOLS[name], policy.tool_schema(name)
 MAX_TURNS = 8
 MAX_MODEL_RESPONSE = 128 * 1024
 
@@ -56,8 +66,8 @@ def chat(state, case_id, port, model, role, question):
     # The role body first, then the code-owned rules, so the Forge's own text is the final word.
     instructions = boundary.system_prompt((runtime.ROOT / "agents" / role / "AGENTS.md").read_text(encoding="utf-8"))
     messages = [{"role": "system", "content": instructions}, {"role": "user", "content": question}]
-    tools = [{"type": "function", "function": {"name": name, "description": policy.TOOLS[name],
-              "parameters": policy.tool_schema(name)}} for name in sorted(ROLES[role])]
+    tools = [{"type": "function", "function": {"name": name, "description": text, "parameters": schema}}
+             for name, text, schema in map(tool_spec, sorted(ROLES[role]))]
     runtime.audit(broker.folder, case=case_id, session=broker.session, decision="local_model_started", role=role)
     try:
         for _ in range(MAX_TURNS):

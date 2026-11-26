@@ -1,11 +1,12 @@
 import { useSyncExternalStore } from "react";
 import { CASE_ID } from "./format";
 
-export type CaseTab = "overview" | "artifacts" | "tools" | "findings" | "chat" | "rules" | "audit";
+export type CaseTab = "overview" | "artifacts" | "tools" | "investigation" | "findings" | "chat" | "rules" | "audit";
 export const CASE_TABS: readonly { id: CaseTab; label: string }[] = [
   { id: "overview", label: "Overview" },
   { id: "artifacts", label: "Artifacts" },
   { id: "tools", label: "Tools" },
+  { id: "investigation", label: "Investigation" },
   { id: "findings", label: "Findings" },
   { id: "chat", label: "Chat" },
   { id: "rules", label: "Rules & grants" },
