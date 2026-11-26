@@ -14,13 +14,14 @@ from http import HTTPStatus
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from . import accounts, cli, forge, local_model, models, policy, projection, runtime, server, tasks
+from . import accounts, cli, forge, grant_requests, local_model, models, policy, projection, runtime, server, tasks
 
 JSON_LIMIT = 64 * 1024
 CHAT_ROWS = 400
 ROLES = tuple(local_model.ROLES)
 SETTINGS_LOCK = threading.Lock()
 CHAT_LOCK = threading.Lock()
+DECIDE_LOCK = threading.Lock()  # one grant per request, even when two operators approve at once
 
 
 class ApiError(Exception):
@@ -199,6 +200,34 @@ def tool_arguments(tool, body):
         raise bad("Those tool arguments are not valid for this tool.") from error
 
 
+# ---- Grant requests and the attention queue ---------------------------------------------------------------
+
+def safe_requests(state, case_id):
+    try:
+        return grant_requests.listing(state, case_id)
+    except (OSError, ValueError):
+        return []
+
+
+def request_error(error):
+    if str(error) == "request_already_decided":
+        return ApiError(HTTPStatus.CONFLICT, "request_already_decided", "That request was already decided.")
+    return ApiError(HTTPStatus.NOT_FOUND, "unknown_request", "No such request.")
+
+
+def waiting(state, cases):
+    """Everything that waits on an operator, newest first."""
+    items = []
+    for row in cases:
+        for request in safe_requests(state, row["id"]):
+            if request["state"] == "pending":
+                items.append({"kind": "grant_request", "case": row["id"], "id": request["id"], "tool": request["tool"],
+                              "artifact": request["artifact"], "audience": request["audience"],
+                              "utc": request["created_utc"], "flagged": bool(request["flags"])})
+    items.sort(key=lambda item: item.get("utc") or "", reverse=True)
+    return {"count": len(items), "items": items[:50]}
+
+
 # ---- Chat history -------------------------------------------------------------------------------------------
 
 def chat_path(state, case_id):
@@ -254,6 +283,8 @@ class Api:
             ("GET", ("cases", "{}", "audit")): self.audit,
             ("POST", ("cases", "{}", "grants")): self.grant,
             ("DELETE", ("cases", "{}", "grants", "{}")): self.revoke,
+            ("GET", ("cases", "{}", "requests")): self.requests,
+            ("POST", ("cases", "{}", "requests", "{}", "decide")): self.decide_request,
             ("GET", ("cases", "{}", "chat")): self.chat,
             ("POST", ("cases", "{}", "chat")): self.send_chat,
             ("DELETE", ("cases", "{}", "chat")): self.clear_chat,
@@ -278,6 +309,8 @@ class Api:
             return ()
         if parts[0] in ("cases", "models", "tasks"):
             if len(parts) >= 2:
+                if parts[0] == "cases" and len(parts) == 5 and parts[2] == "requests":
+                    return (1, 3)
                 return (1, 3) if len(parts) == 4 and parts[0] == "cases" and parts[2] in ("tools", "grants") else (1,)
         return ()
 
@@ -307,7 +340,7 @@ class Api:
             audit += [{**event, "case": row["id"]} for event in forge.recent_audit(folder, 20)]
         audit.sort(key=lambda event: event.get("utc", ""), reverse=True)
         return HTTPStatus.OK, {
-            "cases": cases,
+            "cases": cases, "waiting": waiting(self.state, cases),
             "apprentices": [{"name": name, "verified": ok} for name, ok in forge.baseline_tools(self.state)],
             "tasks": {"queued": sum(t["state"] == "queued" for t in queue), "running": running, "recent": queue[:10]},
             "models": len(models.listing(self.state)), "audit": audit[:20]}
@@ -366,6 +399,7 @@ class Api:
             "engine": record["engine"],
             "yara_rules": {"sha256": rules["sha256"], "rules": rules.get("rules")} if isinstance(rules, dict) else None,
             "settings": public_settings(settings), "ledger": ledger, "grants": grant_rows(record),
+            "pending_requests": sum(row["state"] == "pending" for row in safe_requests(self.state, case_id)),
             "audit": forge.recent_audit(folder, 50)}
 
     def set_paused(self, handler, operator, args, paused):
@@ -539,6 +573,54 @@ class Api:
             raise ApiError(HTTPStatus.NOT_FOUND, "unknown_grant", "No such grant.") from error
         forge_audit(self.app, case_id, operator, decision="forge_revoke", reason="grant " + grant_id[:8])
         return HTTPStatus.OK, {"revoked": grant_id}
+
+    # -- grant requests filed from broker denials --
+
+    def requests(self, handler, operator, args, params):
+        require_case(self.app, args[0])
+        return HTTPStatus.OK, {"requests": safe_requests(self.state, args[0])}
+
+    def decide_request(self, handler, operator, args, params):
+        """Approve issues a grant for exactly the denied call and audience; deny records the operator's note."""
+        case_id, request_id = args
+        folder, record = require_case(self.app, case_id)
+        require_open(record)
+        if not policy.match(request_id, grant_requests.REQUEST_ID):
+            raise ApiError(HTTPStatus.NOT_FOUND, "unknown_request", "No such request.")
+        body = self.body(handler)
+        decision, minutes, note = body.get("decision"), body.get("minutes"), body.get("note")
+        if decision not in ("approve", "deny"):
+            raise bad("Decide approve or deny.")
+        if note is not None and (not isinstance(note, str) or len(note) > 200):
+            raise bad("Keep the note to 200 characters.")
+        with DECIDE_LOCK:
+            return self.decide_locked(case_id, request_id, decision, minutes, note, operator)
+
+    def decide_locked(self, case_id, request_id, decision, minutes, note, operator):
+        try:
+            row = grant_requests.pending(self.state, case_id, request_id)
+        except grant_requests.RequestError as error:
+            raise request_error(error) from error
+        grant = None
+        if decision == "approve":
+            if type(minutes) is not int or not 1 <= minutes <= 60:
+                raise bad("Grants last 1-60 minutes.")
+            arguments = row["arguments"]
+            try:
+                event = run_cli(cli.change_scope, case=case_id, command="grant", tool=row["tool"],
+                                audience=row["audience"], minutes=minutes,
+                                **{key: arguments.get(key) for key in ("artifact", "address", "offset", "limit")})
+            except runtime.RuntimeFailure as error:
+                raise ApiError(HTTPStatus.CONFLICT, "grant_refused", str(error)) from error
+            grant = event["grant"]["id"]
+            forge_audit(self.app, case_id, operator, decision="forge_grant", tool=row["tool"],
+                        audience=row["audience"], reason="grant " + grant[:8])
+        try:
+            decided = grant_requests.decide(self.state, case_id, request_id,
+                                            "approved" if decision == "approve" else "denied", operator, grant, note)
+        except grant_requests.RequestError as error:
+            raise request_error(error) from error
+        return HTTPStatus.OK, grant_requests.public(decided)
 
     # -- chat --
 

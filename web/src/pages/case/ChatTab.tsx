@@ -122,7 +122,7 @@ export function ChatTab({ ctx, draft, setDraft }: { ctx: CaseContext; draft: str
           <ol className="chat-log" ref={logRef} aria-label="Conversation" tabIndex={0}>
             {messages.length === 0 && !thinking && <li className="chat-empty muted">No messages yet. Ask the model about this case's artifacts.</li>}
             {messages.map((message) => (
-              <MessageRow key={txt(message.id)} message={message} />
+              <MessageRow key={txt(message.id)} message={message} rulesHref={rulesHref} />
             ))}
             {thinking && (
               <li className="msg msg-assistant msg-thinking">
@@ -174,7 +174,7 @@ export function ChatTab({ ctx, draft, setDraft }: { ctx: CaseContext; draft: str
   );
 }
 
-function MessageRow({ message }: { message: ChatMessage }) {
+function MessageRow({ message, rulesHref }: { message: ChatMessage; rulesHref: string }) {
   if (message.role === "user") {
     return (
       <li className="msg msg-user">
@@ -203,6 +203,11 @@ function MessageRow({ message }: { message: ChatMessage }) {
             <strong>Blocked by the broker:</strong> {txt(message.reason) || "no reason recorded"}
           </p>
         )}
+        {message.request && (
+          <p className="msg-reason">
+            A grant request for exactly this call is waiting on you. <a href={rulesHref}>Decide it on the Rules &amp; grants tab</a>.
+          </p>
+        )}
         {decision === "failed" && message.reason && (
           <p className="msg-reason">
             <strong>Failed:</strong> {txt(message.reason)}
@@ -215,7 +220,7 @@ function MessageRow({ message }: { message: ChatMessage }) {
   return (
     <li className="msg msg-assistant">
       <div className="msg-meta">
-        <span className="msg-who">Model</span>
+        <span className="msg-who">{message.wrapup ? "Model wrap-up" : "Model"}</span>
         {message.model && <code>{txt(message.model)}</code>}
         <Time utc={message.utc} relative />
         {grants > 0 && (
@@ -224,6 +229,7 @@ function MessageRow({ message }: { message: ChatMessage }) {
           </span>
         )}
       </div>
+      {message.wrapup && <p className="muted small">The turn used its whole tool budget, so the model wrote this summary without tools.</p>}
       <p className="msg-text">{txt(message.text)}</p>
     </li>
   );
