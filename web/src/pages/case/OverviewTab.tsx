@@ -7,6 +7,7 @@ import { fmtCount, list, plural, txt } from "../../format";
 import { errorMessage, isTerminal, useTask } from "../../hooks";
 import { caseHref } from "../../router";
 import type { CaseContext } from "../CaseView";
+import { OutcomeCard } from "./OutcomeCard";
 
 export function OverviewTab({
   ctx,
@@ -146,6 +147,8 @@ export function OverviewTab({
           )}
         </Panel>
       </div>
+
+      <OutcomeCard ctx={ctx} />
 
       <Panel
         title="Report"

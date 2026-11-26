@@ -287,6 +287,20 @@ export interface EvidenceEntry {
   reply: unknown;
 }
 
+export interface Outcome {
+  tools: Record<string, Partial<Record<string, number>>>;
+  denials: Record<string, number>;
+  grants: { requested: number; issued: number; approved: number; denied: number };
+  candidates: { total: number; passed: number; failed: number; not_assessed: number; proposed: number; recorded: number; rejected: number; reviewed: number };
+  questions: Record<string, number>;
+  leads: number;
+  observations: number;
+  tokens: { provider: string; locality: "local" | "cloud"; input: number; output: number; sessions: number }[];
+  model_sessions: number;
+  first_utc: string | null;
+  last_utc: string | null;
+}
+
 export interface QuestionInput {
   text: string;
   outcome: string;
@@ -344,6 +358,8 @@ export interface PolicyLimits {
 export interface Policy {
   tools: PolicyTool[];
   state_tools?: { name: string; description: string; writes: boolean }[];
+  skills?: Record<string, { name: string; description: string }[]>;
+  skill_gaps?: { name: string; count: number; roles: string[]; last_utc: string }[];
   denied: string[];
   roles: Record<string, string[]>;
   limits: PolicyLimits;
@@ -502,6 +518,7 @@ export const api = {
   createGrant: (id: string, grant: GrantInput) => post<Grant>(`cases/${seg(id)}/grants`, grant),
   revokeGrant: (id: string, grant: string) => del<{ revoked: string }>(`cases/${seg(id)}/grants/${seg(grant)}`),
   investigation: (id: string, opts?: Opts) => get<Investigation>(`cases/${seg(id)}/investigation`, opts),
+  outcome: (id: string, opts?: Opts) => get<Outcome>(`cases/${seg(id)}/outcome`, opts),
   evidence: (id: string, opts?: Opts) => get<{ evidence: EvidenceRow[] }>(`cases/${seg(id)}/evidence`, opts),
   evidenceEntry: (id: string, evidence: string, opts?: Opts) =>
     get<EvidenceEntry>(`cases/${seg(id)}/evidence/${seg(evidence)}`, opts),

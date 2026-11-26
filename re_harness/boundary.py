@@ -60,6 +60,8 @@ GUIDANCE = {
     "not_requestable": "This call cannot be requested. Carry on without this excerpt.",
     "invalid_note": "Send note_grant_need with exactly a request id and a short reason.",
     "invalid_reason": "Give a short, non-empty reason.",
+    "unknown_skill": "No skill has that name. Use a name from the list in your instructions.",
+    "skill_not_visible": "That skill is not available to your role. Use a name from the list in your instructions.",
     "unknown_request": "No pending request from this session has that id. Use the id from the refused call.",
     "request_already_decided": "The operator already decided that request.",
     "artifact_not_admitted": "That SHA-256 is not admitted to this case, so no grant request was filed. Use only "
@@ -129,12 +131,13 @@ NO_REQUESTS = ("- **Excerpt grants.** Some tools withhold names, strings or deco
                "and selector a grant would help with, and carry on with what you have. No request is filed for you.")
 
 
-def system_prompt(role_body, requests=False):
-    """The role body first, then the Forge's own rules, so the code-owned text is the final word.
+def system_prompt(role_body, requests=False, skills=""):
+    """The role body, then any skill listing, then the Forge's own rules, so the code-owned text is the final word.
 
     requests says whether this session files grant requests from denials and offers note_grant_need.
     """
-    return role_body.rstrip() + "\n\n" + tail(requests)
+    middle = skills.strip() + "\n\n" if skills and skills.strip() else ""
+    return role_body.rstrip() + "\n\n" + middle + tail(requests)
 
 
 def tail(requests=False):

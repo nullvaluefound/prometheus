@@ -12,7 +12,7 @@ import subprocess
 import threading
 from urllib.parse import urlsplit
 
-from . import accounts, boundary, grant_requests, local_model, policy, runtime, server
+from . import accounts, boundary, grant_requests, local_model, policy, runtime, server, skills
 
 PROVIDERS = ("ollama", "openai", "anthropic")
 MODEL_ID = r"[a-z0-9][a-z0-9-]{0,31}"
@@ -187,17 +187,31 @@ NOTE_SCHEMA = {"type": "object", "properties": {
     "required": ["request", "reason"], "additionalProperties": False}
 
 
-def tool_specs(names, requests=False):
+def tool_specs(names, requests=False, skill_tool=False):
     specs = [local_model.tool_spec(name) for name in sorted(names)]
-    return specs + ([(NOTE_TOOL, NOTE_TEXT, NOTE_SCHEMA)] if requests else [])
+    specs += [(NOTE_TOOL, NOTE_TEXT, NOTE_SCHEMA)] if requests else []
+    return specs + ([(skills.TOOL, skills.TEXT, skills.SCHEMA)] if skill_tool else [])
 
 
 def clean(text):
     return "".join(ch for ch in text if ch in "\n\t" or ch.isprintable())[:MAX_RESPONSE] if isinstance(text, str) else ""
 
 
+def tokens(value):
+    return value if type(value) is int and 0 <= value < 2 ** 40 else 0
+
+
+def usage(adapter):
+    """Tokens an adapter has used so far, for the audit. Adapters without usage report zero."""
+    counted = getattr(adapter, "usage", None)
+    if not isinstance(counted, dict):
+        return {"tokens_in": 0, "tokens_out": 0}
+    return {"tokens_in": tokens(counted.get("input")), "tokens_out": tokens(counted.get("output"))}
+
+
 class Ollama:
     def __init__(self, config, system, tools):
+        self.usage = {"input": 0, "output": 0}
         self.config = config
         self.messages = [{"role": "system", "content": system}]
         self.tools = [{"type": "function", "function": {"name": n, "description": d, "parameters": s}}
@@ -219,6 +233,8 @@ class Ollama:
         message = result.get("message") if isinstance(result, dict) else None
         if not isinstance(message, dict) or message.get("role") != "assistant":
             raise runtime.RuntimeFailure("Unexpected Ollama response")
+        self.usage["input"] += tokens(result.get("prompt_eval_count"))
+        self.usage["output"] += tokens(result.get("eval_count"))
         calls = []
         for call in message.get("tool_calls") or []:
             function = call.get("function", {}) if isinstance(call, dict) else {}
@@ -244,6 +260,9 @@ class OpenAICompatible(Ollama):
             message = result["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as error:
             raise runtime.RuntimeFailure("Unexpected OpenAI-compatible response") from error
+        counted = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+        self.usage["input"] += tokens(counted.get("prompt_tokens"))
+        self.usage["output"] += tokens(counted.get("completion_tokens"))
         calls = []
         for call in message.get("tool_calls") or []:
             function = call.get("function", {}) if isinstance(call, dict) else {}
@@ -278,6 +297,7 @@ class Anthropic:
         self.system = system
         self.messages = []
         self.tools = [{"name": n, "description": d, "input_schema": s} for n, d, s in tools]
+        self.usage = {"input": 0, "output": 0}
 
     def user(self, text):
         self.messages.append({"role": "user", "content": text})
@@ -310,6 +330,9 @@ class Anthropic:
     def step(self, final=False):
         while True:
             response = self.create(final)
+            counted = getattr(response, "usage", None)
+            for key, field in (("input", "input_tokens"), ("output", "output_tokens")):
+                self.usage[key] += tokens(getattr(counted, field, 0))
             content = response.to_dict()["content"]
             self.messages.append({"role": "assistant", "content": content})
             if response.stop_reason == "pause_turn":
@@ -373,10 +396,11 @@ class Turn:
     def __init__(self, state, case_id, broker, role, allowed):
         self.state, self.case_id, self.broker, self.role, self.allowed = state, case_id, broker, role, allowed
         self.requests = bool(allowed & policy.EXCERPT_ONLY)
+        self.skills = bool(skills.visible(role))
         self.seen = set()  # SHA-256 values and addresses this session's tool output named
 
     def names(self):
-        return self.allowed | ({NOTE_TOOL} if self.requests else set())
+        return self.allowed | ({NOTE_TOOL} if self.requests else set()) | ({skills.TOOL} if self.skills else set())
 
     def admitted(self):
         """The case manifest's SHA-256 values, read once per session through a read-only Apprentice."""
@@ -386,6 +410,8 @@ class Turn:
         """Return (display_text, is_error, model_text, extra) for one call."""
         if name == NOTE_TOOL and self.requests:
             return self.note(arguments)
+        if name == skills.TOOL and self.skills:
+            return self.load_skill(arguments)
         reply = self.broker.call({"name": name, "arguments": arguments})
         text = reply["content"][0]["text"]
         if not reply["isError"]:
@@ -395,6 +421,19 @@ class Turn:
         if denial_reason(text) == "operator_excerpt_grant_required":
             extra, override = self.file_request(name, arguments)
         return text, True, boundary.for_model(text, True, name, self.role, extra, override), extra
+
+    def load_skill(self, arguments):
+        """A skill body is git-reviewed procedure, not case data, so it reaches the model as platform text."""
+        try:
+            self.broker.current_scope()
+            reply, error = skills.load(self.state, self.broker.folder, self.case_id, self.broker.session, self.role,
+                                       arguments)
+        except policy.Denied as denied:
+            reply, error = {"status": "denied", "reason": str(denied)}, True
+        except FORGE_ERRORS:
+            reply, error = {"status": "failed", "reason": "backend_or_policy_unavailable"}, True
+        text = json.dumps(reply, ensure_ascii=True)
+        return text, error, boundary.for_model(text, True, skills.TOOL, self.role) if error else text, {}
 
     def file_request(self, name, arguments):
         """File a pending request for exactly the refused call, after a host-side admission check."""
@@ -462,8 +501,8 @@ def converse(state, case_id, config, settings, history, message, operator):
     scope = broker.current_scope()
     turn = Turn(state, case_id, broker, role, allowed)
     system = boundary.system_prompt((runtime.ROOT / "agents" / role / "AGENTS.md").read_text(encoding="utf-8"),
-                                    requests=turn.requests)
-    adapter = ADAPTERS[config["provider"]](config, system, tool_specs(allowed, turn.requests))
+                                    requests=turn.requests, skills=skills.listing(role))
+    adapter = ADAPTERS[config["provider"]](config, system, tool_specs(allowed, turn.requests, turn.skills))
     inherited = replay(adapter, history, scope, broker.audience)
     broker.context_grants.update(inherited)
     adapter.user(message)
@@ -477,7 +516,8 @@ def converse(state, case_id, config, settings, history, message, operator):
 
     def finish(text, wrapup=False):
         runtime.audit(broker.folder, case=case_id, session=broker.session, decision="forge_chat_completed",
-                      role=role, operator=operator, via="forge", **({"reason": "turn_budget_wrapup"} if wrapup else {}))
+                      role=role, operator=operator, via="forge", provider=config["provider"], cloud=cloud,
+                      **usage(adapter), **({"reason": "turn_budget_wrapup"} if wrapup else {}))
         row = {"role": "assistant", "text": text, "model": config["model"]}
         rows.append({**row, "wrapup": True} if wrapup else row)
         return stamped(rows)
@@ -513,7 +553,8 @@ def converse(state, case_id, config, settings, history, message, operator):
     except Exception:
         try:
             runtime.audit(broker.folder, case=case_id, session=broker.session, decision="forge_chat_failed",
-                          role=role, operator=operator, via="forge", reason="forge_chat_session_failed")
+                          role=role, operator=operator, via="forge", reason="forge_chat_session_failed",
+                          provider=config["provider"], cloud=cloud, **usage(adapter))
         except (OSError, runtime.RuntimeFailure):
             pass
         raise

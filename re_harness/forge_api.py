@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from . import (accounts, cli, events, evidence, forge, grant_requests, investigation, local_model, models, policy,
-               projection, review, runtime, server, tasks)
+               outcome, projection, review, runtime, server, skills, tasks)
 
 JSON_LIMIT = 64 * 1024
 CHAT_ROWS = 400
@@ -350,6 +350,7 @@ class Api:
             ("POST", ("cases", "{}", "requests")): self.deny_all_requests,
             ("POST", ("cases", "{}", "requests", "{}", "decide")): self.decide_request,
             ("GET", ("cases", "{}", "investigation")): self.investigation,
+            ("GET", ("cases", "{}", "outcome")): self.outcome,
             ("GET", ("cases", "{}", "evidence")): self.evidence_list,
             ("GET", ("cases", "{}", "evidence", "{}")): self.evidence_entry,
             ("POST", ("cases", "{}", "questions")): self.add_question,
@@ -431,6 +432,9 @@ class Api:
             "state_tools": [{"name": name, "description": text, "writes": name in investigation.WRITES}
                             for name, text in investigation.TOOLS.items()],
             "roles": {role: sorted(tools) for role, tools in local_model.ROLES.items()},
+            "skills": {role: [{"name": name, "description": text} for name, text in skills.visible(role)]
+                       for role in local_model.ROLES},
+            "skill_gaps": skills.gaps(self.state),
             "limits": {"max_tool_calls": policy.MAX_TOOL_CALLS, "max_excerpt_bytes": policy.MAX_EXCERPT,
                        "max_artifact_bytes": policy.MAX_ARTIFACT, "chat_max_turns": models.MAX_TURNS,
                        "chat_max_calls_per_turn": models.MAX_CALLS}}
@@ -732,6 +736,10 @@ class Api:
     def investigation(self, handler, operator, args, params):
         require_case(self.app, args[0])
         return HTTPStatus.OK, investigation.operator_view(load_investigation(self.state, args[0]))
+
+    def outcome(self, handler, operator, args, params):
+        folder, _ = require_case(self.app, args[0])
+        return HTTPStatus.OK, outcome.for_case(self.state, args[0], folder)
 
     def evidence_list(self, handler, operator, args, params):
         folder, _ = require_case(self.app, args[0])

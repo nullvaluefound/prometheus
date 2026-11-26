@@ -178,6 +178,8 @@ interface EvidenceEntry {        // the exact reply the broker released, under i
   { tools: { name, description, excerpt_only: boolean, paged: boolean, addressed: boolean, timeout_s: number }[],
     denied: string[],                    // tools the broker always refuses, e.g. run_ghidra_script
     state_tools: { name, description, writes: boolean }[],  // case-state tools, dispatched by the broker without a worker
+    skills: Record<string, { name, description }[]>,      // role -> skills a chat model may load_skill
+    skill_gaps: { name, count, roles: string[], last_utc }[],  // skills models asked for and could not load
     roles: Record<string, string[]>,     // role -> tools
     limits: { max_tool_calls: number, max_excerpt_bytes: number, max_artifact_bytes: number,
               chat_max_turns: number, chat_max_calls_per_turn: number } }
@@ -190,6 +192,7 @@ interface EvidenceEntry {        // the exact reply the broker released, under i
 
 ### Investigation, evidence and proposed findings
 - `GET api/cases/{id}/investigation` returns `Investigation`: everything, for the operator.
+- `GET api/cases/{id}/outcome` returns the case's outcome card: `{ tools: {tool: {decision: count}}, denials: {reason: count}, grants: {requested, issued, approved, denied}, candidates: {total, passed, failed, not_assessed, proposed, recorded, rejected, reviewed}, questions: {state: count}, leads, observations, tokens: {provider, locality, input, output, sessions}[], model_sessions, first_utc, last_utc }`. It is computed from the audit log and the investigation store, metadata only.
 - `GET api/cases/{id}/evidence` returns `{ evidence: {id, tool, artifact, selector, excerpt, audience, utc}[] }`, newest 200. `GET api/cases/{id}/evidence/{sha256}` returns `EvidenceEntry`, or 404 if it is absent or fails its hash check.
 - `POST api/cases/{id}/questions` with `{ text, outcome, artifacts }` adds an open question. Text is 1–500 characters, outcome up to 300, and up to 8 artifacts, each admitted to the case (400 `artifact_not_admitted` otherwise). `PUT api/cases/{id}/questions/{qid}` takes the same body and returns 409 `question_closed` for a closed question.
 - `POST api/cases/{id}/questions/{qid}/state` with `{ state: "open" | "closed" | "withdrawn", note? }` accepts a proposed question, closes, reopens or withdraws one. Only the operator closes a question.
