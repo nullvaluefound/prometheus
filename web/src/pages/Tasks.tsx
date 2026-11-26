@@ -24,6 +24,7 @@ export function TasksPage({ initialFilter }: { initialFilter: string | null }) {
     (signal) => api.tasks(filter || null, { signal }),
     `tasks:${filter}`,
     (data) => (list<Task>(data.tasks).some((task) => !isTerminal(task.state)) ? 2000 : null),
+    ["tasks"],
   );
   const cases = useResource((signal) => api.cases({ signal }), "cases");
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());

@@ -15,6 +15,16 @@ server {
         proxy_set_header Authorization "";
         proxy_read_timeout 195s;
 
+        # Live change notices: topic names only, streamed for up to five minutes with a keepalive every 15 s.
+        location = /prometheus/api/events {
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_pass http://unix:/run/prometheus-forge/forge.sock:;
+            proxy_set_header X-Forge-Operator "";
+            proxy_set_header Authorization "";
+            proxy_read_timeout 195s;
+        }
+
         # Sample uploads stream to the Forge, which stores them only in the case's offline volume.
         location ~ "^/prometheus/api/cases/[a-z0-9][a-z0-9-]{0,47}/artifacts$" {
             client_max_body_size 128m;

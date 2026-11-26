@@ -16,7 +16,9 @@ const STATE_TONE: Record<string, "ok" | "warn" | "info" | "muted"> = {
 };
 
 export function InvestigationTab({ ctx }: { ctx: CaseContext }) {
-  const data = useResource((signal) => api.investigation(ctx.id, { signal }), `investigation:${ctx.id}`, () => 15000);
+  const data = useResource((signal) => api.investigation(ctx.id, { signal }), `investigation:${ctx.id}`, () => 15000, [
+    `investigation:${ctx.id}`,
+  ]);
   const value = data.data;
   return (
     <div className="stack">

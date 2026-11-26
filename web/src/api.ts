@@ -106,6 +106,7 @@ export interface CaseDetail {
   ledger: Ledger | null;
   grants: Grant[];
   pending_requests?: number;
+  waiting?: number;
   audit: AuditEvent[];
 }
 
@@ -168,8 +169,10 @@ export interface GrantRequest {
 }
 
 export interface WaitingItem {
-  kind: "grant_request" | "candidate" | "question_proposed" | "question_answer_proposed";
-  case: string;
+  kind: "grant_request" | "candidate" | "question_proposed" | "question_answer_proposed" | "task_failed";
+  case: string | null;
+  title?: string;
+  error?: string | null;
   id: string;
   tool?: string;
   artifact?: string;
@@ -530,6 +533,7 @@ export const api = {
     get<{ tasks: Task[] }>(caseId ? `tasks?${new URLSearchParams({ case: caseId })}` : "tasks", opts),
   task: (id: string, opts?: Opts) => get<Task>(`tasks/${seg(id)}`, opts),
   cancelTask: (id: string) => post<Task>(`tasks/${seg(id)}/cancel`),
+  dismissTask: (id: string) => post<Task>(`tasks/${seg(id)}/dismiss`),
 
   models: (opts?: Opts) => get<{ models: ModelConfig[] }>("models", opts),
   createModel: (model: ModelInput) => post<ModelConfig>("models", model),

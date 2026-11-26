@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from . import accounts, cli, policy, runtime, server, tasks
+from . import accounts, cli, events, policy, runtime, server, tasks
 
 BROWSER_ERRORS = (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError)
 BASE_PATH = r"/(?:[a-z0-9-]+/)+"
@@ -31,6 +31,8 @@ COOKIE = "prometheus_session"
 FAILURE_WINDOW = 600
 FAILURE_LIMIT = 30
 FORM_LIMIT = 1024  # sign-in forms stay small
+STREAM_SECONDS = 300  # an events stream ends after five minutes; the browser reconnects and re-authenticates
+KEEPALIVE_SECONDS = 15
 WEB = Path(__file__).with_name("forge_web")
 STATIC = {"assets/app.js": "text/javascript; charset=utf-8", "assets/app.css": "text/css; charset=utf-8"}
 PAGE_CSP = "default-src 'none'; style-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
@@ -309,6 +311,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.login_page()
         if self.path == prefix + "setup":
             return self.setup_page()
+        if self.path == prefix + "api/events":
+            return self.events()
         if self.path.startswith(prefix + "api/"):
             return self.api("GET")
         if not self.path.startswith(prefix):
@@ -361,6 +365,37 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get_all("Origin", []) != [self.server.origin]:
             return self.plain(HTTPStatus.FORBIDDEN, "Origin rejected")
         self.api(method)
+
+    def events(self):
+        """Server-sent change notices: topic names only. The browser re-reads changed data through the API."""
+        if not self.identity():
+            return self.respond_json(HTTPStatus.UNAUTHORIZED, {"error": "sign_in_required", "message": "Sign in again."})
+        visible = self.server.visible
+
+        def shown(topic):
+            case_id = events.case_of(topic)
+            return case_id is None or not visible or case_id in visible
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_common(APP_CSP)
+        self.end_headers()
+        version = events.current()
+        deadline = time.monotonic() + STREAM_SECONDS
+        try:
+            self.wfile.write(b"retry: 5000\n\n")
+            self.wfile.flush()
+            while time.monotonic() < deadline:
+                version, topics = events.since(version, min(KEEPALIVE_SECONDS, max(0.0, deadline - time.monotonic())))
+                topics = [topic for topic in topics if shown(topic)]
+                if topics:
+                    data = json.dumps({"topics": topics[:64]}, ensure_ascii=True)
+                    self.wfile.write(f"event: change\ndata: {data}\n\n".encode("ascii"))
+                else:
+                    self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+        except (OSError, ValueError):
+            return  # the browser went away
 
     def api(self, method):
         from .forge_api import ApiError

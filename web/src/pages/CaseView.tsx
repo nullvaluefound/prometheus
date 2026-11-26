@@ -40,6 +40,7 @@ export function CaseView({ id, tab }: { id: string; tab: CaseTab }) {
     (signal) => api.caseDetail(id, { signal }),
     `case:${id}`,
     (data) => (data.status === "Pending" ? 3000 : null),
+    [`case:${id}`, `requests:${id}`, `investigation:${id}`],
   );
   const policy = useResource((signal) => api.policy({ signal }), "policy");
   const toast = useToast();
@@ -114,6 +115,11 @@ export function CaseView({ id, tab }: { id: string; tab: CaseTab }) {
           <p className="case-sub">
             <code>{id}</code>
             <StatusChip status={data.status} />
+            {typeof data.waiting === "number" && data.waiting > 0 && (
+              <a className="chip chip-warn" href="#/">
+                {data.waiting} waiting on you
+              </a>
+            )}
             <a href={tasksHref(id)}>Tasks for this case</a>
           </p>
         </div>

@@ -11,7 +11,7 @@ import re
 import threading
 import uuid
 
-from . import accounts, policy, runtime
+from . import accounts, events, policy, runtime
 
 LOCK = threading.Lock()
 REQUEST_ID = r"[a-f0-9]{32}"
@@ -47,7 +47,9 @@ def load(state, case_id):
 
 
 def save(state, case_id, rows):
-    accounts.write_private(store_path(state, case_id), (json.dumps(rows, indent=1, ensure_ascii=True) + "\n").encode("ascii"))
+    accounts.write_private(store_path(state, case_id),
+                           (json.dumps(rows, indent=1, ensure_ascii=True) + "\n").encode("ascii"))
+    events.bump(f"requests:{case_id}", "waiting")
 
 
 def tokens(text):

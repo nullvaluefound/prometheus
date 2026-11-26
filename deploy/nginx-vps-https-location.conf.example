@@ -25,6 +25,13 @@ location ^~ /prometheus/ {
         proxy_pass https://192.0.2.40;
     }
 
+    # Live change notices must not be buffered. The guest's X-Accel-Buffering header stops at the guest NGINX.
+    location = /prometheus/api/events {
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_pass https://192.0.2.40;
+    }
+
     # Sample uploads stream to the Forge. Quote the pattern: NGINX reads an unquoted {0,47} as a block.
     location ~ "^/prometheus/api/cases/[a-z0-9][a-z0-9-]{0,47}/artifacts$" {
         client_max_body_size 128m;
