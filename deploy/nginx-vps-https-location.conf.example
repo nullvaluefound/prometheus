@@ -18,7 +18,7 @@ location ^~ /prometheus/ {
     proxy_ssl_trusted_certificate /etc/nginx/ssl/prometheus-backend-ca.crt;
     proxy_read_timeout 200s;
 
-    location ~ ^/prometheus/api/cases/[a-z0-9][a-z0-9-]{0,47}/artifacts$ {
+    location ~ "^/prometheus/api/cases/[a-z0-9][a-z0-9-]{0,47}/artifacts$" {
         limit_req zone=prometheus_forge burst=120 nodelay;
         client_max_body_size 128m;
         proxy_request_buffering off;

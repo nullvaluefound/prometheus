@@ -16,7 +16,7 @@ server {
         proxy_read_timeout 195s;
 
         # Sample uploads stream to the Forge, which stores them only in the case's offline volume.
-        location ~ ^/prometheus/api/cases/[a-z0-9][a-z0-9-]{0,47}/artifacts$ {
+        location ~ "^/prometheus/api/cases/[a-z0-9][a-z0-9-]{0,47}/artifacts$" {
             client_max_body_size 128m;
             proxy_request_buffering off;
             proxy_pass http://unix:/run/prometheus-forge/forge.sock:;
