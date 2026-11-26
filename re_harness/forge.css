@@ -46,4 +46,13 @@ td code { display: inline-block; max-width: 18rem; }
 form.inline { display: inline-block; margin: .6rem 0; }
 form.inline button { width: auto; min-height: 2.1rem; }
 button.stop { background: #e8735d; color: #240b06; }
+nav.operator { display: flex; align-items: center; gap: .9rem; }
+nav.operator form.inline { margin: 0; }
+button.link { background: none; border: 0; color: var(--muted); font-weight: 400; padding: 0; min-height: 0; text-decoration: underline; text-underline-offset: .2em; }
+.auth { max-width: 26rem; }
+.auth form { grid-template-columns: 1fr; }
+.auth h2 { margin-top: .2rem; }
+.error, .notice { margin: 0 0 1rem; padding: .6rem .75rem; border-radius: .35rem; font-size: .9rem; }
+.error { background: #3a1d17; color: #f3b3a5; border: 1px solid #6b3428; }
+.notice { background: #2b2414; color: var(--forge); border: 1px solid #5a4624; }
 @media (max-width: 43rem) { .layout, form { grid-template-columns: 1fr; } .operator { overflow-wrap: anywhere; } }

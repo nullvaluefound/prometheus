@@ -9,10 +9,9 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import urlencode
 
-from re_harness import forge, runtime
+from re_harness import accounts, forge, runtime
 from re_harness.case import atomic_json
 
-OPERATOR = {"X-Forge-Operator": "analyst"}
 FORM_TYPE = "application/x-www-form-urlencoded"
 
 
@@ -45,7 +44,15 @@ class ForgeTests(unittest.TestCase):
         thread.start()
         self.addCleanup(self.app.shutdown)
         self.form = {"case": "review", "artifact": self.digest}
-        self.post_headers = {**OPERATOR, "Origin": self.origin, "Content-Type": FORM_TYPE}
+        fast = patch.dict(accounts.SCRYPT, {"n": 2 ** 10})
+        fast.start()
+        self.addCleanup(fast.stop)
+        code = accounts.issue_setup(state, "analyst")
+        epoch = accounts.complete_setup(state, "analyst", code, "correct horse battery")
+        self.token = accounts.issue_session(state, "analyst", epoch)
+        self.cookie = ("prometheus_session=" + self.token).encode("ascii")
+        self.operator = {"Cookie": self.cookie.decode("ascii")}
+        self.post_headers = {**self.operator, "Origin": self.origin, "Content-Type": FORM_TYPE}
 
     def request(self, method, route, headers=None, form=None):
         body = urlencode(form).encode("ascii") if form else b""
@@ -71,8 +78,9 @@ class ForgeTests(unittest.TestCase):
             return response.status, response.read().decode("utf-8"), dict(response.headers)
 
     def test_identity_and_rendering(self):
-        self.assertEqual(self.request("GET", "/prometheus/")[0], 403)
-        status, body, headers = self.request("GET", "/prometheus/", OPERATOR)
+        status, _, headers = self.request("GET", "/prometheus/")
+        self.assertEqual((status, headers["Location"]), (303, "/prometheus/login"))
+        status, body, headers = self.request("GET", "/prometheus/", self.operator)
         self.assertEqual(status, 200)
         for text in ("Prometheus", "Forge", "Apprentices", "review", "Verified"):
             self.assertIn(text, body)
@@ -82,27 +90,33 @@ class ForgeTests(unittest.TestCase):
         self.assertIn("default-src 'none'", headers["Content-Security-Policy"])
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
-        self.assertEqual(self.request("GET", "/prometheus/../forge.py", OPERATOR)[0], 404)
+        self.assertEqual(self.request("GET", "/prometheus/../forge.py", self.operator)[0], 404)
 
-    def test_operator_identity_must_be_single_and_well_formed(self):
-        for value in ("", "-leading", "has space", "a" * 65, "semi;colon"):
-            with self.subTest(value=value):
-                self.assertEqual(self.request("GET", "/prometheus/", {"X-Forge-Operator": value})[0], 403)
-        duplicated = (b"GET /prometheus/ HTTP/1.1\r\nHost: forge\r\nX-Forge-Operator: analyst\r\n"
-                      b"X-Forge-Operator: root\r\nConnection: close\r\n\r\n")
-        self.assertEqual(self.raw(duplicated), 403)
+    def test_identity_comes_only_from_a_valid_session(self):
+        body, mac = self.token.split(".")
+        for headers in ({"X-Forge-Operator": "analyst"}, {"Cookie": "prometheus_session="},
+                        {"Cookie": "prometheus_session=" + body + ".AAAA"},
+                        {"Cookie": "prometheus_session=" + body[:-2] + "xx." + mac},
+                        {"Cookie": "other=" + self.token}, {"Cookie": "prometheus_session=\"unterminated"}):
+            with self.subTest(headers=headers):
+                self.assertEqual(self.request("GET", "/prometheus/", headers)[0], 303)
+        duplicated = (b"GET /prometheus/ HTTP/1.1\r\nHost: forge\r\nCookie: " + self.cookie + b"\r\n"
+                      b"Cookie: " + self.cookie + b"\r\nConnection: close\r\n\r\n")
+        self.assertEqual(self.raw(duplicated), 303)
+        self.assertEqual(self.request("POST", "/prometheus/pause", {"Origin": self.origin, "Content-Type": FORM_TYPE},
+                                      {"case": "review"})[0], 403)
 
     def test_stylesheet_and_unknown_routes(self):
-        status, body, headers = self.request("GET", "/prometheus/forge.css", OPERATOR)
+        status, body, headers = self.request("GET", "/prometheus/forge.css", self.operator)
         self.assertEqual(status, 200)
         self.assertTrue(headers["Content-Type"].startswith("text/css"))
         self.assertEqual(body, (Path(forge.__file__).with_name("forge.css")).read_text(encoding="utf-8"))
-        self.assertEqual(self.request("GET", "/prometheus/forge.css", {})[0], 403)
-        self.assertEqual(self.request("GET", "/elsewhere/", OPERATOR)[0], 404)
+        self.assertEqual(self.request("GET", "/prometheus/forge.css", {})[0], 200)
+        self.assertEqual(self.request("GET", "/elsewhere/", self.operator)[0], 404)
         self.assertEqual(self.request("POST", "/prometheus/other", self.post_headers, self.form)[0], 404)
 
     def test_case_visibility_and_pause_state(self):
-        _, body, _ = self.request("GET", "/prometheus/", OPERATOR)
+        _, body, _ = self.request("GET", "/prometheus/", self.operator)
         self.assertIn("frozen", body)
         self.assertIn("Paused", body)
         self.assertNotIn("offscope", body)
@@ -143,12 +157,12 @@ class ForgeTests(unittest.TestCase):
             oversized = {**self.form, "artifact": self.digest + "a" * 600}
             self.assertEqual(self.request("POST", "/prometheus/inspect", self.post_headers, oversized)[0], 400)
             body = urlencode(self.form).encode("ascii")
-            chunked = (b"POST /prometheus/inspect HTTP/1.1\r\nHost: forge\r\nX-Forge-Operator: analyst\r\n"
+            chunked = (b"POST /prometheus/inspect HTTP/1.1\r\nHost: forge\r\nCookie: " + self.cookie + b"\r\n"
                        b"Origin: " + self.origin.encode("ascii") + b"\r\nContent-Type: " + FORM_TYPE.encode("ascii") +
                        b"\r\nContent-Length: " + str(len(body)).encode("ascii") +
                        b"\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" + body)
             self.assertEqual(self.raw(chunked), 400)
-            doubled = (b"POST /prometheus/inspect HTTP/1.1\r\nHost: forge\r\nX-Forge-Operator: analyst\r\n"
+            doubled = (b"POST /prometheus/inspect HTTP/1.1\r\nHost: forge\r\nCookie: " + self.cookie + b"\r\n"
                        b"Origin: " + self.origin.encode("ascii") + b"\r\nContent-Type: " + FORM_TYPE.encode("ascii") +
                        b"\r\nContent-Length: " + str(len(body)).encode("ascii") +
                        b"\r\nContent-Length: " + str(len(body)).encode("ascii") + b"\r\nConnection: close\r\n\r\n" + body)
@@ -197,11 +211,11 @@ class ForgeTests(unittest.TestCase):
                       arguments={"artifact": self.digest, "address": "0x401000"})
 
     def test_case_page_renders_scope_ledger_grants_and_audit(self):
-        _, body, _ = self.request("GET", "/prometheus/", OPERATOR)
+        _, body, _ = self.request("GET", "/prometheus/", self.operator)
         self.assertIn('<a href="/prometheus/cases/review">review</a>', body)
         self.add_grants_and_audit()
         with patch.object(forge, "case_ledger", return_value=self.ledger()) as ledger:
-            status, body, headers = self.request("GET", "/prometheus/cases/review", OPERATOR)
+            status, body, headers = self.request("GET", "/prometheus/cases/review", self.operator)
         self.assertEqual(status, 200)
         self.assertEqual(ledger.call_args.args[0]["case"], "review")
         self.assertIn("default-src 'none'", headers["Content-Security-Policy"])
@@ -216,20 +230,20 @@ class ForgeTests(unittest.TestCase):
 
     def test_case_page_degrades_without_ledger_and_hides_unlisted_cases(self):
         with patch.object(forge, "case_ledger", side_effect=runtime.RuntimeFailure("ledger_unavailable")):
-            status, body, _ = self.request("GET", "/prometheus/cases/review", OPERATOR)
+            status, body, _ = self.request("GET", "/prometheus/cases/review", self.operator)
         self.assertEqual(status, 200)
         self.assertIn("evidence ledger is unavailable", body)
         self.assertIn("None imported", body)
         folder, record = runtime.load_case(self.state, "review")
         atomic_json(folder / "scope.json", {**record, "yara_rules": {"sha256": "d" * 64, "rules": 3, "bytes": 90}})
         with patch.object(forge, "case_ledger", return_value=None):
-            self.assertIn("<code>" + "d" * 64 + "</code>", self.request("GET", "/prometheus/cases/review", OPERATOR)[1])
+            self.assertIn("<code>" + "d" * 64 + "</code>", self.request("GET", "/prometheus/cases/review", self.operator)[1])
         with patch.object(forge, "case_ledger") as ledger:
             for route in ("/prometheus/cases/offscope", "/prometheus/cases/missing", "/prometheus/cases/../review",
                           "/prometheus/cases/Review", "/prometheus/cases/", "/prometheus/cases/review/"):
                 with self.subTest(route=route):
-                    self.assertEqual(self.request("GET", route, OPERATOR)[0], 404)
-            self.assertEqual(self.request("GET", "/prometheus/cases/review", {})[0], 403)
+                    self.assertEqual(self.request("GET", route, self.operator)[0], 404)
+            self.assertEqual(self.request("GET", "/prometheus/cases/review", {})[0], 303)
             ledger.assert_not_called()
 
     def test_pause_is_one_way_audited_and_origin_bound(self):
@@ -250,7 +264,7 @@ class ForgeTests(unittest.TestCase):
         self.assertEqual(self.request("POST", "/prometheus/pause", self.post_headers, form)[0], 303)
         self.assertEqual(len((folder / "audit.jsonl").read_text(encoding="ascii").splitlines()), 1)
         with patch.object(forge, "case_ledger", return_value=self.ledger()):
-            _, body, _ = self.request("GET", "/prometheus/cases/review", OPERATOR)
+            _, body, _ = self.request("GET", "/prometheus/cases/review", self.operator)
         self.assertNotIn("Pause case", body)
         self.assertIn("Resume with the operator CLI", body)
         self.assertEqual(self.request("POST", "/prometheus/inspect", self.post_headers, self.form)[0], 400)
@@ -262,11 +276,11 @@ class ForgeTests(unittest.TestCase):
                                             "closed_utc": "2026-11-25T10:00:00+00:00"})
         before = (folder / "scope.json").read_bytes()
         self.app.visible.add("sealed")
-        _, body, _ = self.request("GET", "/prometheus/", OPERATOR)
+        _, body, _ = self.request("GET", "/prometheus/", self.operator)
         self.assertIn('<a href="/prometheus/cases/sealed">sealed</a></span><span class="status">Closed</span>', body)
         self.assertNotIn('<option value="sealed"', body)
         with patch.object(forge, "case_ledger", return_value=self.ledger()):
-            status, body, _ = self.request("GET", "/prometheus/cases/sealed", OPERATOR)
+            status, body, _ = self.request("GET", "/prometheus/cases/sealed", self.operator)
         self.assertEqual(status, 200)
         for expected in ('<span class="status">Closed</span>', "Closure is irreversible", "2026-11-25T10:00:00+00:00",
                          "F0001", self.digest):
@@ -290,6 +304,78 @@ class ForgeTests(unittest.TestCase):
         lock.write_text("1", encoding="ascii")
         self.assertEqual(self.request("POST", "/prometheus/pause", self.post_headers, {"case": "review"})[0], 409)
         self.assertFalse(runtime.read_json(lock.parent / "scope.json")["paused"])
+
+    def sign_in(self, username, password, origin=None):
+        headers = {"Origin": origin or self.origin, "Content-Type": FORM_TYPE}
+        return self.request("POST", "/prometheus/login", headers, {"username": username, "password": password})
+
+    def session_of(self, headers):
+        value = headers["Set-Cookie"].split(";")[0]
+        self.assertTrue(value.startswith("prometheus_session="))
+        return {"Cookie": value}
+
+    def test_sign_in_sets_a_hardened_session_cookie(self):
+        status, body, _ = self.request("GET", "/prometheus/login")
+        self.assertEqual(status, 200)
+        self.assertIn('action="/prometheus/login"', body)
+        status, _, headers = self.sign_in("Analyst", "correct horse battery")
+        self.assertEqual((status, headers["Location"]), (303, "/prometheus/"))
+        flags = [part.strip() for part in headers["Set-Cookie"].split(";")[1:]]
+        for flag in ("Path=/prometheus/", "Secure", "HttpOnly", "SameSite=Strict", "Max-Age=43200"):
+            self.assertIn(flag, flags)
+        status, body, _ = self.request("GET", "/prometheus/", self.session_of(headers))
+        self.assertEqual(status, 200)
+        self.assertIn('<a href="/prometheus/account">analyst</a>', body)
+
+    def test_failed_sign_in_reveals_nothing_and_is_throttled(self):
+        for username, password in (("analyst", "wrong password!"), ("nobody", "correct horse battery"),
+                                   ("../etc", "x"), ("analyst", "")):
+            with self.subTest(username=username):
+                status, body, headers = self.sign_in(username, password)
+                self.assertEqual(status, 401)
+                self.assertIn("The username or password is not correct.", body)
+                self.assertNotIn("Set-Cookie", headers)
+        self.assertEqual(self.sign_in("analyst", "correct horse battery", "https://else.example")[0], 403)
+        self.app.failures.extend([forge.time.monotonic()] * forge.FAILURE_LIMIT)
+        self.assertEqual(self.sign_in("analyst", "correct horse battery")[0], 429)
+
+    def test_setup_code_sets_the_first_password_once(self):
+        code = accounts.issue_setup(self.state, "newcomer")
+        form = {"username": "newcomer", "code": code, "password": "a long new passphrase", "confirm": "a long new passphrase"}
+        headers = {"Origin": self.origin, "Content-Type": FORM_TYPE}
+        self.assertEqual(self.sign_in("newcomer", "a long new passphrase")[0], 401)
+        mismatch = self.request("POST", "/prometheus/setup", headers, {**form, "confirm": "something else entirely"})
+        self.assertEqual(mismatch[0], 400)
+        self.assertIn("do not match", mismatch[1])
+        short = self.request("POST", "/prometheus/setup", headers, {**form, "password": "short", "confirm": "short"})
+        self.assertIn("at least 12 characters", short[1])
+        wrong = self.request("POST", "/prometheus/setup", headers, {**form, "code": "not-the-code"})
+        self.assertIn("not valid", wrong[1])
+        status, _, response = self.request("POST", "/prometheus/setup", headers, form)
+        self.assertEqual(status, 303)
+        self.assertEqual(self.request("GET", "/prometheus/", self.session_of(response))[0], 200)
+        self.assertEqual(self.request("POST", "/prometheus/setup", headers, form)[0], 400)
+        self.assertEqual(self.sign_in("newcomer", "a long new passphrase")[0], 303)
+
+    def test_password_change_requires_the_current_password_and_ends_other_sessions(self):
+        form = {"current": "wrong password!", "password": "a brand new secret", "confirm": "a brand new secret"}
+        status, body, _ = self.request("POST", "/prometheus/account", self.post_headers, form)
+        self.assertEqual(status, 400)
+        self.assertIn("current password is not correct", body)
+        status, body, headers = self.request("POST", "/prometheus/account", self.post_headers,
+                                             {**form, "current": "correct horse battery"})
+        self.assertEqual(status, 200)
+        self.assertIn("Password changed", body)
+        self.assertEqual(self.request("GET", "/prometheus/", self.operator)[0], 303)
+        self.assertEqual(self.request("GET", "/prometheus/account", self.session_of(headers))[0], 200)
+        self.assertEqual(self.sign_in("analyst", "correct horse battery")[0], 401)
+        self.assertEqual(self.sign_in("analyst", "a brand new secret")[0], 303)
+
+    def test_sign_out_ends_the_session(self):
+        status, _, headers = self.request("POST", "/prometheus/logout", {**self.operator, "Origin": self.origin})
+        self.assertEqual((status, headers["Location"]), (303, "/prometheus/login"))
+        self.assertIn("Max-Age=0", headers["Set-Cookie"])
+        self.assertEqual(self.request("GET", "/prometheus/", self.operator)[0], 303)
 
 
 class ForgeHelperTests(unittest.TestCase):

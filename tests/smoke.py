@@ -7,6 +7,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import secrets
 import socket
 import subprocess
 import sys
@@ -16,7 +17,7 @@ import uuid
 from unittest.mock import patch
 from urllib.parse import urlencode
 
-from re_harness import case, cli, forge, local_model, runtime, server
+from re_harness import accounts, case, cli, forge, local_model, runtime, server
 
 
 def check_mcp(state, case_id, digest):
@@ -58,12 +59,20 @@ def check_forge(state, case_id, digest, broker):
         return
     origin, prefix, operator = "https://forge.invalid", "/prometheus/", "smoke-operator"
     path = state / "forge.sock"
-    get_headers = {"X-Forge-Operator": operator}
-    post_headers = {**get_headers, "Origin": origin, "Content-Type": "application/x-www-form-urlencoded"}
+    password = secrets.token_urlsafe(18)
+    accounts.complete_setup(state, operator, accounts.issue_setup(state, operator), password)
+    form_type = {"Origin": origin, "Content-Type": "application/x-www-form-urlencoded"}
     with forge.Forge(path, origin, prefix, state, {case_id}) as app:
         thread = threading.Thread(target=app.serve_forever, daemon=True)
         thread.start()
         try:
+            status, _, headers = forge_request(path, "GET", prefix, {"X-Forge-Operator": operator})
+            assert status == 303 and headers["Location"] == prefix + "login", status
+            status, _, headers = forge_request(path, "POST", prefix + "login", form_type,
+                                               {"username": operator, "password": password})
+            assert status == 303 and "HttpOnly" in headers["Set-Cookie"], status
+            get_headers = {"Cookie": headers["Set-Cookie"].split(";")[0]}
+            post_headers = {**get_headers, **form_type}
             status, body, _ = forge_request(path, "GET", prefix, get_headers)
             assert status == 200 and case_id in body and "Apprentices" in body, status
             assert digest not in body and "Artifact summary" not in body
@@ -87,7 +96,7 @@ def check_forge(state, case_id, digest, broker):
             app.shutdown()
             thread.join(timeout=10)
     path.unlink(missing_ok=True)
-    print("Verified the Forge landing page, a browser inspection, an audited browser pause and refusal after pause.")
+    print("Verified the Forge landing page behind sign-in, a browser inspection, an audited browser pause and refusal after pause.")
 
 
 def operator(state, *argv):
