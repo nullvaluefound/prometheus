@@ -235,7 +235,7 @@ export interface CandidateCheck {
 
 export interface Candidate extends Authored {
   id: string;
-  state: "proposed" | "recorded" | "rejected";
+  state: "proposed" | "recording" | "recorded" | "rejected";
   claim: string;
   kind: string;
   confidence: string;

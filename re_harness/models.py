@@ -470,7 +470,8 @@ def converse(state, case_id, config, settings, history, message, operator):
     rows = []
 
     def stamped(found):
-        grants = sorted(inherited | broker.released_grants)
+        # context_grants holds the replayed history's grants and those of stored text a case-state read showed.
+        grants = sorted(inherited | broker.released_grants | broker.context_grants)
         return [{**row, "audience": broker.audience, "grants": grants} if row["role"] == "assistant" else row
                 for row in found]
 

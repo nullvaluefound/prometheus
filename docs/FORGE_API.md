@@ -127,7 +127,7 @@ interface Lead { id: string; state: string; artifact: string; address: string | 
 interface Observation { id: string; kind: "observed" | "inferred"; text: string; artifact: string;
                         lead: string | null; evidence: string[]; }
 interface Candidate {
-  id: string; state: "proposed" | "recorded" | "rejected";
+  id: string; state: "proposed" | "recording" | "recorded" | "rejected";   // recording: a record task holds it
   claim: string; kind: string; confidence: string; artifacts: string[]; evidence: string[];
   limitations: string | null; counterevidence: string | null; question: string | null; lead: string | null;
   check: { result: "passed" | "failed" | "not_assessed"; problems: { code: string; ref: string | null }[];
@@ -195,7 +195,7 @@ interface EvidenceEntry {        // the exact reply the broker released, under i
 - `POST api/cases/{id}/candidates/{cid}/check` re-runs the reference check and returns the `Candidate`.
 - `POST api/cases/{id}/candidates/{cid}/review` returns `202 {task}` (kind `review`) for one review session. The result is `{ candidate, verdict }`.
 - `POST api/cases/{id}/candidates/{cid}/record` with optional `{ claim, kind, confidence }` edits returns `202 {task}` (kind `record_finding`). It records a ledger finding through the operator `finding` path with the candidate's artifacts and `evidence:<sha256>` locators, and the result is `{ candidate, finding }`.
-- `POST api/cases/{id}/candidates/{cid}/reject` with `{ note? }` returns the `Candidate`. A decided candidate returns 409 `candidate_already_decided`.
+- `POST api/cases/{id}/candidates/{cid}/reject` with `{ note? }` returns the `Candidate`. A decided candidate, or one a record task holds, returns 409 `candidate_already_decided`. An unreadable investigation store returns 503 `investigation_unreadable`.
 
 ### Chat
 - `GET api/cases/{id}/chat` returns `{ messages: ChatMessage[], busy: boolean }`.

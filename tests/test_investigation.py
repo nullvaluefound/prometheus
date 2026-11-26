@@ -156,8 +156,8 @@ class StateToolTests(CaseState):
         bad = self.reply(broker.call(ask("propose_finding", claim="Decoder at 0x5120.", kind="observed",
                                           confidence="low", artifacts=[DIGEST], evidence=[])))
         self.assertEqual(bad["check"]["result"], "failed")
-        self.assertEqual({problem["code"] for problem in bad["check"]["problems"]},
-                         {"address_not_in_evidence", "observed_without_evidence"})
+        # Models get problem codes only; the operator sees which reference failed.
+        self.assertEqual(set(bad["check"]["problems"]), {"address_not_in_evidence", "observed_without_evidence"})
         stored = investigation.load(self.state, "review")["candidates"]
         self.assertEqual([(row["id"], row["state"], row["finding"]) for row in stored],
                          [("C1", "proposed", None), ("C2", "proposed", None)])
@@ -176,8 +176,8 @@ class CheckTests(CaseState):
             evidence=[evidence_id, "c" * 64]), admitted)
         self.assertEqual(result["result"], "failed")
         self.assertEqual(sorted((problem["code"], problem["ref"]) for problem in result["problems"]),
-                         [("artifact_not_admitted", OTHER), ("claim_names_unadmitted_sha256", OTHER),
-                          ("unknown_evidence", "c" * 64)])
+                         [("address_not_in_evidence", "0x10"), ("artifact_not_admitted", OTHER),
+                          ("claim_names_unadmitted_sha256", OTHER), ("unknown_evidence", "c" * 64)])
         unreadable = review.check(self.folder, self.candidate(), lambda: (_ for _ in ()).throw(OSError("x")))
         self.assertEqual(unreadable["result"], "not_assessed")
 
@@ -189,6 +189,137 @@ class CheckTests(CaseState):
         investigation.add_question(self.state, "review", "Config?", "Decoded config", [DIGEST], "analyst")
         usable, reason = investigation.gate(investigation.load(self.state, "review"), {DIGEST})
         self.assertEqual(([row["id"] for row in usable], reason), (["Q3"], None))
+
+
+class ReviewFixTests(CaseState):
+    """The second review's findings: grant taint on read-back, excerpt evidence, recording races, address checks."""
+
+    def grant(self, audience="local", grant_id="g" * 32, address="0x401000"):
+        soon = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=10)).isoformat()
+        scope = runtime.read_json(self.folder / "scope.json")
+        scope["grants"] = [row for row in scope["grants"] if row["id"] != grant_id] + [{
+            "id": grant_id, "tool": "ghidra_decompile", "arguments": {"artifact": DIGEST, "address": address},
+            "audience": audience, "expires_utc": soon}]
+        atomic_json(self.folder / "scope.json", scope)
+
+    def revoke(self, grant_id="g" * 32):
+        scope = runtime.read_json(self.folder / "scope.json")
+        scope["grants"] = [row for row in scope["grants"] if row["id"] != grant_id]
+        atomic_json(self.folder / "scope.json", scope)
+
+    def decompiled(self, broker):
+        excerpt = {"tool": "ghidra_decompile", "artifact": DIGEST, "artifact_bytes": 16,
+                   "summary": {"provider_response": "structured", "top_level_fields": 1},
+                   "evidence_excerpt": {"text": "key = 0x5a; port = 0x1bb;"}}
+        with patch.object(runtime, "worker", return_value=(0, json.dumps(excerpt).encode())):
+            return self.reply(broker.call(ask("ghidra_decompile", artifact=DIGEST, address="0x401000")))
+
+    def test_text_shown_by_a_read_taints_what_the_reader_writes(self):
+        self.grant()
+        writer = self.broker()
+        writer.released_grants.add("g" * 32)
+        writer.call(ask("add_lead", artifact=DIGEST, title="DECOMPILED: xor key 0x5a"))
+        reader = self.broker()
+        self.assertEqual(self.reply(reader.call(ask("case_overview")))["leads"][0]["title"], "DECOMPILED: xor key 0x5a")
+        reader.call(ask("add_lead", artifact=DIGEST, title="copy of the key"))
+        leads = investigation.load(self.state, "review")["leads"]
+        self.assertEqual([row["grants"] for row in leads], [["g" * 32], ["g" * 32]])
+        self.revoke()
+        cloud = self.reply(self.broker(audience="mcp").call(ask("case_overview")))
+        self.assertEqual([row["title"] for row in cloud["leads"]], [investigation.WITHHELD] * 2)
+
+    def test_a_chat_answer_after_a_read_carries_the_grants_it_saw(self):
+        self.grant()
+        writer = self.broker()
+        writer.released_grants.add("g" * 32)
+        writer.call(ask("add_lead", artifact=DIGEST, title="Quotes an excerpt"))
+        with patch.dict(models.ADAPTERS, {"ollama": ScriptedAdapter}):
+            ScriptedAdapter.script = [("", [call("case_overview")]), ("Summary.", [])]
+            rows = models.converse(self.state, "review", ReviewRunTests.CONFIG,
+                                   {"role": "native", "tools": ["case_overview"], "allow_cloud": False}, [], "go",
+                                   "analyst")
+        self.assertEqual(rows[-1]["grants"], ["g" * 32])
+
+    def test_excerpt_evidence_counts_only_for_sessions_holding_its_grants(self):
+        self.grant()
+        local = self.broker()
+        evidence_id = self.decompiled(local)["evidence_id"]
+        self.assertTrue(evidence.load(self.folder, evidence_id)["excerpt"])
+        cloud = self.broker(audience="mcp")
+        guess = "Key at 0x5a, 0x1bb, 0x22, 0x33."
+        for name, arguments in (("propose_finding", {"claim": guess, "kind": "observed", "confidence": "low",
+                                                     "artifacts": [DIGEST], "evidence": [evidence_id]}),
+                                ("record_observation", {"kind": "observed", "text": guess, "artifact": DIGEST,
+                                                        "evidence": [evidence_id]})):
+            with self.subTest(name=name):
+                self.assertEqual(self.reply(cloud.call(ask(name, **arguments)))["reason"], "evidence_not_granted")
+        reply = self.reply(local.call(ask("propose_finding", claim="Key 0x5a and port 0x1bb.", kind="observed",
+                                          confidence="medium", artifacts=[DIGEST], evidence=[evidence_id])))
+        self.assertEqual(reply["check"]["result"], "passed")
+        self.assertEqual(investigation.load(self.state, "review")["candidates"][0]["grants"], ["g" * 32])
+        self.revoke()
+        self.assertEqual(self.reply(self.broker().call(ask("record_observation", kind="observed", text="x",
+                                                           artifact=DIGEST, evidence=[evidence_id])))["reason"],
+                         "evidence_not_granted")
+
+    def test_the_same_reply_to_two_audiences_is_two_releases(self):
+        local = self.summary_evidence(self.broker())
+        cloud = self.summary_evidence(self.broker(audience="mcp"))
+        self.assertNotEqual(local, cloud)
+        self.assertEqual([evidence.load(self.folder, item)["audience"] for item in (local, cloud)], ["local", "mcp"])
+
+    def test_addresses_must_be_shown_by_address_fields_or_labels(self):
+        evidence_id = self.summary_evidence()
+        admitted = lambda: {DIGEST}  # noqa: E731
+        candidate = {"kind": "inferred", "artifacts": [DIGEST], "evidence": [evidence_id]}
+        for claim, passes in (("Entry at 0x401000.", True), ("Config at 0x0 then 0x10.", False),
+                              ("Decoder FUN_00405a10 runs first.", False), ("Entry FUN_00401000.", True)):
+            with self.subTest(claim=claim):
+                result = review.check(self.folder, {**candidate, "claim": claim}, admitted)
+                self.assertEqual(result["result"], "passed" if passes else "failed")
+        self.grant()
+        decompile = self.decompiled(self.broker())["evidence_id"]
+        result = review.check(self.folder, {**candidate, "evidence": [decompile], "claim": "Function 0x401000."},
+                              admitted)
+        self.assertEqual(result["result"], "passed")
+
+    def test_a_write_is_audited_as_written_even_if_the_case_pauses_after_it(self):
+        real = investigation.apply
+
+        def pausing(*args):
+            result = real(*args)
+            atomic_json(self.folder / "scope.json", {**runtime.read_json(self.folder / "scope.json"), "paused": True})
+            return result
+        with patch.object(investigation, "apply", side_effect=pausing):
+            reply = self.reply(self.broker().call(ask("add_lead", artifact=DIGEST, title="x")))
+        self.assertEqual(reply["status"], "recorded")
+        self.assertEqual(self.audit()[-1]["decision"], "investigation_write")
+
+    def test_a_lock_is_removed_only_by_its_holder_or_when_stale(self):
+        path = investigation.store_path(self.state, "review").with_suffix(".lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("someone-else", encoding="ascii")
+        with patch.object(investigation.time, "monotonic", side_effect=[0, 0, 10]), patch.object(
+                investigation.time, "sleep"):
+            with self.assertRaisesRegex(investigation.InvestigationError, "investigation_busy"):
+                with investigation.locked(self.state, "review"):
+                    pass
+        self.assertEqual(path.read_text(encoding="ascii"), "someone-else")
+        os.utime(path, (0, 0))
+        with investigation.locked(self.state, "review"):
+            self.assertNotEqual(path.read_text(encoding="ascii"), "someone-else")
+        self.assertFalse(path.exists())
+
+    def test_claiming_a_candidate_blocks_a_second_record_or_a_reject(self):
+        self.broker().call(ask("propose_finding", claim="An ELF.", kind="inferred", confidence="low",
+                               artifacts=[DIGEST], evidence=[]))
+        investigation.claim_candidate(self.state, "review", "C1", "analyst")
+        for action in (lambda: investigation.claim_candidate(self.state, "review", "C1", "other"),
+                       lambda: investigation.decide_candidate(self.state, "review", "C1", "rejected", "other")):
+            with self.assertRaisesRegex(investigation.InvestigationError, "candidate_already_decided"):
+                action()
+        investigation.release_candidate(self.state, "review", "C1")
+        self.assertEqual(investigation.load(self.state, "review")["candidates"][0]["state"], "proposed")
 
 
 class ReviewRunTests(CaseState):
@@ -329,6 +460,41 @@ class InvestigationApiTests(ForgeServer, unittest.TestCase):
         self.assertEqual(self.api("POST", "cases/review/candidates/C1/reject", {})[1]["error"],
                          "candidate_already_decided")
         self.assertEqual(self.api("POST", "cases/review/candidates/C9/reject", {})[0], 404)
+
+    def test_a_second_record_is_refused_while_the_first_is_queued(self):
+        self.propose()
+        release = __import__("threading").Event()
+        blocker = self.app.tasks.submit("report", "review", "slow", "analyst", lambda: release.wait(5) and {})
+        writes = []
+
+        def finding(args):
+            writes.append(args.claim)
+            print(json.dumps({"id": "F000" + str(len(writes))}))
+        with patch.object(forge_api.cli, "operator_action", side_effect=finding):
+            first = self.api("POST", "cases/review/candidates/C1/record", {"claim": "first"})
+            second = self.api("POST", "cases/review/candidates/C1/record", {"claim": "second"})
+            rejected = self.api("POST", "cases/review/candidates/C1/reject", {})
+            release.set()
+            self.wait(blocker)
+            self.wait(first[1]["task"])
+        self.assertEqual((first[0], second[1]["error"], rejected[1]["error"]),
+                         (202, "candidate_already_decided", "candidate_already_decided"))
+        self.assertEqual(writes, ["first"])
+
+    def test_a_failed_record_returns_the_candidate_to_proposed(self):
+        self.propose()
+        with patch.object(forge_api.cli, "operator_action", side_effect=runtime.RuntimeFailure("worker down")):
+            task = self.wait(self.api("POST", "cases/review/candidates/C1/record", {})[1]["task"])
+        self.assertEqual(task["state"], "failed")
+        self.assertEqual(self.api("GET", "cases/review/investigation")[1]["candidates"][0]["state"], "proposed")
+
+    def test_an_unreadable_store_is_unavailable_not_a_bad_request(self):
+        path = investigation.store_path(self.state, "review")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json", encoding="ascii")
+        for method, route in (("GET", "cases/review/investigation"), ("POST", "cases/review/candidates/C1/reject")):
+            with self.subTest(route=route):
+                self.assertEqual(self.api(method, route, {} if method == "POST" else None)[0], 503)
 
     def test_review_runs_as_a_task(self):
         self.propose()

@@ -217,6 +217,17 @@ STATE_MESSAGES = {
 }
 
 
+UNAVAILABLE = ("investigation_unreadable", "investigation_busy", "investigation_full")
+
+
+def load_investigation(state, case_id):
+    try:
+        return investigation.load(state, case_id)
+    except investigation.InvestigationError as error:
+        raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "investigation_unreadable",
+                       "The case's investigation store is unreadable.") from error
+
+
 def require_id(value, expression, code):
     if not policy.match(value, expression):
         raise ApiError(HTTPStatus.NOT_FOUND, code, "Not found.")
@@ -702,12 +713,7 @@ class Api:
 
     def investigation(self, handler, operator, args, params):
         require_case(self.app, args[0])
-        try:
-            data = investigation.load(self.state, args[0])
-        except investigation.InvestigationError as error:
-            raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "investigation_unreadable",
-                           "The case's investigation store is unreadable.") from error
-        return HTTPStatus.OK, investigation.operator_view(data)
+        return HTTPStatus.OK, investigation.operator_view(load_investigation(self.state, args[0]))
 
     def evidence_list(self, handler, operator, args, params):
         folder, _ = require_case(self.app, args[0])
@@ -780,7 +786,7 @@ class Api:
         require_open(record)
         require_id(question_id, investigation.QUESTION_ID, "unknown_question")
         config, settings = self.case_model(case_id)
-        question = next((row for row in investigation.load(self.state, case_id)["questions"]
+        question = next((row for row in load_investigation(self.state, case_id)["questions"]
                          if row["id"] == question_id), None)
         if question is None or question["state"] != "open":
             raise ApiError(HTTPStatus.CONFLICT, "question_not_open", "Only an open question can be split.")
@@ -811,7 +817,7 @@ class Api:
 
     def candidate(self, case_id, candidate_id):
         require_id(candidate_id, investigation.CANDIDATE_ID, "unknown_candidate")
-        rows = investigation.load(self.state, case_id)["candidates"]
+        rows = load_investigation(self.state, case_id)["candidates"]
         row = next((item for item in rows if item["id"] == candidate_id), None)
         if row is None:
             raise ApiError(HTTPStatus.NOT_FOUND, "unknown_candidate", "No such proposed finding.")
@@ -860,18 +866,32 @@ class Api:
         if evidence.missing(folder, cited):
             raise ApiError(HTTPStatus.CONFLICT, "unknown_evidence", "A cited evidence id is missing from this case.")
         cited = cited or [f"Proposal {candidate_id}, no tool evidence cited"]
+        # Claim the candidate now, so a second record or a reject cannot race this one to the ledger.
+        self.state_write(case_id, operator, "candidate_recording", lambda: investigation.claim_candidate(
+            self.state, case_id, candidate_id, operator), candidate=candidate_id)
 
         def job():
-            result = run_cli(cli.operator_action, case=case_id, command="finding", artifact=list(row["artifacts"]),
-                             kind=kind, confidence=confidence, claim=investigation.clean(claim), evidence=cited,
-                             supersedes=None)
+            if self.candidate(case_id, candidate_id)["state"] != "recording":
+                raise tasks.TaskError("The proposal is no longer waiting to be recorded.")
+            try:
+                result = run_cli(cli.operator_action, case=case_id, command="finding",
+                                 artifact=list(row["artifacts"]), kind=kind, confidence=confidence,
+                                 claim=investigation.clean(claim), evidence=cited, supersedes=None)
+            except BaseException:
+                investigation.release_candidate(self.state, case_id, candidate_id)
+                raise
             finding = result.get("id") if isinstance(result, dict) else None
             investigation.decide_candidate(self.state, case_id, candidate_id, "recorded", operator, finding)
             forge_audit(self.app, case_id, operator, decision="investigation_write", operation="candidate_recorded",
                         candidate=candidate_id, finding=finding)
             return {"candidate": candidate_id, "finding": finding}
-        return HTTPStatus.ACCEPTED, {"task": self.app.tasks.submit("record_finding", case_id,
-                                                                   f"Record {candidate_id} in {case_id}", operator, job)}
+        try:
+            task = self.app.tasks.submit("record_finding", case_id, f"Record {candidate_id} in {case_id}", operator,
+                                         job)
+        except BaseException:
+            investigation.release_candidate(self.state, case_id, candidate_id)
+            raise
+        return HTTPStatus.ACCEPTED, {"task": task}
 
     def reject_candidate(self, handler, operator, args, params):
         case_id, candidate_id = args
@@ -890,7 +910,8 @@ class Api:
             row = write()
         except investigation.InvestigationError as error:
             reason = str(error)
-            status = HTTPStatus.NOT_FOUND if reason.startswith("unknown_") else HTTPStatus.CONFLICT
+            status = (HTTPStatus.NOT_FOUND if reason.startswith("unknown_") else
+                      HTTPStatus.SERVICE_UNAVAILABLE if reason in UNAVAILABLE else HTTPStatus.CONFLICT)
             message = STATE_MESSAGES.get(reason, "The investigation store refused that change.")
             raise ApiError(status, reason, message) from error
         if operation == "question":

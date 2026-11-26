@@ -108,10 +108,15 @@ class Broker:
         context = investigation.Context(self.state, self.case_id, self.folder, self.session, self.audience,
                                         self.released_grants | self.context_grants,
                                         active_grant_ids(scope, self.audience), self.admitted)
-        reply, ids = investigation.apply(name, values, context)
+        reply, ids, taint = investigation.apply(name, values, context)
+        if name in investigation.WRITES:
+            # The write is saved: record it as written, whatever the scope does next.
+            runtime.audit(self.folder, **event, decision="investigation_write", excerpt=False, **ids)
+            return call_result(reply)
         self.current_scope()
-        decision = "investigation_write" if name in investigation.WRITES else "completed"
-        runtime.audit(self.folder, **event, decision=decision, excerpt=False, **ids)
+        # Stored text this read showed may be quoted by whatever the session writes next.
+        self.context_grants.update(taint)
+        runtime.audit(self.folder, **event, decision="completed", excerpt=False, **ids)
         return call_result(reply)
 
     def call(self, params):

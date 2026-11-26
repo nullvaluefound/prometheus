@@ -13,6 +13,7 @@ import contextlib
 import hashlib
 import json
 import os
+import secrets
 import threading
 import time
 
@@ -201,31 +202,59 @@ def save(state, case_id, data):
     accounts.write_private(store_path(state, case_id), encoded)
 
 
+STALE_SECONDS = 60
+
+
+def read_token(path):
+    try:
+        return path.read_text(encoding="ascii")
+    except (OSError, UnicodeError):
+        return None
+
+
+def remove_if(path, token):
+    """Delete the lock only if it still holds this token, so no writer removes another writer's lock."""
+    if read_token(path) == token:
+        with contextlib.suppress(OSError):
+            path.unlink()
+
+
 @contextlib.contextmanager
 def locked(state, case_id):
-    """Serialize writers across threads and processes (the Forge service and a CLI session share the store)."""
+    """Serialize writers across threads and processes (the Forge service and a CLI session share the store).
+
+    The lock file holds a random token. A writer that died leaves its lock behind; writes take milliseconds, so a lock
+    older than a minute is stale and is removed, but only if its token is still the one that was judged stale.
+    """
     path = store_path(state, case_id).with_suffix(".lock")
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with LOCK:
+    if not LOCK.acquire(timeout=5):
+        raise InvestigationError("investigation_busy")
+    try:
+        token = secrets.token_hex(16)
         deadline = time.monotonic() + 5
         while True:
             try:
                 fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                break
             except FileExistsError:
-                # A writer that died leaves its lock behind; writes take milliseconds, so a minute-old lock is stale.
+                stale = read_token(path)
                 with contextlib.suppress(OSError):
-                    if time.time() - path.stat().st_mtime > 60:
-                        path.unlink()
+                    if stale is not None and time.time() - path.stat().st_mtime > STALE_SECONDS:
+                        remove_if(path, stale)
                         continue
                 if time.monotonic() > deadline:
                     raise InvestigationError("investigation_busy")
                 time.sleep(0.02)
-        os.close(fd)
+                continue
+            with os.fdopen(fd, "w", encoding="ascii") as stream:
+                stream.write(token)
+            break
         try:
             yield
         finally:
-            path.unlink(missing_ok=True)
+            remove_if(path, token)
+    finally:
+        LOCK.release()
 
 
 def update(state, case_id, change):
@@ -257,8 +286,13 @@ def readable(row, active):
             all(isinstance(grant, str) and grant in active for grant in grants))
 
 
-def shown(row, key, active):
-    return row.get(key) if readable(row, active) else WITHHELD
+def shown(row, key, active, taint):
+    """The row's text if the reader may see it, else a placeholder. Text shown adds its grants to taint: whatever the
+    reader writes next may quote it."""
+    if not readable(row, active):
+        return WITHHELD
+    taint.update(row.get("grants") or [])
+    return row.get(key)
 
 
 # ---- Model tools -----------------------------------------------------------------------------------------------
@@ -271,9 +305,29 @@ class Context:
         self.session, self.audience, self.grants, self.active, self.admitted = (session, audience, sorted(grants),
                                                                                 active, admitted)
 
-    def stamp(self):
-        return {"author": "model", "session": self.session, "audience": self.audience, "grants": self.grants,
-                "utc": now()}
+    def stamp(self, extra=()):
+        return {"author": "model", "session": self.session, "audience": self.audience,
+                "grants": sorted(set(self.grants) | set(extra)), "utc": now()}
+
+    def cited(self, evidence_ids):
+        """Check cited evidence and return the grants it was released under.
+
+        Evidence that carries an excerpt counts only while every grant it was released under is active for this
+        session's audience. Otherwise a model without the grant could test guesses about the excerpt against the
+        reference check.
+        """
+        grants = set()
+        for evidence_id in evidence_ids:
+            try:
+                entry = evidence.load(self.case_folder, evidence_id)
+            except evidence.EvidenceError as error:
+                raise InvestigationError("unknown_evidence") from error
+            if entry.get("excerpt"):
+                released = entry.get("grants") if isinstance(entry.get("grants"), list) else []
+                if not released or not all(isinstance(grant, str) and grant in self.active for grant in released):
+                    raise InvestigationError("evidence_not_granted")
+                grants.update(released)
+        return grants
 
     def require_admitted(self, digests):
         try:
@@ -287,12 +341,17 @@ class Context:
 
 
 def apply(name, values, context):
-    """Run one validated case-state call. Returns (reply, ids) where ids are safe to audit."""
+    """Run one validated case-state call. Returns (reply, ids, taint).
+
+    ids are safe to audit. taint holds the grants of every stored text the reply showed, which the caller adds to the
+    session so its later writing is stamped with them.
+    """
     state, case_id = context.state, context.case_id
+    taint = set()
     if name == "case_overview":
-        return overview(load(state, case_id), values["offset"], values["limit"], context.active), {}
+        return overview(load(state, case_id), values["offset"], values["limit"], context.active, taint), {}, taint
     if name == "lead_detail":
-        return lead_detail(load(state, case_id), values["lead"], context.active), {}
+        return lead_detail(load(state, case_id), values["lead"], context.active, taint), {}, taint
     if name == "add_lead":
         context.require_admitted([values["artifact"]])
 
@@ -307,15 +366,13 @@ def apply(name, values, context):
             data["leads"].append(lead)
             return lead["id"]
         lead = update(state, case_id, change)
-        return {"status": "recorded", "lead": lead}, {"lead": lead}
+        return {"status": "recorded", "lead": lead}, {"lead": lead}, taint
     if name == "record_observation":
         context.require_admitted([values["artifact"]])
         cited = values.get("evidence") or []
         if values["kind"] == "observed" and not cited:
             raise InvestigationError("observed_needs_evidence")
-        for evidence_id in cited:
-            if not evidence.exists(context.case_folder, evidence_id):
-                raise InvestigationError("unknown_evidence")
+        released = context.cited(cited)
 
         def change(data):
             if values.get("lead"):
@@ -323,19 +380,22 @@ def apply(name, values, context):
             if len(data["observations"]) >= MAX_OBSERVATIONS:
                 raise InvestigationError("too_many_observations")
             row = {"id": next_id(data, "O"), "kind": values["kind"], "text": values["text"],
-                   "artifact": values["artifact"], "lead": values.get("lead"), "evidence": cited, **context.stamp()}
+                   "artifact": values["artifact"], "lead": values.get("lead"), "evidence": cited,
+                   **context.stamp(released)}
             data["observations"].append(row)
             return row["id"]
         row = update(state, case_id, change)
-        return {"status": "recorded", "observation": row}, {"observation": row}
+        return {"status": "recorded", "observation": row}, {"observation": row}, taint
     if name == "update_plan":
         def change(data):
             data["plan"] = {"items": values["items"], **context.stamp()}
         update(state, case_id, change)
-        return {"status": "recorded", "items": len(values["items"])}, {}
+        return {"status": "recorded", "items": len(values["items"])}, {}, taint
     if name == "propose_finding":
         from . import review  # review imports this module
         context.require_admitted(values["artifacts"])
+        released = context.cited(values.get("evidence") or [])
+        manifest = context.admitted()  # read before the lock: it can start a ledger Apprentice
 
         def change(data):
             for key, rows, reason in (("question", "questions", "unknown_question"), ("lead", "leads", "unknown_lead")):
@@ -346,18 +406,20 @@ def apply(name, values, context):
             row = {"id": next_id(data, "C"), "state": "proposed",
                    **{key: values.get(key) for key in ("claim", "kind", "confidence", "artifacts", "evidence",
                                                        "limitations", "counterevidence", "question", "lead")},
-                   **context.stamp(), "verdicts": [], "finding": None, "decided_by": None, "decided_utc": None,
-                   "note": None}
-            row["check"] = review.check(context.case_folder, row, context.admitted)
+                   **context.stamp(released), "verdicts": [], "finding": None, "decided_by": None,
+                   "decided_utc": None, "note": None}
+            row["check"] = review.check(context.case_folder, row, lambda: manifest)
             data["candidates"].append(row)
             return row["id"], row["check"]
         candidate, result = update(state, case_id, change)
-        return ({"status": "proposed", "candidate": candidate, "check": result},
-                {"candidate": candidate, "check": result["result"]})
+        # Models get the result and problem codes; the refs stay for the operator.
+        return ({"status": "proposed", "candidate": candidate,
+                 "check": {"result": result["result"], "problems": sorted({row["code"] for row in result["problems"]})}},
+                {"candidate": candidate, "check": result["result"]}, taint)
     raise InvestigationError("unknown_tool")
 
 
-def overview(data, offset, limit, active):
+def overview(data, offset, limit, active, taint):
     questions = [{"id": row["id"], "state": row["state"], "text": row["text"], "outcome": row.get("outcome"),
                   "artifacts": row.get("artifacts") or []}
                  for row in data["questions"] if row.get("state") in ("open", "answer_proposed")]
@@ -366,27 +428,28 @@ def overview(data, offset, limit, active):
         if row.get("lead"):
             counts[row["lead"]] = counts.get(row["lead"], 0) + 1
     leads = [{"id": row["id"], "state": row["state"], "artifact": row["artifact"], "address": row.get("address"),
-              "offset": row.get("offset"), "question": row.get("question"), "title": shown(row, "title", active),
+              "offset": row.get("offset"), "question": row.get("question"), "title": shown(row, "title", active, taint),
               "observations": counts.get(row["id"], 0)}
              for row in data["leads"][offset:offset + limit]]
     plan = data.get("plan")
     candidates = [{"id": row["id"], "state": row["state"], "kind": row.get("kind"), "artifacts": row.get("artifacts"),
-                   "check": (row.get("check") or {}).get("result"), "claim": shown(row, "claim", active)}
+                   "check": (row.get("check") or {}).get("result"), "claim": shown(row, "claim", active, taint)}
                   for row in data["candidates"][-20:]]
     return {"questions": questions,
-            "plan": None if not plan else (plan["items"] if readable(plan, active) else [WITHHELD]),
+            "plan": None if not plan else (shown(plan, "items", active, taint) if readable(plan, active)
+                                           else [WITHHELD]),
             "leads": leads, "page": {"offset": offset, "limit": limit, "total": len(data["leads"])},
             "observations": len(data["observations"]), "candidates": candidates}
 
 
-def lead_detail(data, lead_id, active):
+def lead_detail(data, lead_id, active, taint):
     lead = find(data["leads"], lead_id, "unknown_lead")
     rows = [row for row in data["observations"] if row.get("lead") == lead_id][-50:]
     return {"lead": {"id": lead["id"], "state": lead["state"], "artifact": lead["artifact"],
                      "address": lead.get("address"), "offset": lead.get("offset"), "question": lead.get("question"),
-                     "title": shown(lead, "title", active)},
+                     "title": shown(lead, "title", active, taint)},
             "observations": [{"id": row["id"], "kind": row["kind"], "artifact": row["artifact"],
-                              "evidence": row.get("evidence") or [], "text": shown(row, "text", active)}
+                              "evidence": row.get("evidence") or [], "text": shown(row, "text", active, taint)}
                              for row in rows]}
 
 
@@ -455,13 +518,35 @@ def set_lead_state(state, case_id, lead_id, target):
     return update(state, case_id, change)
 
 
+def claim_candidate(state, case_id, candidate_id, operator):
+    """Move a proposed candidate to recording, so only one ledger write can follow and nobody rejects it meanwhile."""
+    def change(data):
+        row = find(data["candidates"], candidate_id, "unknown_candidate")
+        if row["state"] != "proposed":
+            raise InvestigationError("candidate_already_decided")
+        row.update(state="recording", decided_by=operator)
+        return dict(row)
+    return update(state, case_id, change)
+
+
+def release_candidate(state, case_id, candidate_id):
+    """Return a candidate whose recording failed to proposed."""
+    def change(data):
+        row = find(data["candidates"], candidate_id, "unknown_candidate")
+        if row["state"] == "recording":
+            row.update(state="proposed", decided_by=None)
+        return dict(row)
+    return update(state, case_id, change)
+
+
 def decide_candidate(state, case_id, candidate_id, outcome, operator, finding=None, note=None):
+    """Reject a proposed candidate, or mark a claimed (recording) candidate recorded with its finding id."""
     if outcome not in ("recorded", "rejected"):
         raise InvestigationError("invalid_state")
 
     def change(data):
         row = find(data["candidates"], candidate_id, "unknown_candidate")
-        if row["state"] != "proposed":
+        if row["state"] != ("recording" if outcome == "recorded" else "proposed"):
             raise InvestigationError("candidate_already_decided")
         row.update(state=outcome, finding=finding, decided_by=operator, decided_utc=now(), note=note)
         return dict(row)
@@ -470,10 +555,16 @@ def decide_candidate(state, case_id, candidate_id, outcome, operator, finding=No
 
 def recheck_candidate(state, case_id, candidate_id, case_folder, admitted):
     from . import review
+    try:
+        manifest = admitted()  # outside the lock: reading the ledger starts an Apprentice
+        known = lambda: manifest  # noqa: E731
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        def known():
+            raise OSError("manifest_unreadable")
 
     def change(data):
         row = find(data["candidates"], candidate_id, "unknown_candidate")
-        row["check"] = review.check(case_folder, row, admitted)
+        row["check"] = review.check(case_folder, row, known)
         return dict(row)
     return update(state, case_id, change)
 

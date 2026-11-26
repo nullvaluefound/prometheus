@@ -7,6 +7,7 @@ one verdict, keyed to the candidate by the Forge. Both are advice to the operato
 """
 
 import json
+import re
 
 from . import boundary, evidence, grant_requests, investigation, models, policy, runtime, server
 from .case import now
@@ -35,21 +36,55 @@ Then call `submit_verdict` once:
 Your verdict is advice for the operator. It records nothing and labels nothing."""
 
 
-def numbers(value, found):
-    """Collect every address-like token in a JSON value: hex strings, and integers as hex."""
+# Ghidra's default labels name an address: FUN_00405a10, LAB_..., DAT_..., and REA or IDA style sub_405a10.
+LABEL = re.compile(r"(?<![0-9A-Za-z])(?:thunk_FUN|FUN|LAB|DAT|PTR|SUB|sub|loc|off|byte|word|dword|unk)_"
+                   r"([0-9A-Fa-f]{4,16})(?![0-9A-Za-z])")
+ADDRESS_KEYS = {"address", "entry", "e_entry", "entry_rva", "rva", "va", "image_base", "offset", "overlay_offset",
+                "value", "from", "to", "start", "end", "function", "caller", "callee", "target"}
+
+
+def addresses(text):
+    """SHA-256 values and addresses a text names: 0x literals and default labels such as FUN_00405a10."""
+    found = grant_requests.tokens(text)
+    return found | {hex(int(match, 16)) for match in LABEL.findall(text)}
+
+
+def address_key(key):
+    return isinstance(key, str) and (key in ADDRESS_KEYS or key.endswith(("_rva", "_address", "_offset", "_va")))
+
+
+def numbers(value, found, key=None):
+    """Collect the addresses a JSON value shows: hex literals and labels in strings, and integers in address fields.
+
+    Counts, sizes and other integers are not addresses, so a claim cannot pass on them.
+    """
     if isinstance(value, dict):
-        for item in value.values():
-            numbers(item, found)
+        for name, item in value.items():
+            numbers(item, found, name)
     elif isinstance(value, list):
         for item in value:
-            numbers(item, found)
+            numbers(item, found, key)
     elif isinstance(value, bool):
         return found
-    elif isinstance(value, int) and value >= 0:
+    elif isinstance(value, int) and value >= 0 and address_key(key):
         found.add(hex(value))
     elif isinstance(value, str):
-        found |= grant_requests.tokens(value)
+        found |= {token for token in addresses(value) if not policy.match(token, policy.DIGEST)}
     return found
+
+
+def shown_by_call(entry):
+    """The address a call asked about counts only when the reply shows something about it."""
+    arguments = entry.get("arguments") if isinstance(entry.get("arguments"), dict) else {}
+    reply = entry.get("reply") if isinstance(entry.get("reply"), dict) else {}
+    summary = reply.get("summary") if isinstance(reply.get("summary"), dict) else {}
+    if not isinstance(arguments.get("address"), str):
+        return set()
+    if entry.get("tool") in ("ghidra_decompile", "rea_decompile") and reply.get("evidence_excerpt"):
+        return {arguments["address"]}
+    if entry.get("tool") == "ghidra_xrefs" and summary.get("rows"):
+        return {arguments["address"]}
+    return set()
 
 
 def check(case_folder, candidate, admitted):
@@ -71,9 +106,9 @@ def check(case_folder, candidate, admitted):
             continue
         cited.append(evidence_id)
         numbers(entry.get("reply"), seen)
-        numbers(entry.get("arguments"), seen)
+        seen |= shown_by_call(entry)
     claim = candidate.get("claim") or ""
-    named = grant_requests.tokens(claim)
+    named = addresses(claim)
     for token in sorted(named):
         if policy.match(token, policy.DIGEST):
             if token not in manifest and token not in cited:

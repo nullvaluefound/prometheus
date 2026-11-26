@@ -2,7 +2,8 @@
 
 After projection, the broker stores exactly the reply it released, once per content hash, in the case folder:
 <state>/cases/<case>/evidence/<sha256>.json. The SHA-256 covers the canonical JSON of the tool, its validated
-arguments, whether an excerpt was released, and the reply, so an evidence id names one exact result. Observations,
+arguments, whether an excerpt was released, the audience it was released to, and the reply, so an evidence id names
+one exact release. Observations,
 proposed findings and ledger findings cite these ids. A model sees only the ids and the reply the broker already gave
 it; an excerpt-bearing reply reaches a model again only through a new broker call under a grant active now.
 """
@@ -40,14 +41,13 @@ def path(case_folder, evidence_id):
 
 
 def record(case_folder, tool, arguments, reply, excerpt, audience, grants, ticket, session):
-    """Store one released reply and return its evidence id. Identical results share one file."""
-    body = {"tool": tool, "arguments": arguments, "excerpt": bool(excerpt), "reply": reply}
+    """Store one released reply and return its evidence id. Identical releases to one audience share one file."""
+    body = {"tool": tool, "arguments": arguments, "excerpt": bool(excerpt), "audience": audience, "reply": reply}
     evidence_id = hashlib.sha256(canonical(body)).hexdigest()
     destination = path(case_folder, evidence_id)
     if destination.exists():
         return evidence_id
-    entry = {"id": evidence_id, **body, "audience": audience, "grants": sorted(grants), "ticket": ticket,
-             "session": session, "utc": now()}
+    entry = {"id": evidence_id, **body, "grants": sorted(grants), "ticket": ticket, "session": session, "utc": now()}
     data = (json.dumps(entry, ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
     if len(data) > MAX_EVIDENCE:
         raise EvidenceError("evidence_too_large")
@@ -81,7 +81,7 @@ def load(case_folder, evidence_id):
         raise EvidenceError("evidence_unreadable") from error
     if not isinstance(entry, dict) or entry.get("id") != evidence_id:
         raise EvidenceError("evidence_unreadable")
-    body = {key: entry.get(key) for key in ("tool", "arguments", "excerpt", "reply")}
+    body = {key: entry.get(key) for key in ("tool", "arguments", "excerpt", "audience", "reply")}
     if hashlib.sha256(canonical(body)).hexdigest() != evidence_id:
         raise EvidenceError("evidence_hash_mismatch")
     return entry

@@ -15,8 +15,8 @@ const CHECK_LABEL: Record<string, string> = { passed: "References resolve", fail
 export function CandidatesPanel({ ctx }: { ctx: CaseContext }) {
   const data = useResource((signal) => api.investigation(ctx.id, { signal }), `investigation:${ctx.id}`, () => 15000);
   const candidates = list<Candidate>(data.data?.candidates).filter(isRecord);
-  const open = candidates.filter((row) => row.state === "proposed");
-  const decided = candidates.filter((row) => row.state !== "proposed").slice(-10).reverse();
+  const open = candidates.filter((row) => row.state === "proposed" || row.state === "recording");
+  const decided = candidates.filter((row) => row.state === "recorded" || row.state === "rejected").slice(-10).reverse();
   const reload = () => {
     data.reload();
     ctx.reload();
@@ -71,7 +71,7 @@ function CandidateCard({ ctx, candidate, reload }: { ctx: CaseContext; candidate
       reload();
     },
   });
-  const busy = tracked.task !== null && !isTerminal(tracked.task.state);
+  const busy = (tracked.task !== null && !isTerminal(tracked.task.state)) || candidate.state === "recording";
   const disabled = ctx.inactive !== null || busy;
   const check = candidate.check;
   const verdict = list<Candidate["verdicts"][number]>(candidate.verdicts).slice(-1)[0];
@@ -105,6 +105,7 @@ function CandidateCard({ ctx, candidate, reload }: { ctx: CaseContext; candidate
     <div className="candidate">
       <div className="question-head">
         <code>{txt(candidate.id)}</code>
+        {candidate.state === "recording" && <Badge tone="info">recording in the ledger…</Badge>}
         <Badge>{txt(candidate.kind)}</Badge>
         <Badge>{txt(candidate.confidence)} confidence</Badge>
         {check && (
