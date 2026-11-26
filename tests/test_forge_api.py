@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from re_harness import forge, forge_api, models, runtime
 from re_harness.case import atomic_json
-from tests.forge_support import ForgeServer, write_case
+from tests.forge_support import ForgeServer, ScriptedAdapter, write_case
 
 
 def ledger(digest):
@@ -223,28 +223,6 @@ class ForgeApiTests(ForgeServer, unittest.TestCase):
         release.set()
         self.assertEqual(self.wait(first)["state"], "succeeded")
         self.assertEqual(self.api("GET", "tasks/" + "f" * 32)[0], 404)
-
-
-class ScriptedAdapter:
-    """A model adapter that records what it is shown and replies from a script."""
-    script = []
-    last = None
-
-    def __init__(self, config, system, tools):
-        self.system, self.tools, self.seen, self.steps = system, tools, [], list(ScriptedAdapter.script)
-        ScriptedAdapter.last = self
-
-    def user(self, text):
-        self.seen.append(("user", text))
-
-    def assistant_text(self, text):
-        self.seen.append(("assistant", text))
-
-    def step(self):
-        return self.steps.pop(0)
-
-    def results(self, pairs):
-        self.seen.append(("results", [text for _, text in pairs]))
 
 
 class ChatReplayTests(unittest.TestCase):

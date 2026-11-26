@@ -23,6 +23,32 @@ def write_case(state, case_id, image, paused=False, initialized=True):
                 "volume": "static-re-" + "1" * 32, "paused": paused, "grants": [], "initialized": initialized})
 
 
+class ScriptedAdapter:
+    """A model adapter that records what it is shown and replies from a script of (text, calls) steps."""
+    script = []
+    last = None
+
+    def __init__(self, config, system, tools):
+        self.system, self.tools, self.seen, self.steps = system, tools, [], list(ScriptedAdapter.script)
+        self.finals = []
+        ScriptedAdapter.last = self
+
+    def user(self, text):
+        self.seen.append(("user", text))
+
+    def assistant_text(self, text):
+        self.seen.append(("assistant", text))
+
+    def step(self, final=False):
+        """A step is (text, calls), or a callable that builds one from what the adapter has seen."""
+        self.finals.append(final)
+        entry = self.steps.pop(0)
+        return entry(self) if callable(entry) else entry
+
+    def results(self, pairs):
+        self.seen.append(("results", [text for _, text in pairs]))
+
+
 class ForgeServer:
     """Mixin for unittest.TestCase classes. Call start_forge() from setUp."""
 

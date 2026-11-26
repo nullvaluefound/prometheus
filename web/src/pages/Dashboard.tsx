@@ -1,9 +1,9 @@
 import { useState } from "react";
-import { api, type CaseStatus, type Overview, type Task } from "../api";
+import { api, type CaseStatus, type Overview, type Task, type WaitingItem } from "../api";
 import { NewCaseDialog } from "../components/NewCaseDialog";
 import { AuditTable } from "../components/AuditTable";
 import { CaseLink, Empty, ErrorNote, Loading, Panel, RefreshButton, StatusChip, TaskChip, Time } from "../components/ui";
-import { fmtCount, list, plural, txt } from "../format";
+import { fmtCount, list, plural, short, txt } from "../format";
 import { useDocumentTitle, useResource } from "../hooks";
 import { caseHref } from "../router";
 
@@ -85,6 +85,8 @@ function DashboardBody({ data, onNewCase }: { data: Overview; onNewCase: () => v
           </p>
         </section>
       </div>
+
+      <WaitingPanel items={list<WaitingItem>(data.waiting?.items)} count={data.waiting?.count ?? 0} />
 
       <Panel title="Cases" actions={<a href="#/cases">All cases</a>}>
         {cases.length === 0 ? (
@@ -172,5 +174,29 @@ export function TaskLine({ task }: { task: Task }) {
       {task.case && <CaseLink id={task.case} href={href} />}
       <Time utc={task.finished_utc ?? task.started_utc ?? task.created_utc} relative />
     </span>
+  );
+}
+
+function WaitingPanel({ items, count }: { items: WaitingItem[]; count: number }) {
+  return (
+    <Panel title={count ? `Waiting on you (${count})` : "Waiting on you"}>
+      {items.length === 0 ? (
+        <Empty>Nothing is waiting on you.</Empty>
+      ) : (
+        <ul className="rows waiting-list">
+          {items.map((item) => (
+            <li key={`${txt(item.case)}:${txt(item.id)}`}>
+              <span className="chip chip-warn">Grant request</span>
+              <CaseLink id={item.case} href={caseHref(item.case, "rules")} />
+              <code>{txt(item.tool)}</code>
+              <code title={txt(item.artifact)}>{short(item.artifact, 12)}</code>
+              <span className="muted small">for {item.audience === "mcp" ? "a cloud or MCP model" : "the local model"}</span>
+              {item.flagged && <span className="chip chip-warn">reason names unverified values</span>}
+              <Time utc={item.utc} relative />
+            </li>
+          ))}
+        </ul>
+      )}
+    </Panel>
   );
 }

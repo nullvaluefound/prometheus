@@ -101,7 +101,7 @@ export function CaseView({ id, tab }: { id: string; tab: CaseTab }) {
   const counts: Partial<Record<CaseTab, number>> = {
     artifacts: artifacts.length,
     findings: findings.length,
-    rules: list(data.grants).length,
+    rules: list(data.grants).length + (typeof data.pending_requests === "number" ? data.pending_requests : 0),
   };
 
   return (

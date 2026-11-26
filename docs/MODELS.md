@@ -16,7 +16,7 @@ ollama serve
 python -m re_harness.cli ask case-001 --port 11435 --model $model --role intake "Summarize artifact $sha using artifact_summary."
 ```
 
-`ask` offers `intake`, `native`, `evidence`, and `review` role prompts. Role-specific tools, eight turns, four calls per turn and thirty-two total calls bound each run. A role prompt cannot broaden tool access. The local runner does not manage the daemon's own network configuration or storage. The final answer is model-generated and requires evidence review.
+`ask` offers `intake`, `native`, `evidence`, and `review` role prompts. The system prompt is the role body followed by the Forge's code-owned rules. Every successful tool result is framed as untrusted data under a fresh nonce, and every refusal carries fixed guidance for its reason (docs/SAFETY.md). Role-specific tools, eight turns, four calls per turn and thirty-two total calls bound each run. A role prompt cannot broaden tool access. The local runner does not manage the daemon's own network configuration or storage. The final answer is model-generated and requires evidence review.
 
 ## MCP client
 
@@ -41,3 +41,10 @@ python -m re_harness.cli revoke case-001 $grantId
 `local` grants apply to `ask` and are the default. `mcp` grants apply to clients connected to the case's MCP broker and may disclose evidence to a hosted model. Configure only the intended MCP client for that case before granting its audience. Cancel an unused grant and pause the case when scope changes. Revocation cannot recall a response already delivered. Operator-only `inspect` lets you review the evidence on disk before granting anything to a model.
 
 Released excerpts are capped at 8 KiB of serialization, labeled untrusted and traceable by result hash. They can include sample instructions or secrets. Review redaction and provider handling before granting release. Model output never grants additional permissions or confirms an operator action.
+
+## Forge chat
+
+The Forge chat (docs/FORGE_API.md) uses the same boundary. In addition:
+
+- A call refused with `operator_excerpt_grant_required` files a grant request for exactly that call, which the operator approves or denies on the case's Rules & grants tab or from the dashboard's *Waiting on you* list. The model can add one short reason with `note_grant_need`.
+- A turn that reaches the turn cap gets one last model step with no tools, and its summary becomes the answer instead of an error.

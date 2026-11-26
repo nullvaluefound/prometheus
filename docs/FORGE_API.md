@@ -53,6 +53,7 @@ interface CaseDetail {
   settings: CaseSettings;
   ledger: { title: string; artifacts: Artifact[]; findings: Finding[] } | null; // null when the ledger is unavailable
   grants: Grant[];
+  pending_requests: number;   // grant requests waiting on an operator
   audit: AuditEvent[];        // newest first, at most 50
 }
 interface CaseSettings {
@@ -92,6 +93,23 @@ interface ChatMessage {
   model?: string; operator?: string; utc: string;
   audience?: "local" | "mcp"; // assistant rows: the audience the text was written for
   grants?: string[];           // assistant rows: grant ids whose excerpts the text may quote
+  wrapup?: boolean;            // assistant rows: the tool-free summary written when the turn budget ran out
+  request?: string;            // tool rows: the grant request filed for this refused call
+}
+
+interface GrantRequest {        // filed by the Forge from a broker denial; only an operator decides it
+  id: string; state: "pending" | "approved" | "denied";
+  tool: string; artifact: string; selector: Record<string, string | number>; audience: "local" | "mcp";
+  created_utc: string;
+  reason: string | null;       // model-written, untrusted; never replayed to a model
+  flags: string[];             // SHA-256 values and addresses in reason that the case never showed
+  decided_by: string | null; decided_utc: string | null;
+  grant: string | null;        // the grant id issued on approval
+  note: string | null;         // the operator's note on denial
+}
+interface WaitingItem {
+  kind: "grant_request"; case: string; id: string; tool: string; artifact: string; audience: "local" | "mcp";
+  utc: string; flagged: boolean;
 }
 ```
 
@@ -105,7 +123,8 @@ interface ChatMessage {
   ```
   { cases: CaseRow[], apprentices: {name: string, verified: boolean}[],
     tasks: { queued: number, running: Task | null, recent: Task[] },   // recent: newest 10
-    models: number, audit: (AuditEvent & {case: string})[] }          // newest 20 across cases
+    models: number, audit: (AuditEvent & {case: string})[],          // newest 20 across cases
+    waiting: { count: number, items: WaitingItem[] } }                 // newest 50 items waiting on an operator
   ```
 
 ### Cases
@@ -130,10 +149,13 @@ interface ChatMessage {
   ```
 - `POST api/cases/{id}/grants` with `{ tool, artifact, address?, offset?, limit?, audience, minutes }` returns `Grant`. `minutes` must be 1–60.
 - `DELETE api/cases/{id}/grants/{grant}` returns `{ revoked: id }`.
+- `GET api/cases/{id}/requests` returns `{ requests: GrantRequest[] }`: pending requests oldest first, then the newest 50 decided.
+- `POST api/cases/{id}/requests/{request}/decide` with `{ decision: "approve", minutes }` (1–60) issues a grant for exactly the request's tool, arguments and audience and returns the decided `GrantRequest`. `{ decision: "deny", note? }` (note up to 200 characters) records the denial. A request that is already decided returns 409 `request_already_decided`; a paused case returns 409 `grant_refused`. A closed case can deny but not approve.
+- `POST api/cases/{id}/requests` with `{ action: "deny_all", note? }` denies every pending request and returns `{ denied: string[] }`.
 
 ### Chat
 - `GET api/cases/{id}/chat` returns `{ messages: ChatMessage[], busy: boolean }`.
-- `POST api/cases/{id}/chat` with `{ message }` (1–6000 chars) returns `202 {task}` (kind `chat`). The model runs through the broker with the case's role and tool allowlist. Tool calls and intercepted calls appear as `role: "tool"` messages. Earlier assistant text is replayed to the model only while every grant in its `grants` is active for the model's audience; otherwise the model sees a withheld placeholder (docs/SAFETY.md). Requires `settings.model`. It returns 409 if the model is cloud and `allow_cloud` is false.
+- `POST api/cases/{id}/chat` with `{ message }` (1–6000 chars) returns `202 {task}` (kind `chat`). The model runs through the broker with the case's role and tool allowlist. Tool calls and intercepted calls appear as `role: "tool"` messages. Earlier assistant text is replayed to the model only while every grant in its `grants` is active for the model's audience; otherwise the model sees a withheld placeholder (docs/SAFETY.md). A call refused for want of an excerpt grant files a `GrantRequest` and its tool row carries `request`. A turn that reaches the turn cap ends with a tool-free `wrapup` answer. Requires `settings.model`. It returns 409 if the model is cloud and `allow_cloud` is false.
 - `DELETE api/cases/{id}/chat` clears the conversation and returns `{ cleared: true }`.
 
 ### Tasks

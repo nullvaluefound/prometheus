@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from re_harness import case, local_model, policy, runtime, server
+from re_harness import boundary, case, local_model, policy, runtime, server
 
 DIGEST = "a" * 64
 MODEL = "qwen3:8b"
@@ -150,7 +150,13 @@ class LocalModelTests(unittest.TestCase):
                          sorted(local_model.ROLES["intake"]))
         tool = self.sent[1]["messages"][-1]
         self.assertEqual(tool["tool_name"], "intercepted")
-        self.assertEqual(json.loads(tool["content"]), {"status": "denied", "reason": "tool_outside_role"})
+        refused = json.loads(tool["content"])
+        self.assertEqual((refused["status"], refused["reason"]), ("denied", "tool_outside_role"))
+        self.assertIn("evidence, native, review roles hold it", refused["guidance"])
+        # The code-owned rules come after the role body, so they are the model's final instruction.
+        system = self.sent[0]["messages"][0]["content"]
+        self.assertTrue(system.endswith(boundary.tail(False)))
+        self.assertIn((runtime.ROOT / "agents" / "intake" / "AGENTS.md").read_text(encoding="utf-8").strip(), system)
         intercepted = [event for event in self.events() if event["decision"] == "intercepted"]
         self.assertEqual([(event["tool"], event["reason"], event["audience"]) for event in intercepted],
                          [("ghidra_functions", "tool_outside_role", "local")])

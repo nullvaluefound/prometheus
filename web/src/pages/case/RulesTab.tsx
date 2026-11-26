@@ -17,11 +17,13 @@ import { DIGEST, LIMIT_DEFAULT, isRecord, list, short, txt } from "../../format"
 import { errorMessage, useResource, type Resource } from "../../hooks";
 import type { CaseContext } from "../CaseView";
 import { ArtifactPicker, SelectorFields, ToolBadges, chosenArtifact, parseSelector, usableTools } from "./ToolsTab";
+import { RequestsPanel } from "./RequestsPanel";
 
 export function RulesTab({ ctx, policy }: { ctx: CaseContext; policy: Resource<Policy> }) {
   const settings = ctx.detail.settings;
   return (
     <div className="stack">
+      <RequestsPanel ctx={ctx} />
       <SettingsPanel key={JSON.stringify(settings ?? null)} ctx={ctx} policy={policy} />
       <GrantsPanel ctx={ctx} />
       <NewGrantPanel ctx={ctx} policy={policy} />

@@ -96,6 +96,7 @@ export interface CaseDetail {
   settings: CaseSettings;
   ledger: Ledger | null;
   grants: Grant[];
+  pending_requests?: number;
   audit: AuditEvent[];
 }
 
@@ -135,6 +136,43 @@ export interface ChatMessage {
   utc: string;
   audience?: "local" | "mcp"; // assistant rows: the audience the text was written for
   grants?: string[]; // assistant rows: excerpt grants the text may quote
+  wrapup?: boolean; // assistant rows: the tool-free summary written when the turn budget ran out
+  request?: string; // tool rows: the grant request filed for this refused call
+}
+
+export type RequestState = "pending" | "approved" | "denied";
+
+export interface GrantRequest {
+  id: string;
+  state: RequestState;
+  tool: string;
+  artifact: string;
+  selector: Record<string, string | number>;
+  audience: Audience;
+  created_utc: string;
+  reason: string | null; // model-written, untrusted
+  flags: string[]; // SHA-256 values and addresses in the reason that the case never showed
+  decided_by: string | null;
+  decided_utc: string | null;
+  grant: string | null;
+  note: string | null; // operator-written
+}
+
+export interface WaitingItem {
+  kind: "grant_request";
+  case: string;
+  id: string;
+  tool: string;
+  artifact: string;
+  audience: Audience;
+  utc: string;
+  flagged: boolean;
+}
+
+export interface DecideInput {
+  decision: "approve" | "deny";
+  minutes?: number;
+  note?: string;
 }
 
 export interface Me {
@@ -153,6 +191,7 @@ export interface Overview {
   tasks: { queued: number; running: Task | null; recent: Task[] };
   models: number;
   audit: CaseAuditEvent[];
+  waiting?: { count: number; items: WaitingItem[] };
 }
 
 export interface PolicyTool {
@@ -331,6 +370,10 @@ export const api = {
   policy: (opts?: Opts) => get<Policy>("policy", opts),
   createGrant: (id: string, grant: GrantInput) => post<Grant>(`cases/${seg(id)}/grants`, grant),
   revokeGrant: (id: string, grant: string) => del<{ revoked: string }>(`cases/${seg(id)}/grants/${seg(grant)}`),
+  requests: (id: string, opts?: Opts) => get<{ requests: GrantRequest[] }>(`cases/${seg(id)}/requests`, opts),
+  denyAllRequests: (id: string, note?: string) => post<{ denied: string[] }>(`cases/${seg(id)}/requests`, { action: "deny_all", note }),
+  decideRequest: (id: string, request: string, input: DecideInput) =>
+    post<GrantRequest>(`cases/${seg(id)}/requests/${seg(request)}/decide`, input),
 
   chat: (id: string, opts?: Opts) => get<ChatState>(`cases/${seg(id)}/chat`, opts),
   sendChat: (id: string, message: string) => post<TaskEnvelope>(`cases/${seg(id)}/chat`, { message }),

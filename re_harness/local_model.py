@@ -4,7 +4,7 @@ import http.client
 import json
 import re
 
-from . import policy, runtime, server
+from . import boundary, policy, runtime, server
 
 ROLES = {
     "intake": {"artifact_summary", "artifact_strings", "yara_scan", "capa_triage"},
@@ -53,7 +53,8 @@ def chat(state, case_id, port, model, role, question):
     broker.current_scope()
     if not installed(port, model):
         raise runtime.RuntimeFailure("Select an exact installed local Ollama model name")
-    instructions = (runtime.ROOT / "agents" / role / "AGENTS.md").read_text(encoding="utf-8")
+    # The role body first, then the code-owned rules, so the Forge's own text is the final word.
+    instructions = boundary.system_prompt((runtime.ROOT / "agents" / role / "AGENTS.md").read_text(encoding="utf-8"))
     messages = [{"role": "system", "content": instructions}, {"role": "user", "content": question}]
     tools = [{"type": "function", "function": {"name": name, "description": policy.TOOLS[name],
               "parameters": policy.tool_schema(name)}} for name in sorted(ROLES[role])]
@@ -85,7 +86,9 @@ def chat(state, case_id, port, model, role, question):
                 reply = broker.call({"name": function.get("name"), "arguments": function.get("arguments")})
                 name = function.get("name")
                 safe_name = name if isinstance(name, str) and name in ROLES[role] else "intercepted"
-                messages.append({"role": "tool", "tool_name": safe_name, "content": reply["content"][0]["text"]})
+                # Results are framed as untrusted data; refusals stay platform text with fixed guidance.
+                content = boundary.for_model(reply["content"][0]["text"], reply["isError"], name, role)
+                messages.append({"role": "tool", "tool_name": safe_name, "content": content})
         raise runtime.RuntimeFailure("Local model turn budget exhausted")
     except Exception:
         # A fixed reason keeps sample-derived exception text out of the audit log.

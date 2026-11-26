@@ -343,6 +343,12 @@ td code { overflow-wrap: anywhere; }
 .msg-text { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .msg-reason { margin: .35rem 0 0; color: var(--forge); font-size: .82rem; overflow-wrap: anywhere; }
 .msg-failed .msg-reason { color: var(--err); }
+.request { display: grid; gap: .45rem; width: 100%; min-width: 0; }
+.request-call, .request-actions, .request-decided { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .6rem; min-width: 0; }
+.request-reason { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.request-actions input[type="number"] { width: 5rem; }
+.request-list > li { display: block; }
+.waiting-list > li { justify-content: flex-start; }
 .msg-thinking { display: inline-flex; align-items: center; gap: .6rem; color: var(--muted); font-style: italic; }
 .dots { display: inline-flex; gap: .2rem; }
 .dots span { width: .38rem; height: .38rem; border-radius: 50%; background: var(--forge); animation: pulse 1.2s ease-in-out infinite; }
