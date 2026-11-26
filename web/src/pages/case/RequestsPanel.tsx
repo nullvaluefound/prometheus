@@ -24,13 +24,28 @@ export function RequestsPanel({ ctx }: { ctx: CaseContext }) {
   const rows = list<GrantRequest>(requests.data?.requests).filter(isRecord);
   const pending = rows.filter((row) => row.state === "pending");
   const decided = rows.filter((row) => row.state !== "pending").slice(0, 10);
+  const toast = useToast();
   const reload = () => {
     requests.reload();
     ctx.reload();
   };
+  const denyAll = async () => {
+    try {
+      const { denied } = await api.denyAllRequests(ctx.id);
+      toast(`Denied ${list(denied).length} request${list(denied).length === 1 ? "" : "s"}.`, "ok");
+      reload();
+    } catch (error) {
+      toast(errorMessage(error), "err");
+    }
+  };
 
   return (
-    <Panel title={pending.length ? `Grant requests waiting on you (${pending.length})` : "Grant requests"}>
+    <Panel
+      title={pending.length ? `Grant requests waiting on you (${pending.length})` : "Grant requests"}
+      actions={
+        pending.length > 1 ? <ConfirmButton label="Deny all" prompt={`Deny all ${pending.length} requests?`} confirmLabel="Deny all" onConfirm={denyAll} /> : undefined
+      }
+    >
       <p className="muted small">
         When the broker refuses a model's call because it needs an excerpt grant, the Forge files a request for exactly that call. Approving
         grants that call, for the model's own audience, for the minutes you choose. The model's reason is untrusted text written by the model.
@@ -76,7 +91,8 @@ function PendingRequest({ ctx, request, onDecided }: { ctx: CaseContext; request
   const [minutes, setMinutes] = useState("10");
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
-  const disabled = ctx.inactive !== null || busy;
+  const closed = ctx.detail.status === "Closed";
+  const disabled = (ctx.inactive !== null && !closed) || busy;
   const flags = list<string>(request.flags);
 
   const decide = async (decision: "approve" | "deny") => {
@@ -128,7 +144,7 @@ function PendingRequest({ ctx, request, onDecided }: { ctx: CaseContext; request
           <span>Minutes</span>
           <input type="number" inputMode="numeric" min={1} max={60} step={1} value={minutes} onChange={(event) => setMinutes(event.target.value)} disabled={disabled} />
         </label>
-        <button type="button" className="btn-small" onClick={() => void decide("approve")} disabled={disabled}>
+        <button type="button" className="btn-small" onClick={() => void decide("approve")} disabled={disabled || closed}>
           Approve
         </button>
         <label className="field field-inline">

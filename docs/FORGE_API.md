@@ -150,7 +150,8 @@ interface WaitingItem {
 - `POST api/cases/{id}/grants` with `{ tool, artifact, address?, offset?, limit?, audience, minutes }` returns `Grant`. `minutes` must be 1–60.
 - `DELETE api/cases/{id}/grants/{grant}` returns `{ revoked: id }`.
 - `GET api/cases/{id}/requests` returns `{ requests: GrantRequest[] }`: pending requests oldest first, then the newest 50 decided.
-- `POST api/cases/{id}/requests/{request}/decide` with `{ decision: "approve", minutes }` (1–60) issues a grant for exactly the request's tool, arguments and audience and returns the decided `GrantRequest`. `{ decision: "deny", note? }` (note up to 200 characters) records the denial. A request that is already decided returns 409 `request_already_decided`; a paused case returns 409 `grant_refused`.
+- `POST api/cases/{id}/requests/{request}/decide` with `{ decision: "approve", minutes }` (1–60) issues a grant for exactly the request's tool, arguments and audience and returns the decided `GrantRequest`. `{ decision: "deny", note? }` (note up to 200 characters) records the denial. A request that is already decided returns 409 `request_already_decided`; a paused case returns 409 `grant_refused`. A closed case can deny but not approve.
+- `POST api/cases/{id}/requests` with `{ action: "deny_all", note? }` denies every pending request and returns `{ denied: string[] }`.
 
 ### Chat
 - `GET api/cases/{id}/chat` returns `{ messages: ChatMessage[], busy: boolean }`.

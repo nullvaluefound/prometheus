@@ -371,6 +371,7 @@ export const api = {
   createGrant: (id: string, grant: GrantInput) => post<Grant>(`cases/${seg(id)}/grants`, grant),
   revokeGrant: (id: string, grant: string) => del<{ revoked: string }>(`cases/${seg(id)}/grants/${seg(grant)}`),
   requests: (id: string, opts?: Opts) => get<{ requests: GrantRequest[] }>(`cases/${seg(id)}/requests`, opts),
+  denyAllRequests: (id: string, note?: string) => post<{ denied: string[] }>(`cases/${seg(id)}/requests`, { action: "deny_all", note }),
   decideRequest: (id: string, request: string, input: DecideInput) =>
     post<GrantRequest>(`cases/${seg(id)}/requests/${seg(request)}/decide`, input),
 

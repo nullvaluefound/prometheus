@@ -212,6 +212,9 @@ def safe_requests(state, case_id):
 def request_error(error):
     if str(error) == "request_already_decided":
         return ApiError(HTTPStatus.CONFLICT, "request_already_decided", "That request was already decided.")
+    if str(error) == "audit_unavailable":
+        return ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "audit_unavailable",
+                        "The case audit is unavailable, so the decision was not recorded.")
     return ApiError(HTTPStatus.NOT_FOUND, "unknown_request", "No such request.")
 
 
@@ -219,6 +222,8 @@ def waiting(state, cases):
     """Everything that waits on an operator, newest first."""
     items = []
     for row in cases:
+        if row["status"] == "Closed":
+            continue  # a closed case's requests can only be denied; they wait on nobody
         for request in safe_requests(state, row["id"]):
             if request["state"] == "pending":
                 items.append({"kind": "grant_request", "case": row["id"], "id": request["id"], "tool": request["tool"],
@@ -284,6 +289,7 @@ class Api:
             ("POST", ("cases", "{}", "grants")): self.grant,
             ("DELETE", ("cases", "{}", "grants", "{}")): self.revoke,
             ("GET", ("cases", "{}", "requests")): self.requests,
+            ("POST", ("cases", "{}", "requests")): self.deny_all_requests,
             ("POST", ("cases", "{}", "requests", "{}", "decide")): self.decide_request,
             ("GET", ("cases", "{}", "chat")): self.chat,
             ("POST", ("cases", "{}", "chat")): self.send_chat,
@@ -399,7 +405,8 @@ class Api:
             "engine": record["engine"],
             "yara_rules": {"sha256": rules["sha256"], "rules": rules.get("rules")} if isinstance(rules, dict) else None,
             "settings": public_settings(settings), "ledger": ledger, "grants": grant_rows(record),
-            "pending_requests": sum(row["state"] == "pending" for row in safe_requests(self.state, case_id)),
+            "pending_requests": 0 if runtime.closed(record) else sum(row["state"] == "pending"
+                                                                     for row in safe_requests(self.state, case_id)),
             "audit": forge.recent_audit(folder, 50)}
 
     def set_paused(self, handler, operator, args, paused):
@@ -580,17 +587,38 @@ class Api:
         require_case(self.app, args[0])
         return HTTPStatus.OK, {"requests": safe_requests(self.state, args[0])}
 
+    def deny_all_requests(self, handler, operator, args, params):
+        """POST {action: "deny_all", note?} denies every pending request at once. A closed case allows it too."""
+        case_id = args[0]
+        require_case(self.app, case_id)
+        body = self.body(handler)
+        note = body.get("note")
+        if body.get("action") != "deny_all":
+            raise bad("Send action deny_all.")
+        if note is not None and (not isinstance(note, str) or len(note) > 200):
+            raise bad("Keep the note to 200 characters.")
+        with DECIDE_LOCK:
+            try:
+                denied = grant_requests.deny_all(self.state, case_id, operator, note)
+            except grant_requests.RequestError as error:
+                raise request_error(error) from error
+        return HTTPStatus.OK, {"denied": denied}
+
     def decide_request(self, handler, operator, args, params):
-        """Approve issues a grant for exactly the denied call and audience; deny records the operator's note."""
+        """Approve issues a grant for exactly the denied call and audience; deny records the operator's note.
+
+        A closed case can still deny, so its queue empties; it cannot approve.
+        """
         case_id, request_id = args
         folder, record = require_case(self.app, case_id)
-        require_open(record)
         if not policy.match(request_id, grant_requests.REQUEST_ID):
             raise ApiError(HTTPStatus.NOT_FOUND, "unknown_request", "No such request.")
         body = self.body(handler)
         decision, minutes, note = body.get("decision"), body.get("minutes"), body.get("note")
         if decision not in ("approve", "deny"):
             raise bad("Decide approve or deny.")
+        if decision == "approve":
+            require_open(record)
         if note is not None and (not isinstance(note, str) or len(note) > 200):
             raise bad("Keep the note to 200 characters.")
         with DECIDE_LOCK:

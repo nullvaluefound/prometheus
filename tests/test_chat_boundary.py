@@ -4,11 +4,13 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from re_harness import boundary, grant_requests, models, runtime
+from re_harness import boundary, forge, grant_requests, models, runtime
+from re_harness.case import atomic_json
 from tests.forge_support import ForgeServer, ScriptedAdapter, write_case
 
 DIGEST = "a" * 64
@@ -80,7 +82,7 @@ class ChatTurnTests(unittest.TestCase):
         for patcher in (patch.dict(models.ADAPTERS, {"ollama": ScriptedAdapter}),
                         patch.object(runtime, "worker", return_value=(0, json.dumps(SUMMARY).encode())),
                         patch.object(models.server.projection, "project", side_effect=lambda value, *args: value),
-                        patch.object(models.forge, "case_ledger",
+                        patch.object(forge, "case_ledger",
                                      return_value={"artifacts": {DIGEST: {}}, "findings": []})):
             self.mock = patcher.start()
             self.addCleanup(patcher.stop)
@@ -101,7 +103,7 @@ class ChatTurnTests(unittest.TestCase):
         system = ScriptedAdapter.last.system
         role = (runtime.ROOT / "agents" / "native" / "AGENTS.md").read_text(encoding="utf-8").rstrip()
         self.assertTrue(system.startswith(role))
-        self.assertTrue(system.endswith(boundary.TAIL))
+        self.assertTrue(system.endswith(boundary.tail(True)))
         self.assertEqual([name for name, _, _ in ScriptedAdapter.last.tools],
                          ["artifact_summary", "ghidra_decompile", "note_grant_need"])
         without = self.run_turn([("Done.", [])], {**self.SETTINGS, "tools": ["artifact_summary"]})
@@ -172,10 +174,130 @@ class ChatTurnTests(unittest.TestCase):
         self.run_turn([("", [decompile]), ("", [])])
         reply = json.loads(self.results()[0][0])
         self.assertEqual((reply["status"], reply["request_refused"]), ("denied", "artifact_not_admitted"))
-        with patch.object(models.forge, "case_ledger", side_effect=runtime.RuntimeFailure("ledger_unavailable")):
+        with patch.object(forge, "case_ledger", side_effect=runtime.RuntimeFailure("ledger_unavailable")):
             self.run_turn([("", [call("ghidra_decompile", artifact=DIGEST, address="0x401000")]), ("", [])])
         self.assertEqual(json.loads(self.results()[0][0])["request_refused"], "admission_unverified")
         self.assertEqual(grant_requests.load(self.state, "review"), [])
+
+
+class ReviewFixTests(ChatTurnTests):
+    """Failure paths: audit failures, ledger timeouts, repeat requests across sessions and the per-session cap."""
+
+    def test_a_failed_audit_stores_no_request(self):
+        real = runtime.audit
+
+        def failing(folder, **event):
+            if event.get("decision") == "grant_requested":
+                raise OSError("disk full")
+            return real(folder, **event)
+        with patch.object(runtime, "audit", side_effect=failing):
+            self.run_turn([("", [call("ghidra_decompile", artifact=DIGEST, address="0x401000")]), ("", [])])
+        self.assertEqual(json.loads(self.results()[0][0])["request_refused"], "audit_unavailable")
+        self.assertEqual(grant_requests.load(self.state, "review"), [])
+
+    def test_a_ledger_timeout_refuses_the_request_without_ending_the_turn(self):
+        with patch.object(forge, "case_ledger", side_effect=subprocess.TimeoutExpired("docker", 60)):
+            rows = self.run_turn([("", [call("ghidra_decompile", artifact=DIGEST, address="0x401000")]),
+                                  ("Carried on.", [])])
+        self.assertEqual(json.loads(self.results()[0][0])["request_refused"], "admission_unverified")
+        self.assertEqual(rows[-1]["text"], "Carried on.")
+
+    def test_a_note_store_failure_is_refused_not_fatal(self):
+        decompile = call("ghidra_decompile", artifact=DIGEST, address="0x401000")
+
+        def noting(adapter):
+            request = json.loads(adapter.seen[-1][1][0])["request"]
+            return "", [call("note_grant_need", request=request, reason="It decodes the config.")]
+        real, saves = grant_requests.save, []
+
+        def failing_second(*args):
+            saves.append(args)
+            if len(saves) > 1:
+                raise OSError("disk full")
+            return real(*args)
+        with patch.object(grant_requests, "save", side_effect=failing_second):
+            rows = self.run_turn([("", [decompile]), noting, ("Done.", [])])
+        self.assertEqual(json.loads(self.results()[1][0])["reason"], "request_store_unavailable")
+        self.assertEqual(rows[-1]["text"], "Done.")
+
+    def test_a_repeat_request_moves_to_the_session_that_asked_last(self):
+        decompile = call("ghidra_decompile", artifact=DIGEST, address="0x401000")
+        self.run_turn([("", [decompile]), ("", [])])
+
+        def noting(adapter):
+            request = json.loads(adapter.seen[-1][1][0])["request"]
+            return "", [call("note_grant_need", request=request, reason="Second ask, with a reason.")]
+        self.run_turn([("", [decompile]), noting, ("", [])])
+        self.assertEqual(json.loads(self.results()[1][0])["status"], "noted")
+        rows = grant_requests.load(self.state, "review")
+        self.assertEqual([(row["state"], row["reason"]) for row in rows], [("pending", "Second ask, with a reason.")])
+
+    def test_one_session_files_at_most_four_requests(self):
+        calls = [call("ghidra_decompile", artifact=DIGEST, address=hex(0x401000 + index)) for index in range(4)]
+        more = [call("ghidra_decompile", artifact=DIGEST, address=hex(0x402000 + index)) for index in range(2)]
+        self.run_turn([("", calls), ("", more), ("", [])])
+        replies = [json.loads(text) for batch in self.results() for text in batch]
+        self.assertEqual([reply["status"] for reply in replies], ["pending"] * 4 + ["denied"] * 2)
+        self.assertEqual(replies[-1]["request_refused"], "too_many_session_requests")
+        self.assertEqual(len(grant_requests.load(self.state, "review")), 4)
+
+    def test_sessions_without_requests_are_not_told_about_them(self):
+        self.run_turn([("Done.", [])], {**self.SETTINGS, "tools": ["artifact_summary"]})
+        self.assertNotIn("note_grant_need", ScriptedAdapter.last.system)
+        self.assertTrue(ScriptedAdapter.last.system.endswith(boundary.tail(False)))
+
+
+class AdapterFinalStepTests(unittest.TestCase):
+    """The tool-free final step, as each provider receives it."""
+
+    TOOLS = [("artifact_summary", "Summarize.", {"type": "object"})]
+
+    def capture(self, adapter_class, reply):
+        sent = []
+
+        def post(base_url, path, payload, headers=None, timeout=180):
+            sent.append(payload)
+            return reply
+        adapter = adapter_class({"base_url": "http://127.0.0.1:1", "model": "m"}, "system", self.TOOLS)
+        adapter.user("hi")
+        with patch.object(models, "post_json", side_effect=post):
+            adapter.step()
+            adapter.step(final=True)
+        return sent
+
+    def test_ollama_offers_no_tools_on_the_final_step(self):
+        sent = self.capture(models.Ollama, {"message": {"role": "assistant", "content": "ok"}})
+        self.assertIn("tools", sent[0])
+        self.assertNotIn("tools", sent[1])
+
+    def test_openai_forbids_calls_on_the_final_step(self):
+        sent = self.capture(models.OpenAICompatible, {"choices": [{"message": {"content": "ok"}}]})
+        self.assertNotIn("tool_choice", sent[0])
+        self.assertEqual((sent[1]["tool_choice"], len(sent[1]["tools"])), ("none", 1))
+
+    def test_anthropic_forbids_calls_on_the_final_step(self):
+        adapter = object.__new__(models.Anthropic)
+        adapter.config, adapter.system, adapter.messages = {"model": "claude-haiku-4-5"}, "system", []
+        adapter.tools = [{"name": "artifact_summary", "description": "Summarize.", "input_schema": {}}]
+        requests = []
+
+        class Messages:
+            def create(self, **request):
+                requests.append(request)
+                return Response()
+
+        class Response:
+            stop_reason = "end_turn"
+            content = []
+
+            def to_dict(self):
+                return {"content": []}
+        adapter.client = type("Client", (), {"messages": Messages()})()
+        adapter.sdk = None
+        adapter.step()
+        adapter.step(final=True)
+        self.assertNotIn("tool_choice", requests[0])
+        self.assertEqual(requests[1]["tool_choice"], {"type": "none"})
 
 
 class NoteTests(unittest.TestCase):
@@ -248,6 +370,26 @@ class GrantRequestApiTests(ForgeServer, unittest.TestCase):
         decisions = [json.loads(line)["decision"] for line in
                      (runtime.case_path(self.state, "review") / "audit.jsonl").read_text().splitlines()]
         self.assertEqual(decisions.count("grant_decided"), 2)
+
+    def test_a_closed_case_can_deny_but_not_approve_and_waits_on_nobody(self):
+        write_case(self.state, "sealed", self.image)
+        folder = runtime.case_path(self.state, "sealed")
+        atomic_json(folder / "scope.json", {**runtime.read_json(folder / "scope.json"), "closed": True,
+                                            "closed_utc": "2026-11-25T10:00:00+00:00"})
+        self.app.visible.add("sealed")
+        rows = [grant_requests.file(self.state, "sealed", "ghidra_decompile",
+                                    {"artifact": self.digest, "address": hex(0x401000 + index)}, "local",
+                                    "s" * 32)[0]["id"] for index in range(3)]
+        self.assertEqual(self.api("GET", "overview")[1]["waiting"]["count"], 0)
+        self.assertEqual(self.api("GET", "cases/sealed")[1]["pending_requests"], 0)
+        self.assertEqual(self.api("POST", f"cases/sealed/requests/{rows[0]}/decide",
+                                  {"decision": "approve", "minutes": 5})[1]["error"], "case_closed")
+        self.assertEqual(self.api("POST", f"cases/sealed/requests/{rows[0]}/decide",
+                                  {"decision": "deny"})[1]["state"], "denied")
+        self.assertEqual(self.api("POST", "cases/sealed/requests", {"action": "nope"})[0], 400)
+        status, reply = self.api("POST", "cases/sealed/requests", {"action": "deny_all", "note": "Closed"})
+        self.assertEqual((status, sorted(reply["denied"])), (200, sorted(rows[1:])))
+        self.assertTrue(all(row["state"] == "denied" for row in grant_requests.load(self.state, "sealed")))
 
     def test_a_paused_case_refuses_approval(self):
         row, _ = grant_requests.file(self.state, "frozen", "ghidra_decompile",

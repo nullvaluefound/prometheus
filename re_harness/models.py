@@ -8,6 +8,7 @@ import http.client
 import ipaddress
 import json
 import ssl
+import subprocess
 import threading
 from urllib.parse import urlsplit
 
@@ -408,6 +409,8 @@ class Turn:
                                          self.broker.session)
         except grant_requests.RequestError as error:
             return {}, str(error)
+        except policy.Denied:
+            return {}, "not_requestable"
         except FORGE_ERRORS:
             return {}, "admission_unverified"
         return {"status": "pending", "request": row["id"]}, None
@@ -426,11 +429,14 @@ class Turn:
         except (policy.Denied, grant_requests.RequestError) as error:
             text = json.dumps({"status": "denied", "reason": str(error)})
             return text, True, boundary.for_model(text, True, NOTE_TOOL, self.role), {}
+        except FORGE_ERRORS:
+            text = json.dumps({"status": "failed", "reason": "request_store_unavailable"})
+            return text, True, boundary.for_model(text, True, NOTE_TOOL, self.role), {}
         text = json.dumps({"status": "noted", "request": row["id"]})
         return text, False, text, {}
 
 
-FORGE_ERRORS = (OSError, ValueError, KeyError, TypeError, RuntimeError)
+FORGE_ERRORS = (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError)
 
 
 def denial_reason(text):
@@ -458,7 +464,8 @@ def converse(state, case_id, config, settings, history, message, operator):
     broker = server.Broker(state, case_id, allowed, audience="mcp" if cloud else "local")
     scope = broker.current_scope()
     turn = Turn(state, case_id, broker, role, allowed)
-    system = boundary.system_prompt((runtime.ROOT / "agents" / role / "AGENTS.md").read_text(encoding="utf-8"))
+    system = boundary.system_prompt((runtime.ROOT / "agents" / role / "AGENTS.md").read_text(encoding="utf-8"),
+                                    requests=turn.requests)
     adapter = ADAPTERS[config["provider"]](config, system, tool_specs(allowed, turn.requests))
     inherited = replay(adapter, history, scope, broker.audience)
     adapter.user(message)

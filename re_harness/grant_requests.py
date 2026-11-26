@@ -17,6 +17,7 @@ LOCK = threading.Lock()
 REQUEST_ID = r"[a-f0-9]{32}"
 MAX_REASON = 500
 MAX_PENDING = 64
+MAX_PER_SESSION = 4  # a sample-steered model cannot fill the operator's queue in one session
 KEEP_DECIDED = 200
 STATES = ("pending", "approved", "denied")
 DIGEST_TOKEN = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{64}(?![0-9A-Fa-f])")
@@ -60,8 +61,20 @@ def clean(text):
     return "".join(ch if ch.isprintable() else " " for ch in text).strip()[:MAX_REASON]
 
 
+def audited(state, case_id, **event):
+    """Audit before the store changes, so no stored request lacks its record. A failed audit refuses the change."""
+    try:
+        runtime.audit(runtime.case_path(state, case_id), case=case_id, **event)
+    except (OSError, runtime.RuntimeFailure) as error:
+        raise RequestError("audit_unavailable") from error
+
+
 def file(state, case_id, tool, arguments, audience, session):
-    """Record a pending request for exactly this denied call. Returns (request, created)."""
+    """Record a pending request for exactly this denied call. Returns (request, created).
+
+    A repeat of a pending request is the same request. It moves to the session that asked last, so that session can
+    explain it with note_grant_need.
+    """
     if tool not in policy.EXCERPT_ONLY or audience not in ("local", "mcp"):
         raise RequestError("not_requestable")
     arguments = policy.validate(tool, arguments)
@@ -70,18 +83,23 @@ def file(state, case_id, tool, arguments, audience, session):
         for row in rows:
             if (row["state"] == "pending" and row["tool"] == tool and row["arguments"] == arguments and
                     row["audience"] == audience):
+                if row["session"] != session:
+                    row["session"] = session
+                    save(state, case_id, rows)
                 return dict(row), False
         if sum(row["state"] == "pending" for row in rows) >= MAX_PENDING:
             raise RequestError("too_many_pending_requests")
+        if sum(row["state"] == "pending" and row.get("filed_by") == session for row in rows) >= MAX_PER_SESSION:
+            raise RequestError("too_many_session_requests")
         row = {"id": uuid.uuid4().hex, "state": "pending", "tool": tool, "arguments": arguments,
-               "audience": audience, "session": session, "created_utc": now(), "reason": None, "flags": [],
-               "decided_by": None, "decided_utc": None, "grant": None, "note": None}
+               "audience": audience, "session": session, "filed_by": session, "created_utc": now(), "reason": None,
+               "flags": [], "decided_by": None, "decided_utc": None, "grant": None, "note": None}
         decided = [item for item in rows if item["state"] != "pending"]
         drop = {item["id"] for item in decided[:max(0, len(decided) - KEEP_DECIDED)]}
         rows = [item for item in rows if item["id"] not in drop] + [row]
+        audited(state, case_id, session=session, decision="grant_requested", request=row["id"], tool=tool,
+                arguments=arguments, audience=audience)
         save(state, case_id, rows)
-    runtime.audit(runtime.case_path(state, case_id), case=case_id, session=session, decision="grant_requested",
-                  request=row["id"], tool=tool, arguments=arguments, audience=audience)
     return dict(row), True
 
 
@@ -107,9 +125,9 @@ def note(state, case_id, request_id, reason, session, known):
         # The request's own artifact and address are shown to the approver, so they need no flag.
         named = {value for value in row["arguments"].values() if isinstance(value, str)}
         row["flags"] = sorted(tokens(text) - set(known) - named)[:32]
+        audited(state, case_id, session=session, decision="grant_need_noted", request=request_id,
+                flagged=len(row["flags"]))
         save(state, case_id, rows)
-    runtime.audit(runtime.case_path(state, case_id), case=case_id, session=session, decision="grant_need_noted",
-                  request=request_id, flagged=len(row["flags"]))
     return dict(row)
 
 
@@ -135,11 +153,26 @@ def decide(state, case_id, request_id, outcome, operator, grant=None, note_text=
             raise RequestError("request_already_decided")
         row.update(state=outcome, decided_by=operator, decided_utc=now(), grant=grant,
                    note=clean(note_text) if isinstance(note_text, str) and note_text.strip() else None)
+        audited(state, case_id, decision="grant_decided", request=request_id, outcome=outcome, decided_by=operator,
+                operator=operator, via="forge", **({"grant": grant} if grant else {}))
         save(state, case_id, rows)
-    runtime.audit(runtime.case_path(state, case_id), case=case_id, decision="grant_decided", request=request_id,
-                  outcome=outcome, decided_by=operator, operator=operator, via="forge",
-                  **({"grant": grant} if grant else {}))
     return dict(row)
+
+
+def deny_all(state, case_id, operator, note_text=None):
+    """Deny every pending request in one step. Returns the ids denied."""
+    with LOCK:
+        rows = load(state, case_id)
+        denied = [row for row in rows if row["state"] == "pending"]
+        stamp = now()
+        note_value = clean(note_text) if isinstance(note_text, str) and note_text.strip() else None
+        for row in denied:
+            row.update(state="denied", decided_by=operator, decided_utc=stamp, grant=None, note=note_value)
+        if denied:
+            audited(state, case_id, decision="grant_decided", requests=[row["id"] for row in denied],
+                    outcome="denied", decided_by=operator, operator=operator, via="forge")
+            save(state, case_id, rows)
+    return [row["id"] for row in denied]
 
 
 def public(row):

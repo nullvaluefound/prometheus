@@ -155,7 +155,7 @@ class LocalModelTests(unittest.TestCase):
         self.assertIn("evidence, native, review roles hold it", refused["guidance"])
         # The code-owned rules come after the role body, so they are the model's final instruction.
         system = self.sent[0]["messages"][0]["content"]
-        self.assertTrue(system.endswith(boundary.TAIL))
+        self.assertTrue(system.endswith(boundary.tail(False)))
         self.assertIn((runtime.ROOT / "agents" / "intake" / "AGENTS.md").read_text(encoding="utf-8").strip(), system)
         intercepted = [event for event in self.events() if event["decision"] == "intercepted"]
         self.assertEqual([(event["tool"], event["reason"], event["audience"]) for event in intercepted],
