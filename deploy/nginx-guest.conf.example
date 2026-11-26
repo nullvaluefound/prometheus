@@ -8,12 +8,10 @@ server {
     location ^~ /prometheus/ {
         allow 192.0.2.1;
         deny all;
-        auth_basic "Prometheus Forge";
-        auth_basic_user_file /etc/prometheus-forge/operators.htpasswd;
 
         client_max_body_size 1k;
         proxy_pass http://unix:/run/prometheus-forge/forge.sock:;
-        proxy_set_header X-Forge-Operator $remote_user;
+        proxy_set_header X-Forge-Operator "";
         proxy_set_header Authorization "";
         proxy_read_timeout 195s;
     }

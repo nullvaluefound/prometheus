@@ -12,7 +12,7 @@ import sys
 import tempfile
 import uuid
 
-from . import decoding, local_model, policy, runtime, server
+from . import accounts, decoding, local_model, policy, runtime, server
 from .case import atomic_json, hashes
 
 EXCERPTS = tuple(name for name in policy.TOOLS if name != "artifact_summary")
@@ -401,6 +401,38 @@ def hookup(args):
         emit({"command": command, "args": config, "cwd": str(runtime.ROOT), "env": env, "tool_timeout_seconds": 330})
 
 
+def forge_user(args):
+    """Manage Forge sign-in accounts. New and reset accounts get a one-time setup code, never a password."""
+    if args.action == "list":
+        return emit(accounts.listing(STATE))
+    if not args.user:
+        raise ValueError("Name the account")
+    known = {row["user"] for row in accounts.listing(STATE)}
+    if args.action == "add" and args.user in known:
+        raise ValueError("Account already exists. Use reset to issue a new setup code")
+    if args.action in ("reset", "remove", "signout") and args.user not in known:
+        raise ValueError("No such account")
+    if args.action == "remove":
+        accounts.remove(STATE, args.user)
+        return emit({"user": args.user, "decision": "removed"})
+    if args.action == "signout":
+        accounts.end_sessions(STATE, args.user)
+        return emit({"user": args.user, "decision": "sessions_ended"})
+    if args.code_file and args.code_file.exists():
+        raise ValueError("Setup code file already exists")
+    code = accounts.issue_setup(STATE, args.user)
+    result = {"user": args.user, "decision": "setup_issued", "expires_hours": accounts.SETUP_HOURS,
+              "setup_page": "<prefix>setup"}
+    if args.code_file:
+        fd = os.open(args.code_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+        with os.fdopen(fd, "w", encoding="ascii", newline="\n") as stream:
+            stream.write(code + "\n")
+        result["setup_code_file"] = str(args.code_file)
+    else:
+        result["setup_code"] = code
+    emit(result)
+
+
 def add_selector(parser):
     parser.add_argument("--address")
     parser.add_argument("--offset", type=int)
@@ -472,6 +504,11 @@ def make_parser():
     command("close", close_case)
     for name in ("pause", "resume"):
         command(name, change_scope)
+    users = command("forge-user", forge_user, False)
+    users.add_argument("action", choices=("add", "reset", "remove", "signout", "list"))
+    users.add_argument("user", nargs="?")
+    users.add_argument("--code-file", type=Path,
+                       help="Write the one-time setup code to this new file (mode 0600) instead of printing it")
     command("hookup", hookup).add_argument("--format", choices=("codex", "json"), default="codex")
     command("serve", lambda a: server.serve(STATE, a.case))
     model = command("ask", lambda a: print(local_model.chat(STATE, a.case, a.port, a.model, a.role, a.question)))

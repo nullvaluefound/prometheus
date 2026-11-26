@@ -1,6 +1,7 @@
-"""The Prometheus Forge, served over a private Unix socket to an authenticating proxy."""
+"""The Prometheus Forge, served over a private Unix socket behind a TLS proxy, with its own operator sign-in."""
 
 import argparse
+import collections
 import datetime as dt
 import html
 import json
@@ -9,17 +10,23 @@ import re
 import socket
 import socketserver
 import subprocess
+import time
 from http import HTTPStatus
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from . import policy, runtime, server
+from . import accounts, policy, runtime, server
 from .case import atomic_json
 
 BROWSER_ERRORS = (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError)
-OPERATOR = r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}"
 BASE_PATH = r"/(?:[a-z0-9-]+/)+"
+COOKIE = "prometheus_session"
+# Failed sign-ins and setup attempts across all clients. The proxy also limits each client address.
+FAILURE_WINDOW = 600
+FAILURE_LIMIT = 30
+FORM_LIMIT = 1024  # the public proxy caps request bodies at 1 KiB
 
 
 def esc(value):
@@ -159,13 +166,24 @@ def table(headings, rows, empty):
     return f'<div class="scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
 
 
-def shell(prefix, operator, body):
+def shell(prefix, operator, body, title="Forge"):
+    prefix = esc(prefix)
+    if operator:
+        account = (f'<nav class="operator"><a href="{prefix}account">{esc(operator)}</a>'
+                   f'<form class="inline" method="post" action="{prefix}logout"><button class="link">Sign out</button>'
+                   '</form></nav>')
+    else:
+        account = ""
     return f'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Forge · Prometheus</title><link rel="stylesheet" href="{esc(prefix)}forge.css"></head>
+<title>{esc(title)} · Prometheus</title><link rel="stylesheet" href="{prefix}forge.css"></head>
 <body><header><div class="identity"><span class="mark" aria-hidden="true">P</span><div><strong>Prometheus</strong>
-<span>Static malware analysis</span></div></div><span class="operator">{esc(operator)}</span></header>
-<main><h1>Forge</h1>{body}</main></body></html>'''
+<span>Static malware analysis</span></div></div>{account}</header>
+<main><h1>{esc(title)}</h1>{body}</main></body></html>'''
+
+
+def notice(message, error=True):
+    return f'<p class="{"error" if error else "notice"}" role="status">{esc(message)}</p>' if message else ""
 
 
 class Forge(socketserver.TCPServer):
@@ -179,7 +197,17 @@ class Forge(socketserver.TCPServer):
         self.prefix = prefix
         self.state = state
         self.visible = visible
+        self.failures = collections.deque()
         super().__init__(str(socket_path), Handler)
+
+    def throttled(self):
+        cutoff = time.monotonic() - FAILURE_WINDOW
+        while self.failures and self.failures[0] < cutoff:
+            self.failures.popleft()
+        return len(self.failures) >= FAILURE_LIMIT
+
+    def record_failure(self):
+        self.failures.append(time.monotonic())
 
     def get_request(self):
         connection, address = super().get_request()
@@ -195,25 +223,53 @@ class Handler(BaseHTTPRequestHandler):
         # The ingress owns access logging. Never log bodies or evidence in the app.
         return
 
-    def respond(self, status, content, content_type="text/html; charset=utf-8"):
-        data = content.encode("utf-8") if isinstance(content, str) else content
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
+    def send_common(self):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "same-origin")
         self.send_header("Content-Security-Policy",
                          "default-src 'none'; style-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+
+    def respond(self, status, content, content_type="text/html; charset=utf-8", cookie=None):
+        data = content.encode("utf-8") if isinstance(content, str) else content
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        if cookie is not None:
+            self.send_header("Set-Cookie", cookie)
+        self.send_common()
         self.end_headers()
         self.wfile.write(data)
 
+    def redirect(self, location, cookie=None):
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        if cookie is not None:
+            self.send_header("Set-Cookie", cookie)
+        self.send_common()
+        self.end_headers()
+
+    def cookie(self, value, max_age):
+        return (f"{COOKIE}={value}; Path={self.server.prefix}; Max-Age={max_age}; Secure; HttpOnly; "
+                "SameSite=Strict")
+
     def identity(self):
-        values = self.headers.get_all("X-Forge-Operator", [])
-        if len(values) == 1 and policy.match(values[0], OPERATOR):
-            return values[0]
-        self.respond(HTTPStatus.FORBIDDEN, "Authenticated ingress required", "text/plain; charset=utf-8")
-        return None
+        """Return the signed-in operator, or None. The proxy must not supply identity."""
+        values = self.headers.get_all("Cookie", [])
+        if len(values) != 1:
+            return None
+        try:
+            jar = SimpleCookie()
+            jar.load(values[0])
+        except CookieError:
+            return None
+        if COOKIE not in jar:
+            return None
+        try:
+            return accounts.session_user(self.server.state, jar[COOKIE].value)
+        except BROWSER_ERRORS:
+            return None
 
     def plain(self, status, message):
         self.respond(status, message, "text/plain; charset=utf-8")
@@ -222,18 +278,58 @@ class Handler(BaseHTTPRequestHandler):
         return {name: status for name, status in case_rows(self.server.state, self.server.visible)}
 
     def do_GET(self):
-        if not (operator := self.identity()):
-            return
         prefix = self.server.prefix
         if self.path == prefix + "forge.css":
             return self.respond(HTTPStatus.OK, Path(__file__).with_name("forge.css").read_bytes(), "text/css; charset=utf-8")
+        if self.path == prefix + "login":
+            return self.login_page()
+        if self.path == prefix + "setup":
+            return self.setup_page()
+        if not self.path.startswith(prefix):
+            return self.plain(HTTPStatus.NOT_FOUND, "Not found")
+        if not (operator := self.identity()):
+            return self.redirect(prefix + "login")
         if self.path == prefix:
             return self.dashboard(operator)
+        if self.path == prefix + "account":
+            return self.account_page(operator)
         if self.path.startswith(prefix + "cases/"):
             case_id = self.path[len(prefix + "cases/"):]
             if policy.match(case_id, policy.CASE_ID) and case_id in self.listed_cases():
                 return self.case_page(operator, case_id)
         self.plain(HTTPStatus.NOT_FOUND, "Not found")
+
+    def login_page(self, message="", status=HTTPStatus.OK, username=""):
+        prefix = esc(self.server.prefix)
+        body = f'''<section class="auth">{notice(message)}<form method="post" action="{prefix}login">
+<label>Username<input name="username" value="{esc(username)}" autocomplete="username" maxlength="32" required autofocus></label>
+<label>Password<input name="password" type="password" autocomplete="current-password" maxlength="72" required></label>
+<button>Sign in</button></form>
+<p class="muted">New account or reset? <a href="{prefix}setup">Use your one-time setup code</a>.</p></section>'''
+        self.respond(status, shell(self.server.prefix, None, body, "Sign in"))
+
+    def setup_page(self, message="", status=HTTPStatus.OK, username=""):
+        prefix = esc(self.server.prefix)
+        body = f'''<section class="auth">{notice(message)}
+<p class="muted">An operator issues setup codes with <code>re_harness.cli forge-user</code>. Codes work once and expire after {accounts.SETUP_HOURS} hours.</p>
+<form method="post" action="{prefix}setup">
+<label>Username<input name="username" value="{esc(username)}" autocomplete="username" maxlength="32" required autofocus></label>
+<label>Setup code<input name="code" autocomplete="one-time-code" maxlength="64" required></label>
+<label>New password<input name="password" type="password" autocomplete="new-password" minlength="{accounts.MIN_PASSWORD}" maxlength="72" required></label>
+<label>Confirm password<input name="confirm" type="password" autocomplete="new-password" minlength="{accounts.MIN_PASSWORD}" maxlength="72" required></label>
+<button>Set password</button></form><p class="muted"><a href="{prefix}login">Back to sign in</a></p></section>'''
+        self.respond(status, shell(self.server.prefix, None, body, "Set your password"))
+
+    def account_page(self, operator, message="", error=True, status=HTTPStatus.OK):
+        prefix = esc(self.server.prefix)
+        body = f'''<p class="crumb"><a href="{prefix}">Forge</a> / Account</p><section class="auth">{notice(message, error)}
+<h2>Change password</h2><form method="post" action="{prefix}account">
+<label>Current password<input name="current" type="password" autocomplete="current-password" maxlength="72" required></label>
+<label>New password<input name="password" type="password" autocomplete="new-password" minlength="{accounts.MIN_PASSWORD}" maxlength="72" required></label>
+<label>Confirm new password<input name="confirm" type="password" autocomplete="new-password" minlength="{accounts.MIN_PASSWORD}" maxlength="72" required></label>
+<button>Change password</button></form>
+<p class="muted">Use at least {accounts.MIN_PASSWORD} characters. Changing your password signs out your other sessions.</p></section>'''
+        self.respond(status, shell(self.server.prefix, operator, body, "Account"))
 
     def case_link(self, name):
         return f'<a href="{esc(self.server.prefix)}cases/{esc(name)}">{esc(name)}</a>'
@@ -351,28 +447,102 @@ class Handler(BaseHTTPRequestHandler):
 <section class="block"><h2>Recent audit</h2>{audit_html}</section>'''
         self.respond(HTTPStatus.OK, shell(self.server.prefix, operator, body))
 
-    def read_form(self, fields):
+    def read_form(self, fields, limit=512):
         """Parse one small urlencoded form with exactly the expected single-valued fields."""
         lengths = self.headers.get_all("Content-Length", [])
-        if (len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,3}", lengths[0]) or
-                not 1 <= int(lengths[0]) <= 512 or self.headers.get("Transfer-Encoding") or
+        if (len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,4}", lengths[0]) or
+                not 1 <= int(lengths[0]) <= limit or self.headers.get("Transfer-Encoding") or
                 self.headers.get_content_type() != "application/x-www-form-urlencoded"):
             raise ValueError("invalid framing")
         form = parse_qs(self.rfile.read(int(lengths[0])).decode("ascii"), max_num_fields=len(fields),
-                        keep_blank_values=True, strict_parsing=True)
+                        keep_blank_values=True, strict_parsing=True, encoding="utf-8", errors="strict")
         if set(form) != set(fields) or any(len(values) != 1 for values in form.values()):
             raise ValueError("invalid form")
         return {key: values[0] for key, values in form.items()}
 
     def do_POST(self):
-        if not (operator := self.identity()):
-            return
-        routes = {self.server.prefix + "inspect": self.inspect, self.server.prefix + "pause": self.pause}
-        if self.path not in routes:
+        prefix = self.server.prefix
+        public = {prefix + "login": self.login, prefix + "setup": self.complete_setup}
+        private = {prefix + "inspect": self.inspect, prefix + "pause": self.pause,
+                   prefix + "logout": self.logout, prefix + "account": self.change_password}
+        if self.path not in public and self.path not in private:
             return self.plain(HTTPStatus.NOT_FOUND, "Not found")
+        # Every form, sign-in included, must come from the Forge's own origin.
         if self.headers.get_all("Origin", []) != [self.server.origin]:
             return self.plain(HTTPStatus.FORBIDDEN, "Origin rejected")
-        routes[self.path](operator)
+        if self.path in public:
+            return public[self.path]()
+        if not (operator := self.identity()):
+            return self.plain(HTTPStatus.FORBIDDEN, "Sign in required")
+        private[self.path](operator)
+
+    def login(self):
+        if self.server.throttled():
+            return self.login_page("Too many failed attempts. Try again in a few minutes.", HTTPStatus.TOO_MANY_REQUESTS)
+        try:
+            form = self.read_form(("username", "password"), FORM_LIMIT)
+        except (ValueError, UnicodeError, OSError):
+            return self.plain(HTTPStatus.BAD_REQUEST, "Invalid sign-in form")
+        username = form["username"].strip().lower()
+        try:
+            epoch = accounts.authenticate(self.server.state, username, form["password"])
+            token = accounts.issue_session(self.server.state, username, epoch) if epoch is not None else None
+        except BROWSER_ERRORS:
+            return self.plain(HTTPStatus.SERVICE_UNAVAILABLE, "Account service unavailable")
+        if token is None:
+            self.server.record_failure()
+            return self.login_page("The username or password is not correct.", HTTPStatus.UNAUTHORIZED,
+                                   username if accounts.valid_username(username) else "")
+        self.redirect(self.server.prefix, self.cookie(token, accounts.SESSION_HOURS * 3600))
+
+    def complete_setup(self):  # never name this setup(): BaseRequestHandler calls setup() to open the socket
+        if self.server.throttled():
+            return self.setup_page("Too many failed attempts. Try again in a few minutes.", HTTPStatus.TOO_MANY_REQUESTS)
+        try:
+            form = self.read_form(("username", "code", "password", "confirm"), FORM_LIMIT)
+        except (ValueError, UnicodeError, OSError):
+            return self.plain(HTTPStatus.BAD_REQUEST, "Invalid setup form")
+        username = form["username"].strip().lower()
+        shown = username if accounts.valid_username(username) else ""
+        if form["password"] != form["confirm"]:
+            return self.setup_page("The passwords do not match.", HTTPStatus.BAD_REQUEST, shown)
+        try:
+            epoch = accounts.complete_setup(self.server.state, username, form["code"].strip(), form["password"])
+            token = accounts.issue_session(self.server.state, username, epoch)
+        except accounts.AccountError as error:
+            if "setup code" in str(error):
+                self.server.record_failure()
+            return self.setup_page(str(error), HTTPStatus.BAD_REQUEST, shown)
+        except BROWSER_ERRORS:
+            return self.plain(HTTPStatus.SERVICE_UNAVAILABLE, "Account service unavailable")
+        self.redirect(self.server.prefix, self.cookie(token, accounts.SESSION_HOURS * 3600))
+
+    def logout(self, operator):
+        """End every session of this operator. The form carries no fields, so the body is never read."""
+        try:
+            accounts.end_sessions(self.server.state, operator)
+        except BROWSER_ERRORS:
+            pass
+        self.redirect(self.server.prefix + "login", self.cookie("", 0))
+
+    def change_password(self, operator):
+        try:
+            form = self.read_form(("current", "password", "confirm"), FORM_LIMIT)
+        except (ValueError, UnicodeError, OSError):
+            return self.plain(HTTPStatus.BAD_REQUEST, "Invalid password form")
+        if form["password"] != form["confirm"]:
+            return self.account_page(operator, "The new passwords do not match.", status=HTTPStatus.BAD_REQUEST)
+        try:
+            epoch = accounts.change_password(self.server.state, operator, form["current"], form["password"])
+            token = accounts.issue_session(self.server.state, operator, epoch)
+        except accounts.AccountError as error:
+            return self.account_page(operator, str(error), status=HTTPStatus.BAD_REQUEST)
+        except BROWSER_ERRORS:
+            return self.plain(HTTPStatus.SERVICE_UNAVAILABLE, "Account service unavailable")
+        content = shell(self.server.prefix, operator, f'<p class="crumb"><a href="{esc(self.server.prefix)}">Forge</a> / '
+                        f'Account</p><section class="auth">{notice("Password changed. Other sessions are signed out.", False)}'
+                        '</section>', "Account")
+        self.respond(HTTPStatus.OK, content, cookie=self.cookie(token, accounts.SESSION_HOURS * 3600))
 
     def inspect(self, operator):
         try:
