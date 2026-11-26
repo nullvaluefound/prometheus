@@ -245,6 +245,7 @@ export interface CandidateCheck {
   result: CheckResult;
   problems: { code: string; ref: string | null }[];
   sources?: ("tool_output" | "sample_content")[];
+  grounded?: boolean;
   utc: string;
 }
 

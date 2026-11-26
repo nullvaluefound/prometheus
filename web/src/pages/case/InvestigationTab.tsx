@@ -339,8 +339,14 @@ function LeadsPanel({ ctx, data, reload }: { ctx: CaseContext; data: Investigati
 }
 
 /** Where a fact's evidence came from, set by the Forge: a tool's own result, or content the sample's author controls. */
-export function SourceBadge({ sources }: { sources: string[] }) {
+export function SourceBadge({ sources, grounded }: { sources: string[]; grounded?: boolean }) {
   if (sources.length === 0) return null;
+  if (sources.includes("tool_output") && grounded === false)
+    return (
+      <Badge tone="warn" title="Some address in this claim is shown only by sample content, so it cannot answer a question">
+        not grounded
+      </Badge>
+    );
   if (sources.includes("tool_output")) return <Badge tone="muted">tool output</Badge>;
   if (sources.includes("sample_content"))
     return (

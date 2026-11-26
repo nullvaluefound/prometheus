@@ -116,7 +116,7 @@ function CandidateCard({ ctx, candidate, reload }: { ctx: CaseContext; candidate
             {CHECK_LABEL[check.result] ?? txt(check.result)}
           </Badge>
         )}
-        {check && <SourceBadge sources={list<string>(check.sources)} />}
+        {check && <SourceBadge sources={list<string>(check.sources)} grounded={check.grounded} />}
         {verdict && <Badge tone={verdict.verdict === "supported" ? "ok" : "warn"}>review: {txt(verdict.verdict)}</Badge>}
         <Badge tone="muted" title="Written by a model. Untrusted text.">
           model, {txt(candidate.audience)}

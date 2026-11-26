@@ -351,6 +351,17 @@ class DerivedFieldTests(CaseState):
                                                   evidence=[reply["evidence_id"]])))
         self.assertEqual(claim["check"]["result"], "passed")
 
+    def test_no_section_index_when_sections_are_missing_and_va_wraps_like_the_loader(self):
+        sections = [{"rva": "0x1000", "raw_offset": 512, "raw_size": 512, "virtual_size": 4096, "flags": "0x60000020",
+                     "entropy": 5.1}]
+        pe = {"parsed": True, "sections_count": 200, "import_libraries_count": 1, "certificate_bytes": 0,
+              "machine": "0x14c", "entry_rva": "0x20000", "image_base": "0xffff0000", "overlay_offset": None,
+              "sections": sections}
+        reply = self.summarize({"size": 16, "format_hint": "PE candidate", "strings_count": 0,
+                                "strings_truncated": False, "pe": pe})
+        # The entry may be in one of the 199 sections not listed, so no index; a 32-bit VA wraps at 2**32.
+        self.assertEqual(reply["derived"], {"entry_va": "0x10000"})
+
     def test_elf_entry_in_hex(self):
         reply = self.summarize({"size": 16, "format_hint": "ELF", "strings_count": 0, "strings_truncated": False,
                                 "elf": {"elf_class": 2, "data_encoding": 1, "machine": 62, "e_type": 3,
@@ -431,6 +442,89 @@ class FactRuleTests(ReviewFixTests):
             investigation.propose_answer(self.state, "review", "R1", question, ["C1"], {})
         answered = investigation.propose_answer(self.state, "review", "R1", question, ["C1", "C2"], {})
         self.assertEqual(answered["state"], "answer_proposed")
+
+
+class FactRuleReviewTests(FactRuleTests):
+    """The third review's findings on the fact rules."""
+
+    def run_question(self):
+        question = investigation.add_question(self.state, "review", "Imports?", "Names", [DIGEST], "analyst")["id"]
+
+        def seed(data):
+            data["run"] = {"id": "R1", "state": "running", "questions": [question]}
+        investigation.update(self.state, "review", seed)
+        return question
+
+    def propose(self, broker, claim, kind="observed", **fields):
+        return self.reply(broker.call(ask("propose_finding", claim=claim, kind=kind, confidence="high",
+                                          artifacts=[DIGEST], **fields)))
+
+    def test_a_proposal_with_new_evidence_is_not_a_duplicate(self):
+        summary = self.summary_evidence()
+        broker = self.broker()
+        failed = self.propose(broker, "Entry point 0x401000.")
+        self.assertEqual({problem["code"] for problem in failed["check"]["problems"]},
+                         {"address_not_in_evidence", "observed_without_evidence"})
+        fixed = self.propose(broker, "Entry point 0x401000.", evidence=[summary])
+        self.assertEqual(fixed["check"]["result"], "passed")
+        self.assertEqual(self.propose(broker, "Entry point 0x401000.", evidence=[summary])["reason"],
+                         "duplicate_proposal")
+        self.assertEqual(self.propose(broker, "Entry point 0x401000.", "inferred", evidence=[summary])["status"],
+                         "proposed")
+
+    def test_a_finding_rests_on_no_more_evidence_than_a_recorded_finding_keeps(self):
+        self.assertEqual(investigation.MAX_FINDING_EVIDENCE, cli.MAX_EVIDENCE)
+        ids = [evidence.record(self.folder, "artifact_summary", {"artifact": DIGEST}, {"page": index}, False,
+                               "local", [], "t" * 32, "s" * 32) for index in range(17)]
+        broker = self.broker()
+        broker.call(ask("record_observation", kind="inferred", text="Page sixteen.", artifact=DIGEST,
+                        evidence=ids[16:]))
+        refused = self.propose(broker, "Seventeen pages.", "inferred", evidence=ids[:16], observations=["O1"])
+        self.assertEqual(refused["reason"], "too_much_evidence")
+        self.assertEqual(self.propose(broker, "Sixteen pages.", "inferred", evidence=ids[:16])["status"], "proposed")
+
+    def test_evidence_about_another_artifact_shows_nothing(self):
+        other = evidence.record(self.folder, "artifact_summary", {"artifact": OTHER}, {"entry": "0x401000"}, False,
+                                "local", [], "t" * 32, "s" * 32)
+        broker = self.broker()
+        refused = self.reply(broker.call(ask("record_observation", kind="observed", text="Entry point 0x401000.",
+                                             artifact=DIGEST, evidence=[other])))
+        self.assertEqual(refused["reason"], "evidence_other_artifact")
+        reply = self.propose(broker, "Entry point 0x401000.", evidence=[other])
+        self.assertEqual([problem["code"] for problem in reply["check"]["problems"]],
+                         ["evidence_other_artifact", "address_not_in_evidence"])
+
+    def test_granted_text_is_sample_content_whatever_the_tool(self):
+        self.assertEqual([review.source_of({"tool": tool, "excerpt": excerpt}) for tool, excerpt in (
+            ("ghidra_functions", True), ("ghidra_decompile", True), ("artifact_strings", True),
+            ("ghidra_functions", False), ("ghidra_xrefs", False), ("capa_triage", False))],
+            ["sample_content"] * 3 + ["tool_output"] * 3)
+
+    def test_an_address_only_sample_content_shows_does_not_ground_an_answer(self):
+        names, summary = self.sample_evidence(), self.summary_evidence()
+        question = self.run_question()
+        broker = self.broker()
+        broker.released_grants.add("g" * 32)
+        imported = self.propose(broker, "Imports ExitProcess at 0x2040.", evidence=[names, summary])
+        entry = self.propose(broker, "Entry point 0x401000; imports ExitProcess.", evidence=[names, summary])
+        rows = {row["id"]: row["check"] for row in investigation.load(self.state, "review")["candidates"]}
+        self.assertEqual([(rows[reply["candidate"]]["result"], rows[reply["candidate"]]["grounded"])
+                          for reply in (imported, entry)], [("passed", False), ("passed", True)])
+        with self.assertRaisesRegex(investigation.InvestigationError, "answer_needs_tool_output"):
+            investigation.propose_answer(self.state, "review", "R1", question, [imported["candidate"]], {})
+        answered = investigation.propose_answer(self.state, "review", "R1", question,
+                                                [imported["candidate"], entry["candidate"]], {})
+        self.assertEqual(answered["state"], "answer_proposed")
+
+    def test_the_audit_keeps_what_a_proposal_rests_on(self):
+        summary = self.summary_evidence()
+        broker = self.broker()
+        broker.call(ask("record_observation", kind="observed", text="Entry point 0x401000.", artifact=DIGEST,
+                        evidence=[summary]))
+        self.propose(broker, "The entry point is 0x401000.", observations=["O1"])
+        written = [event for event in self.audit()
+                   if event["decision"] == "investigation_write" and event["tool"] == "propose_finding"]
+        self.assertEqual((written[0]["arguments"]["observations"], written[0]["cited_evidence"]), (["O1"], [summary]))
 
 
 class ReviewRunTests(CaseState):

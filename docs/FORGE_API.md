@@ -139,7 +139,9 @@ interface Candidate {
   limitations: string | null; counterevidence: string | null; question: string | null; lead: string | null;
   observations?: string[];     // observation ids the proposal rests on; their evidence is in evidence
   check: { result: "passed" | "failed" | "not_assessed"; problems: { code: string; ref: string | null }[];
-           sources?: ("tool_output" | "sample_content")[]; utc: string } | null;
+           sources?: ("tool_output" | "sample_content")[];
+           grounded?: boolean;   // a tool_output result about its artifacts shows every address in the claim
+           utc: string } | null;
   verdicts: { verdict: "supported" | "unsupported" | "insufficient"; rationale: string; model: string;
               utc: string; operator: string }[];
   finding: string | null; decided_by: string | null; decided_utc: string | null; note: string | null;

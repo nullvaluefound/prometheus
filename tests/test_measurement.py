@@ -205,6 +205,24 @@ class SkillTests(unittest.TestCase):
                     with self.subTest(skill=name, token=token):
                         self.assertIn(token, real)
 
+    def test_a_role_s_skills_point_only_at_skills_it_can_load(self):
+        """A skill may send a role to another skill only if the role can load it, unless that line is a step for a
+        tool the role lacks (which the skill tells it to skip)."""
+        import re
+        from re_harness import investigation, local_model, policy
+        known = {path.parent.name for path in skills.folder().glob("*/SKILL.md")}
+        real = set(policy.TOOLS) | set(investigation.TOOLS)
+        for role, names in skills.VISIBLE.items():
+            tools = set(local_model.ROLES[role])
+            for name in names:
+                for line in skills.read(name)["body"].splitlines():
+                    for target in (set(re.findall(r"`([a-z]+(?:-[a-z]+)+)`", line)) & known) - set(names):
+                        lacked = {tool for tool in re.findall(r"`([a-z_]+)`", line) if tool in real - tools}
+                        with self.subTest(role=role, skill=name, target=target):
+                            self.assertTrue(lacked, line)
+        self.assertNotIn("static-triage", skills.listing("review"))
+        self.assertIn("Load `static-triage` first", skills.listing("evidence"))
+
     def test_pinned_skills_load_into_the_prompt_and_leave_the_listing(self):
         with patch.dict(skills.PINNED, {"evidence": ("static-triage",)}):
             text = skills.listing("evidence")

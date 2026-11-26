@@ -28,7 +28,7 @@ Put everything one result showed into **one** observation: a one-line summary fi
 - **Record negative results too.** "capa found no anti-analysis rules" or "no network imports among the 12 imported functions" is a fact. Mark it `observed` only if you saw the whole result (no `has_more`); otherwise `inferred`.
 - The reply gives the observation id (O1, O2 …). Keep it for the finding.
 
-The Forge records where each fact came from, from the evidence you cite: `tool_output` (header, capa, Ghidra), `sample_content` (string text, import names, YARA-matched bytes: content the sample's author controls) or `inference` (no evidence). You do not set it.
+The Forge records where each fact came from, from the evidence you cite: `tool_output` (header numbers, capa, Ghidra's function addresses and cross-references), `sample_content` (any result the operator granted: string text, import and symbol names, YARA-matched bytes, decompiled code; content the sample's author controls) or `inference` (no evidence). You do not set it. Cite only results about the artifact you name: a result about another artifact is refused with `evidence_other_artifact`.
 
 ## propose_finding
 
@@ -63,11 +63,13 @@ Every proposal is checked. It fails when:
 - **an address in the claim does not appear in the cited evidence.** Copy addresses from the result; never convert or add them yourself. `artifact_summary` gives `derived.entry_va` (the entry point's virtual address, such as `0x401000`), `entry_rva` (relative, such as `0x1000`) and, for ELF, `derived.e_entry_hex`. A failed check names the address it could not find (`ref`): fix that value, do not propose the same claim again;
 - kind is `observed` or `corroborated` with no evidence.
 
-The reply gives the result (`passed`, `failed` or `not_assessed`) and the failing problem codes. If it failed, fix the claim and propose again.
+The reply gives the result (`passed`, `failed` or `not_assessed`) and each failing problem: its `code` and the value it is about (`ref`). If it failed, fix that value, its evidence or its observations, and propose again. The same proposal twice is refused with `duplicate_proposal`.
+
+A finding can rest on at most 16 evidence ids, counting those its observations bring.
 
 ## Sample content alone proves nothing
 
-String text, import names and matched bytes are written by the sample's author, who can plant them. A proposal that rests only on them is shown as "sample content only", and it cannot answer a question by itself. Back it with a tool's own result: the header, a capa match, or Ghidra's analysis of the code that uses the string or import.
+String text, import and symbol names, matched bytes and decompiled code come from what the sample's author wrote, and an author can plant them. A proposal that rests only on them is shown as "sample content only", and it cannot answer a question by itself. To answer, a proposal must cite a tool's own result about the same artifact (the header, a capa match, or Ghidra's function list or cross-references), and every address in its claim must appear in such a result.
 
 ## Good and bad
 

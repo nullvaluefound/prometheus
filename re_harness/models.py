@@ -577,13 +577,15 @@ def converse(state, case_id, config, settings, history, message, operator, plan=
     stop = None
     analyzed = recorded = nudged = False
     try:
-        for _ in range(MAX_TURNS):
+        for index in range(MAX_TURNS):
             broker.current_scope()
             stop = plan.interrupt() if plan.interrupt else None
             if stop:
                 break
             text, calls = adapter.step()
-            if not calls and plan.require_record and analyzed and not recorded and not nudged:
+            # Only with a turn left to record in: on the last turn the nudge would meet the tool-free wrap-up.
+            if (not calls and plan.require_record and analyzed and not recorded and not nudged
+                    and index < MAX_TURNS - 1):
                 nudged = True
                 rows.append({"role": "assistant", "text": text or "(no answer)", "model": config["model"]})
                 runtime.audit(broker.folder, case=case_id, session=broker.session, decision="record_nudged",

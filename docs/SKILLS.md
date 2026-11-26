@@ -15,7 +15,9 @@ Skills advise; code enforces. Every rule that must hold is in the broker, the in
 | `import-analysis` | imports, API families to capabilities and ATT&CK, the caveats that change the reading | native, evidence, review |
 | `string-triage` | string locations, which page to ask for, classifying recovered strings safely | intake, native, evidence |
 | `capa-yara` | reading capa and YARA results, warnings, corroboration | all |
-| `function-analysis` | choosing a function, cross-references, decompilation patterns and constants | native |
+| `function-analysis` | choosing a function, cross-references, decompilation patterns and constants | native, evidence |
+
+Skills that point at a tool or skill a role lacks say to skip that step, and a test checks that every skill a role can load names only skills that role can load, unless the line names a tool the role lacks.
 
 `static-malware-re`, `static-re-native` and `static-re-evidence` describe the operator workflow for external MCP clients and stay visible to the roles that had them.
 
@@ -37,9 +39,9 @@ A test (`tests/test_measurement.py`) refuses a skill that names a tool the model
 ARTEX registers facts with `record_fact`: a confidence (`observed` or `inferred`) and a source, where content the target itself returned (`target_response`) never proves a goal. Prometheus keeps the same method and makes more of it code:
 
 - `record_observation` is the fact. `observed` needs evidence ids, which name exact tool results by hash, and every address and SHA-256 in its text must appear in that evidence.
-- The Forge sets the source from the cited evidence: `sample_content` (string text, import names, YARA-matched bytes: what the sample's author controls), `tool_output` (header, capa, Ghidra), or `inference`.
+- The Forge sets the source from the cited evidence: `sample_content` (any result released under an excerpt grant: string text, import and symbol names, YARA-matched bytes, decompiled code), `tool_output` (header numbers, capa, Ghidra's function addresses and cross-references), or `inference`. Evidence about another artifact counts for nothing.
 - `propose_finding` may cite observations, so a finding rests on facts and facts on evidence.
-- `propose_answer` refuses an answer that rests only on `sample_content`.
+- `propose_answer` needs a grounded proposal: one citing a `tool_output` result about its artifacts, with every address in its claim shown by such a result. The check cannot attribute each word of a claim to a result, so the operator still reads every answer.
 - Skills teach one consolidated fact per tool result, and recording negative results.
 
 ## Measuring a skill change

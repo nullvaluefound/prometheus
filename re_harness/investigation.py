@@ -152,6 +152,9 @@ def validate(name, arguments):
 
 
 TEXT_FIELDS = ("title", "text", "claim", "limitations", "counterevidence")
+# A recorded finding keeps at most cli.MAX_EVIDENCE evidence locators, so a proposal may rest on no more: otherwise
+# the evidence that proves it could be cut when the operator records it.
+MAX_FINDING_EVIDENCE = 16
 
 
 def audit_fields(values):
@@ -159,7 +162,7 @@ def audit_fields(values):
     kept = {key: values[key] for key in ("artifact", "address", "offset", "lead", "question", "kind", "confidence",
                                          "limit")
             if key in values}
-    for key in ("artifacts", "evidence"):
+    for key in ("artifacts", "evidence", "observations"):
         if key in values:
             kept[key] = values[key]
     texts = [values[key] for key in TEXT_FIELDS if values.get(key)] + list(values.get("items") or [])
@@ -315,7 +318,7 @@ class Context:
                 "grants": sorted(set(self.grants) | set(extra)), "utc": now()}
 
     def cited(self, evidence_ids):
-        """Check cited evidence and return the grants it was released under (see cited_sources for provenance).
+        """Check cited evidence and return the grants it was released under (review.source_of gives provenance).
 
         Evidence that carries an excerpt counts only while every grant it was released under is active for this
         session's audience. Otherwise a model without the grant could test guesses about the excerpt against the
@@ -380,7 +383,8 @@ def apply(name, values, context):
             raise InvestigationError("observed_needs_evidence")
         released = context.cited(cited)
         # An observed fact is held to what its evidence shows, like a proposal (ARTEX: write only what you saw).
-        problems, _, sources = review.references(context.case_folder, values["text"], cited, context.admitted())
+        problems, _, sources, _ = review.references(context.case_folder, values["text"], cited, context.admitted(),
+                                                    [values["artifact"]])
         if values["kind"] == "observed" and problems:
             raise InvestigationError(problems[0]["code"])
 
@@ -408,7 +412,9 @@ def apply(name, values, context):
         stored = load(state, case_id)["observations"]
         facts = [find(stored, observation, "unknown_observation") for observation in values.get("observations") or []]
         evidence_ids = list(dict.fromkeys((values.get("evidence") or []) +
-                                          [item for fact in facts for item in fact.get("evidence") or []]))[:32]
+                                          [item for fact in facts for item in fact.get("evidence") or []]))
+        if len(evidence_ids) > MAX_FINDING_EVIDENCE:
+            raise InvestigationError("too_much_evidence")
         released = context.cited(evidence_ids)
         values = {**values, "evidence": evidence_ids}
         manifest = context.admitted()  # read before the lock: it can start a ledger Apprentice
@@ -419,7 +425,9 @@ def apply(name, values, context):
                     find(data[rows], values[key], reason)
             if len(data["candidates"]) >= MAX_CANDIDATES:
                 raise InvestigationError("too_many_candidates")
-            if any(row.get("claim") == values["claim"] and row.get("session") == context.session
+            # The same proposal again from the same session gets the same check: refuse it. A changed claim, kind,
+            # artifact list, evidence or observation list is a new attempt, as the guidance asks for.
+            if any(row.get("session") == context.session and proposal_key(row) == proposal_key(values)
                    for row in data["candidates"]):
                 raise InvestigationError("duplicate_proposal")
             row = {"id": next_id(data, "C"), "state": "proposed",
@@ -436,8 +444,13 @@ def apply(name, values, context):
         # may see: excerpt evidence needs active grants to be cited, so naming the failing value leaks nothing.
         return ({"status": "proposed", "candidate": candidate,
                  "check": {"result": result["result"], "problems": result["problems"][:8]}},
-                {"candidate": candidate, "check": result["result"]}, taint)
+                {"candidate": candidate, "check": result["result"], "cited_evidence": evidence_ids}, taint)
     raise InvestigationError("unknown_tool")
+
+
+def proposal_key(row):
+    return (row.get("claim"), row.get("kind"), tuple(sorted(row.get("artifacts") or [])),
+            tuple(sorted(row.get("evidence") or [])), tuple(sorted(row.get("observations") or [])))
 
 
 def overview(data, offset, limit, active, taint):
@@ -602,8 +615,10 @@ def add_verdict(state, case_id, candidate_id, verdict):
 def propose_answer(state, case_id, run_id, question_id, candidate_ids, stamp, case_folder=None):
     """Mark a run question answer_proposed, only with proposals whose check passed and that cite its artifacts.
 
-    An answer also needs at least one cited proposal that rests on a tool's own result, not only on content the
-    sample's author controls (ARTEX's prove_goal rule for target_response).
+    An answer also needs at least one cited proposal that is grounded (review.references): it cites a tool's own
+    result about its artifacts, and every address in its claim is shown by such a result, not only by content the
+    sample's author controls (ARTEX's prove_goal rule for target_response). The check cannot tell which words of a
+    claim rest on which result, so the operator still reads every answer.
 
     The marker is advice to the operator: it records no finding, labels no proposal, and only the operator closes
     the question.
@@ -622,21 +637,18 @@ def propose_answer(state, case_id, run_id, question_id, candidate_ids, stamp, ca
         if question["state"] not in ("open", "answer_proposed"):
             raise InvestigationError("question_not_open")
         named = set(question.get("artifacts") or [])
-        sources = set()
+        supported = False
         for candidate_id in candidate_ids:
             row = find(data["candidates"], candidate_id, "unknown_candidate")
             if row.get("state") == "rejected" or (row.get("check") or {}).get("result") != "passed":
                 raise InvestigationError("candidate_check_not_passed")
             if not named & set(row.get("artifacts") or []):
                 raise InvestigationError("candidate_not_for_question")
-            known = (row.get("check") or {}).get("sources")
-            if known is None:  # proposed before checks recorded sources: read them from its evidence
-                from . import review  # review imports this module
-                known = [review.source_of(evidence.load(case_folder, item)) for item in row.get("evidence") or []
-                         if evidence.exists(case_folder, item)]
-            sources.update(known)
+            # Recomputed from the hashed evidence every time, so proposals checked by an older version count too.
+            from . import review  # review imports this module
+            supported = supported or review.grounded(case_folder, row)
         # ARTEX's prove_goal rule: content the sample's author controls never proves an answer alone.
-        if "tool_output" not in sources:
+        if not supported:
             raise InvestigationError("answer_needs_tool_output")
         question["state"] = "answer_proposed"
         question["answer"] = {"candidates": list(dict.fromkeys(candidate_ids)), "run": run_id, "author": "model",

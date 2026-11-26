@@ -212,22 +212,28 @@ def imports_page(value, limit):
             "total_rows": number(value["total_rows"], policy.MAX_IMPORT_ROWS), "limitations": list(limitations)}
 
 
+PE32_MACHINES = frozenset({"0x14c", "0x1c0", "0x1c2", "0x1c4"})  # i386 and 32-bit ARM: 32-bit pointers
+
+
 def derived(reply):
     """Arithmetic on validated artifact_summary fields, so a model never has to convert or add addresses itself.
 
-    PE: the entry point's virtual address (image_base + entry_rva) and the index of the section that holds it.
+    PE: the entry point's virtual address (image_base + entry_rva, wrapped as the loader's pointer width wraps it)
+    and the index of the section that holds it, or None when no section does. The index is left out when the
+    header lists more sections than the summary carries, since the entry may be in one not shown.
     ELF: the entry address in hex. No judgments, only numbers the projected fields already imply.
     """
     summary = reply.get("summary") if isinstance(reply.get("summary"), dict) else {}
     found = {}
     pe = summary.get("pe")
     if isinstance(pe, dict) and pe.get("parsed") and "entry_rva" in pe:
-        entry = int(pe["entry_rva"], 16)
-        found["entry_va"] = hex(int(pe["image_base"], 16) + entry)
-        found["entry_section"] = next((index for index, section in enumerate(pe["sections"])
-                                       if int(section["rva"], 16) <= entry <
-                                       int(section["rva"], 16) + max(section["virtual_size"], section["raw_size"])),
-                                      None)
+        entry, base = int(pe["entry_rva"], 16), int(pe["image_base"], 16)
+        width = 32 if pe.get("machine") in PE32_MACHINES and base <= 0xFFFFFFFF else 64
+        found["entry_va"] = hex((base + entry) % (1 << width))
+        if pe.get("sections_count") == len(pe["sections"]):
+            found["entry_section"] = next((index for index, section in enumerate(pe["sections"])
+                                           if int(section["rva"], 16) <= entry < int(section["rva"], 16)
+                                           + max(section["virtual_size"], section["raw_size"])), None)
     elf = summary.get("elf")
     if isinstance(elf, dict) and "e_entry" in elf:
         found["e_entry_hex"] = hex(elf["e_entry"])

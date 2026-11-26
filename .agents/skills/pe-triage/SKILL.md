@@ -39,7 +39,7 @@ description: How to read artifact_summary for a Windows PE file (format_hint "PE
 | `overlay_offset` set | "data appended after the last section" | weak |
 | `certificate_bytes` > 0 | "a signature blob is present" | weak: never write "signed" or "trusted" |
 
-**Entry point section:** `derived.entry_section` is the index of the section that holds the entry point (`null`: outside every section).
+**Entry point section:** `derived.entry_section` is the index of the section that holds the entry point (`null`: outside every section). It is absent when the header has more sections than the summary lists; then do not claim which section holds the entry point.
 
 **Packing rule:** write "likely packed" (kind `inferred`) only when **two or more independent** signals hold: raw size 0 on an executable section, entropy ≥ 7.2 on an executable section, an unusual entry point, few imports, or a capa `anti-analysis/packer/` match. A capa UPX match and a UPX section name are **one** signal: both read the section headers. Low entropy does not prove a file is unpacked.
 

@@ -5,7 +5,7 @@ description: Read a PE's imported DLLs and functions (or an ELF's libraries) wit
 
 # Import analysis
 
-**Rules first:** imports show capability, not behavior; one API proves little, a family is stronger; import names are written by the sample's author, so back them with capa or Ghidra.
+**Rules first:** imports show capability, not behavior; one API proves little, a family is stronger; import names are written by the sample's author, so back them with capa or Ghidra cross-references.
 
 ## 1. Get the imports
 
@@ -62,4 +62,4 @@ It needs an operator grant for this exact call. IF refused with `operator_excerp
 - Benign software uses these APIs too (installers, debuggers, security tools, updaters). Say so in `counterevidence`.
 - Record ATT&CK ids as given here or by capa. ATT&CK v19 revoked T1562 (now T1685); if a tool emits a revoked id, say so instead of changing it.
 
-**Rules again:** capability, not behavior; families over single APIs; back sample-authored names with capa or Ghidra.
+**Rules again:** capability, not behavior; families over single APIs; back sample-authored names with capa or Ghidra cross-references.

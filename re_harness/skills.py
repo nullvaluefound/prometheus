@@ -26,7 +26,7 @@ TRIAGE = ("static-triage", "pe-triage", "elf-triage", "string-triage", "capa-yar
 VISIBLE = {
     "intake": TRIAGE + ("static-malware-re",),
     "native": TRIAGE + ("import-analysis", "function-analysis", "static-malware-re", "static-re-native"),
-    "evidence": TRIAGE + ("import-analysis", "static-malware-re", "static-re-evidence"),
+    "evidence": TRIAGE + ("import-analysis", "function-analysis", "static-malware-re", "static-re-evidence"),
     "review": ("recording-evidence", "capa-yara", "import-analysis", "static-re-evidence"),
 }
 # Skills already loaded into the prompt for a role, because a small model may never call load_skill. Pinned skills
@@ -87,8 +87,9 @@ def listing(role):
     rows = [(name, text) for name, text in visible(role) if name not in {skill["name"] for skill in pinned}]
     parts = [f"## Procedure: {skill['name']}\n\n" + untitled(skill["body"]) for skill in pinned]
     if rows:
+        first = " Load `static-triage` first if you have not read it." if "static-triage" in dict(rows) else ""
         parts.append("## Skills you can load\n\nCall `load_skill` with a name to read its procedure when the task "
-                     "calls for it. Load `static-triage` first if you have not read it.\n\n"
+                     "calls for it." + first + "\n\n"
                      + "\n".join(f"- `{name}`: {description}" for name, description in rows))
     return "\n\n".join(parts)
 
