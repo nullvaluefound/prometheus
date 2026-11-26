@@ -14,8 +14,8 @@ from http import HTTPStatus
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from . import (accounts, cli, evidence, forge, grant_requests, investigation, local_model, models, policy, projection,
-               review, runtime, server, tasks)
+from . import (accounts, cli, events, evidence, forge, grant_requests, investigation, local_model, models, policy,
+               projection, review, runtime, server, tasks)
 
 JSON_LIMIT = 64 * 1024
 CHAT_ROWS = 400
@@ -155,6 +155,7 @@ def run_cli(handler, **fields):
 def forge_audit(app, case_id, operator, **event):
     folder = runtime.case_path(app.state, case_id)
     runtime.audit(folder, case=case_id, operator=operator, via="forge", **event)
+    events.bump(f"case:{case_id}")
 
 
 def grant_rows(record):
@@ -238,9 +239,20 @@ def request_error(error):
     return ApiError(HTTPStatus.NOT_FOUND, "unknown_request", "No such request.")
 
 
-def waiting(state, cases):
-    """Everything that waits on an operator, newest first."""
+FAILED_TASK_HOURS = 24
+
+
+def waiting(state, cases, task_rows=()):
+    """Everything that waits on an operator, newest first: grant requests, proposals, proposed and answered
+    questions, and failed tasks from the last day that nobody dismissed."""
     items = []
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=FAILED_TASK_HOURS)).isoformat()
+    shown = {row["id"] for row in cases}
+    for task in task_rows:
+        if (task.get("state") == "failed" and not task.get("dismissed") and (task.get("finished_utc") or "") >= cutoff
+                and (task.get("case") is None or task.get("case") in shown)):
+            items.append({"kind": "task_failed", "case": task.get("case"), "id": task["id"],
+                          "title": task.get("title"), "error": task.get("error"), "utc": task.get("finished_utc")})
     for row in cases:
         if row["status"] == "Closed":
             continue  # a closed case's requests can only be denied; they wait on nobody
@@ -287,6 +299,7 @@ def append_chat(state, case_id, rows):
         history = history[-CHAT_ROWS:]
         accounts.write_private(chat_path(state, case_id),
                                (json.dumps(history, ensure_ascii=True) + "\n").encode("ascii"))
+    events.bump(f"chat:{case_id}")
 
 
 def stamp(row, operator=None):
@@ -343,6 +356,7 @@ class Api:
             ("GET", ("tasks",)): self.task_list,
             ("GET", ("tasks", "{}")): self.task,
             ("POST", ("tasks", "{}", "cancel")): self.cancel_task,
+            ("POST", ("tasks", "{}", "dismiss")): self.dismiss_task,
             ("GET", ("models",)): self.model_list,
             ("POST", ("models",)): self.create_model,
             ("PUT", ("models", "{}")): self.update_model,
@@ -392,7 +406,7 @@ class Api:
             audit += [{**event, "case": row["id"]} for event in forge.recent_audit(folder, 20)]
         audit.sort(key=lambda event: event.get("utc", ""), reverse=True)
         return HTTPStatus.OK, {
-            "cases": cases, "waiting": waiting(self.state, cases),
+            "cases": cases, "waiting": waiting(self.state, cases, self.app.tasks.listing(limit=500)),
             "apprentices": [{"name": name, "verified": ok} for name, ok in forge.baseline_tools(self.state)],
             "tasks": {"queued": sum(t["state"] == "queued" for t in queue), "running": running, "recent": queue[:10]},
             "models": len(models.listing(self.state)), "audit": audit[:20]}
@@ -455,6 +469,9 @@ class Api:
             "settings": public_settings(settings), "ledger": ledger, "grants": grant_rows(record),
             "pending_requests": 0 if runtime.closed(record) else sum(row["state"] == "pending"
                                                                      for row in safe_requests(self.state, case_id)),
+            "waiting": 0 if runtime.closed(record) else sum(
+                item["case"] == case_id for item in waiting(self.state, [{"id": case_id, "status": case_status(record)}],
+                                                            self.app.tasks.listing(case=case_id, limit=100))["items"]),
             "audit": forge.recent_audit(folder, 50)}
 
     def set_paused(self, handler, operator, args, paused):
@@ -471,6 +488,7 @@ class Api:
                     cli.atomic_json(folder / "scope.json", record)
         except runtime.RuntimeFailure as error:
             raise ApiError(HTTPStatus.CONFLICT, "case_busy", "Another operator command holds this case.") from error
+        events.bump(f"case:{case_id}")
         return HTTPStatus.OK, {"status": "Paused" if paused else "Ready"}
 
     def put_settings(self, handler, operator, args, params):
@@ -957,6 +975,7 @@ class Api:
             raise ApiError(HTTPStatus.CONFLICT, "chat_busy", "Wait for the model to finish first.")
         with CHAT_LOCK:
             chat_path(self.state, case_id).unlink(missing_ok=True)
+        events.bump(f"chat:{case_id}")
         forge_audit(self.app, case_id, operator, decision="forge_chat_cleared")
         return HTTPStatus.OK, {"cleared": True}
 
@@ -970,6 +989,15 @@ class Api:
         task = self.app.tasks.get(args[0])
         if not task:
             raise ApiError(HTTPStatus.NOT_FOUND, "unknown_task", "No such task.")
+        return HTTPStatus.OK, task
+
+    def dismiss_task(self, handler, operator, args, params):
+        try:
+            task = self.app.tasks.dismiss(args[0])
+        except KeyError as error:
+            raise ApiError(HTTPStatus.NOT_FOUND, "unknown_task", "No such task.") from error
+        if task is None:
+            raise ApiError(HTTPStatus.CONFLICT, "task_not_failed", "Only failed tasks can be dismissed.")
         return HTTPStatus.OK, task
 
     def cancel_task(self, handler, operator, args, params):

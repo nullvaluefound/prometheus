@@ -6,7 +6,7 @@ import queue
 import threading
 import uuid
 
-from . import accounts, policy, runtime
+from . import accounts, events, policy, runtime
 
 KINDS = ("create_case", "ingest", "tool", "chat", "model_test", "report", "split", "review", "record_finding")
 MAX_RESULT = 2 * 1024 * 1024
@@ -55,6 +55,8 @@ class TaskQueue:
     def save(self, task):
         accounts.write_private(self.folder / f"{task['id']}.json",
                                (json.dumps(task, ensure_ascii=True, allow_nan=False) + "\n").encode("ascii"))
+        events.bump("tasks", "waiting" if task["state"] == "failed" else None,
+                    f"case:{task['case']}" if task.get("case") else None)
 
     def submit(self, kind, case, title, operator, job):
         if kind not in KINDS:
@@ -94,6 +96,18 @@ class TaskQueue:
         with self.lock:
             return any(t["case"] == case and t["kind"] == kind and t["state"] in ("queued", "running")
                        for t in self.tasks.values())
+
+    def dismiss(self, task_id):
+        """Take a failed task off the operator's waiting list."""
+        with self.lock:
+            task = self.tasks.get(task_id)
+            if not task:
+                raise KeyError(task_id)
+            if task["state"] != "failed":
+                return None
+            task["dismissed"] = True
+            self.save(task)
+            return dict(task)
 
     def cancel(self, task_id):
         with self.lock:

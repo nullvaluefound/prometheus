@@ -15,6 +15,7 @@ export function ChatTab({ ctx, draft, setDraft }: { ctx: CaseContext; draft: str
     (signal) => api.chat(id, { signal }),
     `chat:${id}`,
     (data) => (data.busy || activeRef.current ? 2000 : null),
+    [`chat:${id}`],
   );
   const models = useResource((signal) => api.models({ signal }), "models");
   const [pending, setPending] = useState<Task | null>(null);

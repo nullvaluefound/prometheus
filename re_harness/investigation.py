@@ -16,7 +16,7 @@ import os
 import threading
 import time
 
-from . import accounts, evidence, policy
+from . import accounts, events, evidence, policy
 from .case import now
 
 QUESTION_ID = r"Q[0-9]{1,4}"
@@ -199,6 +199,7 @@ def save(state, case_id, data):
     if len(encoded) > MAX_STORE:
         raise InvestigationError("investigation_full")
     accounts.write_private(store_path(state, case_id), encoded)
+    events.bump(f"investigation:{case_id}", "waiting")
 
 
 @contextlib.contextmanager
