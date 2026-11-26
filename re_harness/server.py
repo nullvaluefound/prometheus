@@ -9,6 +9,7 @@ import uuid
 from . import policy, projection, runtime
 
 PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"}
+UNIDENTIFIED = "unidentified-grant"
 
 
 def reject_duplicates(pairs):
@@ -28,14 +29,30 @@ def strict_json(data):
     return json.loads(data, object_pairs_hook=reject_duplicates, parse_constant=reject_constant)
 
 
-def grant_active(record, tool, arguments, audience, now=None):
+def matching_grants(record, tool, arguments, audience, now=None):
+    """IDs of the unexpired grants that cover exactly this call for this audience."""
     now = now or dt.datetime.now(dt.timezone.utc)
+    # A grant without an ID is never active by ID, so text built on its excerpt is never replayed.
+    return [grant["id"] if isinstance(grant.get("id"), str) else UNIDENTIFIED for grant in record["grants"]
+            if grant["tool"] == tool and grant["arguments"] == arguments and
+            now < dt.datetime.fromisoformat(grant["expires_utc"]) and grant.get("audience") == audience]
+
+
+def grant_active(record, tool, arguments, audience, now=None):
+    return bool(matching_grants(record, tool, arguments, audience, now))
+
+
+def active_grant_ids(record, audience, now=None):
+    """IDs of every unexpired grant for this audience."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    ids = set()
     for grant in record["grants"]:
-        expiry = dt.datetime.fromisoformat(grant["expires_utc"])
-        if (grant["tool"] == tool and grant["arguments"] == arguments and now < expiry and
-                grant.get("audience") == audience):
-            return True
-    return False
+        try:
+            if grant.get("audience") == audience and now < dt.datetime.fromisoformat(grant["expires_utc"]):
+                ids.add(grant["id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return ids
 
 
 def call_result(value, error=False):
@@ -52,6 +69,8 @@ class Broker:
         self.calls = 0
         self.allowed_tools = set(policy.TOOLS) if allowed_tools is None else allowed_tools
         self.audience = audience
+        # Grants whose excerpts this session released. Model text written after a release may quote them.
+        self.released_grants = set()
         if runtime.closed(self.bound):
             runtime.audit(self.folder, session=self.session, case=case_id, audience=audience,
                           decision="intercepted", reason="case_closed")
@@ -99,8 +118,11 @@ class Broker:
             scope = self.current_scope()
             if name == "yara_scan" and runtime.yara_rules(scope) != request["rules"]:
                 raise policy.Denied("yara_rules_changed")
-            if include and not grant_active(scope, name, arguments, self.audience):
-                raise policy.Denied("excerpt_grant_expired_or_revoked")
+            if include:
+                covering = matching_grants(scope, name, arguments, self.audience)
+                if not covering:
+                    raise policy.Denied("excerpt_grant_expired_or_revoked")
+                self.released_grants.update(covering)
             # Excerpt-only tools release names in their rows rather than in an evidence_excerpt.
             released = "evidence_excerpt" in reply or (include and name in policy.EXCERPT_ONLY)
             runtime.audit(self.folder, **event, decision="completed", excerpt=released)
