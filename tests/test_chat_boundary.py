@@ -105,9 +105,9 @@ class ChatTurnTests(unittest.TestCase):
         self.assertTrue(system.startswith(role))
         self.assertTrue(system.endswith(boundary.tail(True)))
         self.assertEqual([name for name, _, _ in ScriptedAdapter.last.tools],
-                         ["artifact_summary", "ghidra_decompile", "note_grant_need"])
+                         ["artifact_summary", "ghidra_decompile", "note_grant_need", "load_skill"])
         without = self.run_turn([("Done.", [])], {**self.SETTINGS, "tools": ["artifact_summary"]})
-        self.assertEqual([name for name, _, _ in ScriptedAdapter.last.tools], ["artifact_summary"])
+        self.assertEqual([name for name, _, _ in ScriptedAdapter.last.tools], ["artifact_summary", "load_skill"])
         self.assertEqual(without[-1]["text"], "Done.")
 
     def test_results_are_framed_and_refusals_are_guided(self):
@@ -266,7 +266,8 @@ class AdapterFinalStepTests(unittest.TestCase):
         return sent
 
     def test_ollama_offers_no_tools_on_the_final_step(self):
-        sent = self.capture(models.Ollama, {"message": {"role": "assistant", "content": "ok"}})
+        sent = self.capture(models.Ollama, {"message": {"role": "assistant", "content": "ok"}, "prompt_eval_count": 7,
+                                            "eval_count": 3})
         self.assertIn("tools", sent[0])
         self.assertNotIn("tools", sent[1])
 
@@ -278,6 +279,7 @@ class AdapterFinalStepTests(unittest.TestCase):
     def test_anthropic_forbids_calls_on_the_final_step(self):
         adapter = object.__new__(models.Anthropic)
         adapter.config, adapter.system, adapter.messages = {"model": "claude-haiku-4-5"}, "system", []
+        adapter.usage = {"input": 0, "output": 0}
         adapter.tools = [{"name": "artifact_summary", "description": "Summarize.", "input_schema": {}}]
         requests = []
 
@@ -289,6 +291,7 @@ class AdapterFinalStepTests(unittest.TestCase):
         class Response:
             stop_reason = "end_turn"
             content = []
+            usage = type("Usage", (), {"input_tokens": 120, "output_tokens": 30})()
 
             def to_dict(self):
                 return {"content": []}
@@ -298,6 +301,7 @@ class AdapterFinalStepTests(unittest.TestCase):
         adapter.step(final=True)
         self.assertNotIn("tool_choice", requests[0])
         self.assertEqual(requests[1]["tool_choice"], {"type": "none"})
+        self.assertEqual(models.usage(adapter), {"tokens_in": 240, "tokens_out": 60})
 
 
 class NoteTests(unittest.TestCase):

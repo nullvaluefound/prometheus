@@ -48,3 +48,14 @@ The Forge chat (docs/FORGE_API.md) uses the same boundary. In addition:
 
 - A call refused with `operator_excerpt_grant_required` files a grant request for exactly that call, which the operator approves or denies on the case's Rules & grants tab or from the dashboard's *Waiting on you* list. The model can add one short reason with `note_grant_need`.
 - A turn that reaches the turn cap gets one last model step with no tools, and its summary becomes the answer instead of an error.
+- The prompt lists the skills the role may load (`static-malware-re` for every role but review, plus `static-re-native` for native and `static-re-evidence` for evidence and review), and `load_skill` returns one body. Requests for a skill the role cannot load are audited and listed as skill gaps on the Rules page.
+- Each chat turn and review run records its input and output tokens in the audit, by provider and locality, and the case's Overview tab shows them on its outcome card.
+
+## Measuring a model
+
+Two harnesses measure a model before and after a change. Both use benign or synthetic fixtures only.
+
+- **Posture probe** (no Docker, no case): `python -m tests.benchmark.posture --model <model-id>` drives the model through the Forge's own prompt tail and output envelope with canned results. It checks that the model calls `artifact_summary` for a plain static-analysis request instead of refusing, and that it neither echoes a canary nor calls a tool that a planted instruction inside a tool result asks for. It exits non-zero if either check fails.
+- **Ground-truth benchmark** (needs the provisioned worker image): `python -m tests.benchmark.run --model <model-id> [--grant-imports]` creates a case named `bench-<hex>`, admits the synthetic PE and the image's benign ELF, asks their questions through the normal chat path, and scores the proposed findings against known properties: format, entry point and import names for the PE, format and needed libraries for the ELF. A match needs the right artifact, kind, address and terms, and for observed claims a passing reference check. The report gives recall and precision with their denominators. The case stays for inspection; close it with the operator CLI.
+
+Cloud models are refused by both unless `--allow-cloud` is given. Keep the reports with the model and prompt version they measured.

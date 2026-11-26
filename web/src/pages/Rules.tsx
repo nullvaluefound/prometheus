@@ -1,5 +1,5 @@
 import { ROLES, api, type Policy, type PolicyTool } from "../api";
-import { Empty, ErrorNote, Loading, Panel, RefreshButton } from "../components/ui";
+import { Empty, ErrorNote, Loading, Panel, RefreshButton, Time } from "../components/ui";
 import { fmtBytes, fmtCount, isRecord, list, txt } from "../format";
 import { useDocumentTitle, useResource } from "../hooks";
 import { ToolBadges } from "./case/ToolsTab";
@@ -167,6 +167,60 @@ function PolicyBody({ policy }: { policy: Policy }) {
           </div>
         )}
         <p className="muted small">A case's tool allowlist can narrow its role's tools but never widen them.</p>
+      </Panel>
+
+      <SkillsPanel policy={policy} roleNames={roleNames} />
+    </div>
+  );
+}
+
+function SkillsPanel({ policy, roleNames }: { policy: Policy; roleNames: string[] }) {
+  const skills = isRecord(policy.skills) ? policy.skills : {};
+  const gaps = list<NonNullable<Policy["skill_gaps"]>[number]>(policy.skill_gaps).filter(isRecord);
+  return (
+    <div className="columns">
+      <Panel title="Skills by role">
+        <p className="muted small">
+          A chat model sees each skill's name and description and loads a body with <code>load_skill</code> when it needs the procedure. Skills are
+          git-reviewed files. They never change tools, grants or policy.
+        </p>
+        <ul className="rows">
+          {roleNames.map((role) => (
+            <li key={role}>
+              <span>{role}</span>
+              <span>
+                {list<{ name: string }>(skills[role]).length === 0 ? (
+                  <span className="muted">none</span>
+                ) : (
+                  list<{ name: string }>(skills[role]).map((skill) => (
+                    <code key={txt(skill.name)} className="spaced">
+                      {txt(skill.name)}
+                    </code>
+                  ))
+                )}
+              </span>
+            </li>
+          ))}
+        </ul>
+      </Panel>
+      <Panel title="Skill gaps">
+        {gaps.length === 0 ? (
+          <Empty>No model has asked for a skill it could not load.</Empty>
+        ) : (
+          <>
+            <p className="muted small">Skills models asked for and could not load. The names are model-chosen. Consider writing the procedure they point to.</p>
+            <ul className="rows">
+              {gaps.map((gap) => (
+                <li key={txt(gap.name)}>
+                  <code>{txt(gap.name)}</code>
+                  <span className="muted small">
+                    {fmtCount(gap.count)} asks · {list(gap.roles).map(txt).join(", ")} · <Time utc={gap.last_utc} relative />
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
       </Panel>
     </div>
   );

@@ -183,17 +183,20 @@ def run(state, case_id, config, settings, candidate_id, operator):
                 break
     except Exception:
         runtime.audit(broker.folder, case=case_id, session=broker.session, decision="review_failed",
-                      candidate=candidate_id, reason="review_session_failed", operator=operator, via="forge")
+                      candidate=candidate_id, reason="review_session_failed", operator=operator, via="forge",
+                      provider=config["provider"], cloud=cloud, **models.usage(adapter))
         raise
     if verdict is None:
         runtime.audit(broker.folder, case=case_id, session=broker.session, decision="review_failed",
-                      candidate=candidate_id, reason="no_verdict", operator=operator, via="forge")
+                      candidate=candidate_id, reason="no_verdict", operator=operator, via="forge",
+                      provider=config["provider"], cloud=cloud, **models.usage(adapter))
         raise models.ModelError("The review model did not submit a verdict.")
     record = {**verdict, "model": config["model"], "session": broker.session, "audience": broker.audience,
               "grants": sorted(broker.released_grants | broker.context_grants), "utc": now(), "operator": operator}
     investigation.add_verdict(state, case_id, candidate_id, record)
     runtime.audit(broker.folder, case=case_id, session=broker.session, decision="review_completed",
-                  candidate=candidate_id, verdict=verdict["verdict"], operator=operator, via="forge")
+                  candidate=candidate_id, verdict=verdict["verdict"], operator=operator, via="forge",
+                  provider=config["provider"], cloud=cloud, **models.usage(adapter))
     return record
 
 
