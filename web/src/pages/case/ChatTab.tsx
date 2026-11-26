@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import { api, type ChatMessage, type ModelConfig, type Task } from "../../api";
 import { useToast } from "../../components/toast";
+import { SideQuestion } from "../../components/SideQuestion";
 import { ConfirmButton, DecisionChip, ErrorNote, Loading, Note, Panel, Time } from "../../components/ui";
 import { MAX_CHAT_CHARS, isRecord, list, txt } from "../../format";
 import { errorMessage, isTerminal, useResource, useTask } from "../../hooks";
@@ -170,6 +171,7 @@ export function ChatTab({ ctx, draft, setDraft }: { ctx: CaseContext; draft: str
             </button>
           </div>
         </form>
+        {messages.length > 0 && <SideQuestion caseId={id} source="chat" disabled={blocked || thinking} />}
       </div>
     </Panel>
   );

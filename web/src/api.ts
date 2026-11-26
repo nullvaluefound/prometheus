@@ -296,6 +296,25 @@ export interface Investigation {
   candidates: Candidate[];
   run?: InvestigationRun | null;
   runs?: InvestigationRun[];
+  links?: { case: string; linked_by: string; refreshed_utc: string }[];
+  inherited?: { case: string; finding: string; kind: string; confidence: string; claim: string; artifacts: string[] }[];
+}
+
+export interface Lesson {
+  id: string;
+  state: "proposed" | "adopted" | "retired";
+  cue: string;
+  action: string;
+  evidence: { case: string; candidate: string }[];
+  created_utc: string;
+  created_by: string;
+  adopted: { by: string; utc: string; benchmark: unknown } | null;
+}
+
+export interface LessonsState {
+  mode: "off" | "shadow" | "inject";
+  modes: string[];
+  lessons: Lesson[];
 }
 
 export interface EvidenceRow {
@@ -553,6 +572,13 @@ export const api = {
   revokeGrant: (id: string, grant: string) => del<{ revoked: string }>(`cases/${seg(id)}/grants/${seg(grant)}`),
   investigation: (id: string, opts?: Opts) => get<Investigation>(`cases/${seg(id)}/investigation`, opts),
   outcome: (id: string, opts?: Opts) => get<Outcome>(`cases/${seg(id)}/outcome`, opts),
+  ask: (id: string, question: string, source: "chat" | "investigation") =>
+    post<TaskEnvelope>(`cases/${seg(id)}/ask`, { question, source }),
+  setLinks: (id: string, cases: string[]) => put<TaskEnvelope>(`cases/${seg(id)}/links`, { cases }),
+  lessons: (opts?: Opts) => get<LessonsState>("lessons", opts),
+  setLessonsMode: (mode: string) => put<LessonsState>("lessons", { mode }),
+  extractLessons: () => post<LessonsState>("lessons/extract"),
+  changeLesson: (id: string, action: "adopt" | "retire", body: unknown) => post<Lesson>(`lessons/${seg(id)}/${action}`, body),
   startInvestigation: (id: string, input: { lead_role: string; budgets: { calls: number; tokens: number; minutes: number } }) =>
     post<InvestigationRun>(`cases/${seg(id)}/investigation/start`, input),
   investigationAction: (id: string, action: "pause" | "resume" | "cancel" | "acknowledge" | "message", text?: string) =>

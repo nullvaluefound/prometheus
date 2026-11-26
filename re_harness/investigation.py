@@ -175,7 +175,8 @@ def store_path(state, case_id):
 
 def empty():
     return {"version": 1, "questions": [], "leads": [], "observations": [], "plan": None, "candidates": [],
-            "run": None, "runs": [], "counters": {"Q": 0, "L": 0, "O": 0, "C": 0, "R": 0}}
+            "run": None, "runs": [], "links": [], "inherited": [],
+            "counters": {"Q": 0, "L": 0, "O": 0, "C": 0, "R": 0}}
 
 
 def load(state, case_id):
@@ -436,7 +437,8 @@ def overview(data, offset, limit, active, taint):
     candidates = [{"id": row["id"], "state": row["state"], "kind": row.get("kind"), "artifacts": row.get("artifacts"),
                    "check": (row.get("check") or {}).get("result"), "claim": shown(row, "claim", active, taint)}
                   for row in data["candidates"][-20:]]
-    return {"questions": questions,
+    inherited = [{**row, "inherited": True} for row in (data.get("inherited") or [])[:20]]
+    return {"questions": questions, "inherited_findings": inherited,
             "plan": None if not plan else (shown(plan, "items", active, taint) if readable(plan, active)
                                            else [WITHHELD]),
             "leads": leads, "page": {"offset": offset, "limit": limit, "total": len(data["leads"])},
@@ -607,9 +609,41 @@ def propose_answer(state, case_id, run_id, question_id, candidate_ids, stamp):
     return update(state, case_id, change)
 
 
+MAX_LINKS = 8
+INHERITED_CLAIM = 500
+
+
+def inherited_rows(case_id, ledger):
+    """The current recorded findings of a linked case: operator-recorded ledger text, never bytes or excerpts.
+
+    Each keeps its own case id and SHA-256 values, so nothing is attributed to the case that links it.
+    """
+    findings = ledger.get("findings") if isinstance(ledger.get("findings"), list) else []
+    replaced = {row.get("supersedes") for row in findings if isinstance(row, dict) and row.get("supersedes")}
+    rows = []
+    for row in findings:
+        if not isinstance(row, dict) or row.get("id") in replaced:
+            continue
+        artifacts = [value for value in (row.get("artifacts") or []) if policy.match(value, policy.DIGEST)][:16]
+        rows.append({"case": case_id, "finding": str(row.get("id", ""))[:16], "kind": str(row.get("kind", ""))[:16],
+                     "confidence": str(row.get("confidence", ""))[:8],
+                     "claim": clean(str(row.get("claim", "")))[:INHERITED_CLAIM], "artifacts": artifacts})
+    return rows[:200]
+
+
+def set_links(state, case_id, links, snapshots, operator):
+    """Replace the case's linked prior cases and the snapshot of their recorded findings."""
+    def change(data):
+        data["links"] = [{"case": linked, "linked_by": operator, "refreshed_utc": now()} for linked in links]
+        data["inherited"] = [row for linked in links for row in snapshots.get(linked, [])][:400]
+        return {"links": data["links"], "inherited": len(data["inherited"])}
+    return update(state, case_id, change)
+
+
 def operator_view(data):
     """Everything, for the signed-in operator. Model-written text is marked as such."""
-    return {key: data[key] for key in ("questions", "leads", "observations", "plan", "candidates", "run", "runs")}
+    return {key: data[key] for key in ("questions", "leads", "observations", "plan", "candidates", "run", "runs",
+                                       "links", "inherited")}
 
 
 def gate(data, manifest):

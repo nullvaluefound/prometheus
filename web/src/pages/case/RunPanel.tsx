@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from "react";
 import { api, type Investigation, type InvestigationRun } from "../../api";
 import { useToast } from "../../components/toast";
+import { SideQuestion } from "../../components/SideQuestion";
 import { Badge, ConfirmButton, Note, Panel, Time } from "../../components/ui";
 import { fmtCount, fmtDuration, list, short, txt } from "../../format";
 import { errorMessage } from "../../hooks";
@@ -67,6 +68,7 @@ export function RunPanel({ ctx, data, reload }: { ctx: CaseContext; data: Invest
         </div>
       )}
       {!closed && (!run || TERMINAL.includes(run.state)) && <StartForm ctx={ctx} onStarted={reload} again={run !== null} />}
+      {run && <SideQuestion caseId={ctx.id} source="investigation" disabled={!ctx.detail.settings?.model} />}
     </Panel>
   );
 }

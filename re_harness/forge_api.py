@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import (accounts, cli, events, evidence, forge, grant_requests, investigate, investigation, local_model,
                models, policy,
-               outcome, projection, review, runtime, server, skills, tasks)
+               lessons, outcome, projection, review, runtime, server, skills, tasks)
 
 JSON_LIMIT = 64 * 1024
 CHAT_ROWS = 400
@@ -403,6 +403,8 @@ class Api:
             ("POST", ("cases", "{}", "candidates", "{}", "record")): self.record_candidate,
             ("POST", ("cases", "{}", "candidates", "{}", "reject")): self.reject_candidate,
             ("POST", ("cases", "{}", "investigation", "{}")): self.investigation_action,
+            ("POST", ("cases", "{}", "ask")): self.side_question,
+            ("PUT", ("cases", "{}", "links")): self.set_links,
             ("GET", ("cases", "{}", "chat")): self.chat,
             ("POST", ("cases", "{}", "chat")): self.send_chat,
             ("DELETE", ("cases", "{}", "chat")): self.clear_chat,
@@ -410,6 +412,10 @@ class Api:
             ("GET", ("tasks", "{}")): self.task,
             ("POST", ("tasks", "{}", "cancel")): self.cancel_task,
             ("POST", ("tasks", "{}", "dismiss")): self.dismiss_task,
+            ("GET", ("lessons",)): self.lessons,
+            ("PUT", ("lessons",)): self.set_lessons_mode,
+            ("POST", ("lessons", "extract")): self.extract_lessons,
+            ("POST", ("lessons", "{}", "{}")): self.change_lesson,
             ("GET", ("models",)): self.model_list,
             ("POST", ("models",)): self.create_model,
             ("PUT", ("models", "{}")): self.update_model,
@@ -426,6 +432,8 @@ class Api:
     def variable_positions(parts):
         if not parts:
             return ()
+        if parts[0] == "lessons" and len(parts) == 3:
+            return (1, 2)
         if parts[0] in ("cases", "models", "tasks"):
             if len(parts) >= 2:
                 if parts[0] == "cases" and len(parts) in (4, 5) and parts[2] in COLLECTIONS:
@@ -810,6 +818,57 @@ class Api:
             self.schedule_step(case_id)
         return HTTPStatus.OK, run
 
+    def set_links(self, handler, operator, args, params):
+        """Link prior cases. Their recorded findings, not bytes, appear read-only in case_overview, marked inherited."""
+        case_id = args[0]
+        folder, record = require_case(self.app, case_id)
+        require_open(record)
+        links = self.body(handler).get("cases")
+        if (not isinstance(links, list) or len(links) > investigation.MAX_LINKS or
+                not all(isinstance(item, str) and policy.match(item, policy.CASE_ID) for item in links)):
+            raise bad(f"Link up to {investigation.MAX_LINKS} case IDs.")
+        links = list(dict.fromkeys(links))
+        if case_id in links:
+            raise bad("A case cannot link itself.")
+        records = {}
+        for linked in links:
+            _, linked_record = require_case(self.app, linked)
+            if not linked_record.get("initialized"):
+                raise bad("Link only cases that finished setup.")
+            records[linked] = linked_record
+
+        def job():
+            snapshots = {}
+            for linked, linked_record in records.items():
+                try:
+                    snapshots[linked] = investigation.inherited_rows(linked, forge.case_ledger(linked_record))
+                except forge.BROWSER_ERRORS as error:
+                    raise tasks.TaskError(f"The ledger of {linked} could not be read.") from error
+            result = investigation.set_links(self.state, case_id, links, snapshots, operator)
+            forge_audit(self.app, case_id, operator, decision="investigation_write", operation="cases_linked",
+                        linked=links)
+            return result
+        return HTTPStatus.ACCEPTED, {"task": self.app.tasks.submit("link_cases", case_id, f"Link cases to {case_id}",
+                                                                   operator, job)}
+
+    def side_question(self, handler, operator, args, params):
+        """Ask about the last chat or the investigation. Nothing is written to either; the answer is the task result."""
+        case_id = args[0]
+        require_case(self.app, case_id)
+        body = self.body(handler)
+        question, source = body.get("question"), body.get("source")
+        if source not in ("chat", "investigation"):
+            raise bad("Ask about the chat or the investigation.")
+        if not isinstance(question, str) or not 1 <= len(question.strip()) <= 2000:
+            raise bad("Ask a question of 1-2000 characters.")
+        config, settings = self.case_model(case_id)
+        history = read_chat(self.state, case_id) if source == "chat" else []
+
+        def job():
+            return models.side_question(self.state, case_id, config, settings, source, question, history, operator)
+        return HTTPStatus.ACCEPTED, {"task": self.app.tasks.submit("side_question", case_id,
+                                                                   f"Side question in {case_id}", operator, job)}
+
     def run_write(self, write):
         try:
             return write()
@@ -1139,6 +1198,45 @@ class Api:
         if task is None:
             raise ApiError(HTTPStatus.CONFLICT, "task_started", "Only queued tasks can be cancelled.")
         return HTTPStatus.OK, task
+
+    # -- lessons (Forge-wide; see re_harness/lessons.py) --
+
+    def lessons(self, handler, operator, args, params):
+        return HTTPStatus.OK, lessons.public(lessons.load(self.state))
+
+    def set_lessons_mode(self, handler, operator, args, params):
+        mode = self.body(handler).get("mode")
+        try:
+            lessons.set_mode(self.state, mode)
+        except ValueError as error:
+            raise bad("The mode is off, shadow or inject.") from error
+        return HTTPStatus.OK, lessons.public(lessons.load(self.state))
+
+    def extract_lessons(self, handler, operator, args, params):
+        """Propose lessons from closed cases' reviewed outcomes. Proposed lessons are only ever shadowed."""
+        touched = lessons.extract(self.state, self.visible_ids(), operator)
+        return HTTPStatus.OK, {**lessons.public(lessons.load(self.state)), "touched": touched}
+
+    def change_lesson(self, handler, operator, args, params):
+        lesson_id, action = args
+        if not lessons.valid_id(lesson_id) or action not in ("adopt", "retire"):
+            raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "No such lesson action.")
+        body = self.body(handler)
+        try:
+            if action == "adopt":
+                row = lessons.adopt(self.state, lesson_id, operator, body.get("benchmark"))
+            else:
+                row = lessons.retire(self.state, lesson_id, operator)
+        except KeyError as error:
+            raise ApiError(HTTPStatus.NOT_FOUND, "unknown_lesson", "No such lesson.") from error
+        except ValueError as error:
+            reason = str(error)
+            messages = {"invalid_benchmark": "Give before and after recall and precision, each from 0 to 1.",
+                        "benchmark_regressed": "Benchmarks adopt: the after run lost recall or precision.",
+                        "invalid_transition": "That lesson cannot change that way."}
+            status = HTTPStatus.BAD_REQUEST if reason == "invalid_benchmark" else HTTPStatus.CONFLICT
+            raise ApiError(status, reason, messages.get(reason, "Refused.")) from error
+        return HTTPStatus.OK, row
 
     # -- models --
 

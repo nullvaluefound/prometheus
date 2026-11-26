@@ -213,6 +213,8 @@ interface EvidenceEntry {        // the exact reply the broker released, under i
 - `POST api/cases/{id}/investigation/start` with `{ lead_role?: "native" | "evidence", budgets?: { calls?, tokens?, minutes? } }` starts a run over the usable questions and queues its first step (kind `investigate`). Budgets default to 160 calls, 600000 tokens and 60 active minutes, and must lie within 8-2000, 10000-20000000 and 5-1440. It returns 409 `no_usable_question` without an open question naming an admitted artifact and an outcome, and 409 `investigation_active` while another run is not finished.
 - `POST api/cases/{id}/investigation/{pause | resume | cancel | acknowledge}` with `{}` returns the `InvestigationRun`. `resume` works from paused or waiting and queues a step. `acknowledge` takes an exhausted or failed run off the waiting list. A move the run's state does not allow returns 409 `invalid_transition`.
 - `POST api/cases/{id}/investigation/message` with `{ text }` (1-1000 characters) leaves a message for the next lead run.
+- `POST api/cases/{id}/ask` with `{ question, source: "chat" | "investigation" }` (1-2000 characters) returns `202 {task}` (kind `side_question`). The result is `{ answer, audience, grants }`. The model gets a filtered snapshot and no tools, and nothing is written to the chat or the investigation.
+- `PUT api/cases/{id}/links` with `{ cases: string[] }` (up to 8 other cases) returns `202 {task}` (kind `link_cases`). It snapshots each linked case's current recorded findings into the investigation's `inherited` list, which `case_overview` shows read-only.
 - `GET api/cases/{id}/outcome` returns the case's outcome card: `{ tools: {tool: {decision: count}}, denials: {reason: count}, grants: {requested, issued, approved, denied}, candidates: {total, passed, failed, not_assessed, proposed, recorded, rejected, reviewed}, questions: {state: count}, leads, observations, tokens: {provider, locality, input, output, sessions}[], model_sessions, first_utc, last_utc }`. It is computed from the audit log and the investigation store, metadata only.
 - `GET api/cases/{id}/evidence` returns `{ evidence: {id, tool, artifact, selector, excerpt, audience, utc}[] }`, newest 200. `GET api/cases/{id}/evidence/{sha256}` returns `EvidenceEntry`, or 404 if it is absent or fails its hash check.
 - `POST api/cases/{id}/questions` with `{ text, outcome, artifacts }` adds an open question. Text is 1–500 characters, outcome up to 300, and up to 8 artifacts, each admitted to the case (400 `artifact_not_admitted` otherwise). `PUT api/cases/{id}/questions/{qid}` takes the same body and returns 409 `question_closed` for a closed question.
@@ -234,6 +236,12 @@ interface EvidenceEntry {        // the exact reply the broker released, under i
 - `GET api/tasks/{id}` returns `Task`.
 - `POST api/tasks/{id}/cancel` returns `Task`. Only queued tasks can be cancelled; any other state returns 409. A running `investigate` step is the exception: cancelling it cancels its run, which stops at its next broker call.
 - `POST api/tasks/{id}/dismiss` takes a failed task off the waiting list and returns `Task`. A failed task stays on the list for 24 hours unless dismissed. Any other state returns 409 `task_not_failed`.
+
+### Lessons
+- `GET api/lessons` returns `{ mode: "off" | "shadow" | "inject", modes, lessons: Lesson[] }`, where a `Lesson` is `{ id, state: "proposed" | "adopted" | "retired", cue, action, evidence: {case, candidate}[], created_utc, created_by, adopted }`.
+- `PUT api/lessons` with `{ mode }` sets the Forge-wide mode.
+- `POST api/lessons/extract` proposes lessons from the visible closed cases' reviewed proposals and returns the lessons with `touched` ids.
+- `POST api/lessons/{id}/adopt` with `{ benchmark: { before: {recall, precision}, after: {recall, precision} } }` adopts a proposed lesson. It returns 409 `benchmark_regressed` if the after run lost recall or precision. `POST api/lessons/{id}/retire` with `{}` retires one.
 
 ### Models (plug and play)
 - `GET api/models` returns `{ models: ModelConfig[] }`.
