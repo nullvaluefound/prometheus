@@ -1,2 +1,5 @@
 # Include at http scope, outside server blocks.
-limit_req_zone $binary_remote_addr zone=prometheus_forge:10m rate=240r/m;
+# Sign-in and setup forms: a tight per-address limit against password guessing.
+limit_req_zone $binary_remote_addr zone=prometheus_forge:10m rate=12r/m;
+# The Forge app itself polls while tasks run, so it gets a generous per-address limit.
+limit_req_zone $binary_remote_addr zone=prometheus_forge_app:10m rate=300r/m;

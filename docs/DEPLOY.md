@@ -41,7 +41,7 @@ The base path serves a React app (built into `re_harness/forge_web/` from `web/`
 - **Models:** register model endpoints: Ollama, any OpenAI-compatible server, or Anthropic. API keys are stored mode 0600 under the state directory and never returned to the browser. A case must opt in before a cloud model (Anthropic, a public endpoint, or an Ollama `:cloud` model) may see its projected evidence. Local models use the `local` grant audience; cloud models use `mcp`.
 - **Tasks:** watch the queue. Docker work runs one task at a time in the order submitted.
 
-The app polls while tasks run, so the VPS limit in `deploy/nginx-vps-http.conf.example` allows 240 requests a minute per client with a burst of 120. Upload routes allow 128 MiB bodies on both NGINX layers. Every other route stays at 64 KiB.
+The app polls while tasks run, so the VPS examples give the app a generous per-address limit (300 requests a minute, burst 200). Only the sign-in and setup forms keep the tight limit (12 a minute, burst 6), on top of the Forge's own cap on failed attempts. Upload routes allow 128 MiB bodies on both NGINX layers, sign-in forms 1 KiB, and every other route 64 KiB.
 
 Redeploy with `deploy/prometheus-redeploy.sh`, installed root-owned as `/usr/local/sbin/prometheus-redeploy`. It fast-forwards `/opt/prometheus` to `origin/main`, refreshes the venv, provisions, restarts the service and runs the smoke test.
 
