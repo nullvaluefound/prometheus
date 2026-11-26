@@ -74,6 +74,8 @@ class Broker:
         # Grants that earlier text shown to this session's model drew on, set by the caller after replay.
         self.context_grants = set()
         self.manifest = None
+        # An optional check run before every call; it returns a refusal reason to stop the session cooperatively.
+        self.interrupt = None
         if runtime.closed(self.bound):
             runtime.audit(self.folder, session=self.session, case=case_id, audience=audience,
                           decision="intercepted", reason="case_closed")
@@ -126,6 +128,9 @@ class Broker:
         try:
             if self.calls >= policy.MAX_TOOL_CALLS:
                 raise policy.Denied("session_budget_exhausted")
+            stopped = self.interrupt() if self.interrupt is not None else None
+            if stopped:
+                raise policy.Denied(stopped)
             self.calls += 1
             if not isinstance(params, dict) or set(params) != {"name", "arguments"}:
                 raise policy.Denied("invalid_tool_call")

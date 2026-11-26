@@ -169,7 +169,16 @@ export interface GrantRequest {
 }
 
 export interface WaitingItem {
-  kind: "grant_request" | "candidate" | "question_proposed" | "question_answer_proposed" | "task_failed";
+  kind:
+    | "grant_request"
+    | "candidate"
+    | "question_proposed"
+    | "question_answer_proposed"
+    | "task_failed"
+    | "investigation_waiting"
+    | "investigation_exhausted"
+    | "investigation_failed";
+  need?: string | null;
   case: string | null;
   title?: string;
   error?: string | null;
@@ -256,12 +265,37 @@ export interface Candidate extends Authored {
   note: string | null;
 }
 
+export type RunState = "queued" | "running" | "paused" | "waiting" | "settling" | "answered" | "exhausted" | "failed" | "cancelled";
+
+export interface InvestigationRun {
+  id: string;
+  state: RunState;
+  questions: string[];
+  budgets: { calls: number; tokens: number; minutes: number };
+  spent: { calls: number; tokens: number; active_seconds: number };
+  active_since: number | null;
+  lead_role: "native" | "evidence";
+  message: { text: string; by: string; utc: string } | null;
+  need: ({ text: string; flags: string[] } & Authored) | null;
+  summary: ({ text: string } & Authored) | null;
+  current_lead: string | null;
+  steps: number;
+  history: { from: RunState | null; to: RunState; by: string; utc: string }[];
+  started_by: string;
+  created_utc: string;
+  updated_utc: string;
+  error: string | null;
+  acknowledged?: string;
+}
+
 export interface Investigation {
   questions: Question[];
   leads: Lead[];
   observations: Observation[];
   plan: ({ items: string[] } & Authored) | null;
   candidates: Candidate[];
+  run?: InvestigationRun | null;
+  runs?: InvestigationRun[];
 }
 
 export interface EvidenceRow {
@@ -519,6 +553,10 @@ export const api = {
   revokeGrant: (id: string, grant: string) => del<{ revoked: string }>(`cases/${seg(id)}/grants/${seg(grant)}`),
   investigation: (id: string, opts?: Opts) => get<Investigation>(`cases/${seg(id)}/investigation`, opts),
   outcome: (id: string, opts?: Opts) => get<Outcome>(`cases/${seg(id)}/outcome`, opts),
+  startInvestigation: (id: string, input: { lead_role: string; budgets: { calls: number; tokens: number; minutes: number } }) =>
+    post<InvestigationRun>(`cases/${seg(id)}/investigation/start`, input),
+  investigationAction: (id: string, action: "pause" | "resume" | "cancel" | "acknowledge" | "message", text?: string) =>
+    post<InvestigationRun>(`cases/${seg(id)}/investigation/${action}`, text === undefined ? {} : { text }),
   evidence: (id: string, opts?: Opts) => get<{ evidence: EvidenceRow[] }>(`cases/${seg(id)}/evidence`, opts),
   evidenceEntry: (id: string, evidence: string, opts?: Opts) =>
     get<EvidenceEntry>(`cases/${seg(id)}/evidence/${seg(evidence)}`, opts),

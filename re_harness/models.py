@@ -390,17 +390,33 @@ def replay(adapter, history, scope, audience):
     return inherited
 
 
+class Plan:
+    """How a non-chat session differs from a chat turn: its purpose, tools, prompt and stop check.
+
+    allowed replaces the case's tool allowlist; extra maps a local tool name to (description, schema, handler), where
+    handler(turn, arguments) returns (display_text, is_error, model_text, extra); context adds grants the session's
+    input already draws on; interrupt() returns a reason to stop at the next broker call and wrap up. After the run,
+    metrics holds the session id, broker calls, tokens, audience and grants.
+    """
+
+    def __init__(self, purpose="chat", allowed=None, role_body=None, extra=None, context=(), interrupt=None):
+        self.purpose, self.allowed, self.role_body, self.extra = purpose, allowed, role_body, extra or {}
+        self.context, self.interrupt, self.metrics = set(context), interrupt, {}
+
+
 class Turn:
     """One chat turn's tool handling: broker calls, grant requests filed from denials, and model-facing framing."""
 
-    def __init__(self, state, case_id, broker, role, allowed):
+    def __init__(self, state, case_id, broker, role, allowed, extra=None):
         self.state, self.case_id, self.broker, self.role, self.allowed = state, case_id, broker, role, allowed
+        self.extra = extra or {}
         self.requests = bool(allowed & policy.EXCERPT_ONLY)
         self.skills = bool(skills.visible(role))
         self.seen = set()  # SHA-256 values and addresses this session's tool output named
 
     def names(self):
-        return self.allowed | ({NOTE_TOOL} if self.requests else set()) | ({skills.TOOL} if self.skills else set())
+        return (self.allowed | ({NOTE_TOOL} if self.requests else set()) |
+                ({skills.TOOL} if self.skills else set()) | set(self.extra))
 
     def admitted(self):
         """The case manifest's SHA-256 values, read once per session through a read-only Apprentice."""
@@ -412,6 +428,13 @@ class Turn:
             return self.note(arguments)
         if name == skills.TOOL and self.skills:
             return self.load_skill(arguments)
+        if isinstance(name, str) and name in self.extra:
+            try:
+                self.broker.current_scope()
+                return self.extra[name][2](self, arguments)
+            except policy.Denied as denied:
+                text = json.dumps({"status": "denied", "reason": str(denied)})
+                return text, True, boundary.for_model(text, True, name, self.role), {}
         reply = self.broker.call({"name": name, "arguments": arguments})
         text = reply["content"][0]["text"]
         if not reply["isError"]:
@@ -483,26 +506,32 @@ def denial_reason(text):
     return reply.get("reason") if isinstance(reply, dict) else None
 
 
-def converse(state, case_id, config, settings, history, message, operator):
+def converse(state, case_id, config, settings, history, message, operator, plan=None):
     """Run one user turn through the broker. Returns the display rows to append to the chat.
 
     Each assistant row is stamped with the audience it was written for and every grant whose excerpts it may quote:
-    the grants this turn released plus those of the earlier text it was shown. A turn that reaches MAX_TURNS gets one
-    final model step with no tools, and its summary is saved as the answer.
+    the grants this turn released plus those of the earlier text it was shown. A turn that reaches MAX_TURNS, or whose
+    plan says to stop, gets one final model step with no tools, and its summary is saved as the answer.
     """
+    plan = plan or Plan()
     if not isinstance(message, str) or not 1 <= len(message) <= MAX_PROMPT:
         raise ModelError(f"Send a message of 1-{MAX_PROMPT} characters.")
     cloud = is_cloud(config)
     if cloud and not settings.get("allow_cloud"):
         raise ModelError("This case does not allow cloud models. Enable it on the case Rules tab.")
     role = settings.get("role") if settings.get("role") in local_model.ROLES else "evidence"
-    allowed = set(settings.get("tools") or ()) & local_model.ROLES[role]
+    allowed = set(plan.allowed) if plan.allowed is not None else set(settings.get("tools") or ()) & local_model.ROLES[role]
     broker = server.Broker(state, case_id, allowed, audience="mcp" if cloud else "local")
+    broker.interrupt = plan.interrupt
+    broker.context_grants.update(plan.context)
     scope = broker.current_scope()
-    turn = Turn(state, case_id, broker, role, allowed)
-    system = boundary.system_prompt((runtime.ROOT / "agents" / role / "AGENTS.md").read_text(encoding="utf-8"),
-                                    requests=turn.requests, skills=skills.listing(role))
-    adapter = ADAPTERS[config["provider"]](config, system, tool_specs(allowed, turn.requests, turn.skills))
+    turn = Turn(state, case_id, broker, role, allowed, plan.extra)
+    body = plan.role_body or (runtime.ROOT / "agents" / role / "AGENTS.md").read_text(encoding="utf-8")
+    system = boundary.system_prompt(body, requests=turn.requests, skills=skills.listing(role))
+    # A local tool may wrap a broker tool of the same name, so list each name once.
+    specs = tool_specs(allowed - set(plan.extra), turn.requests, turn.skills) + [
+        (name, text, schema) for name, (text, schema, _) in plan.extra.items()]
+    adapter = ADAPTERS[config["provider"]](config, system, specs)
     inherited = replay(adapter, history, scope, broker.audience)
     broker.context_grants.update(inherited)
     adapter.user(message)
@@ -514,19 +543,28 @@ def converse(state, case_id, config, settings, history, message, operator):
         return [{**row, "audience": broker.audience, "grants": grants} if row["role"] == "assistant" else row
                 for row in found]
 
-    def finish(text, wrapup=False):
+    def measure():
+        plan.metrics.update(session=broker.session, calls=broker.calls, audience=broker.audience,
+                            grants=sorted(inherited | broker.released_grants | broker.context_grants), **usage(adapter))
+
+    def finish(text, wrapup=False, reason="turn_budget_wrapup"):
+        measure()
         runtime.audit(broker.folder, case=case_id, session=broker.session, decision="forge_chat_completed",
                       role=role, operator=operator, via="forge", provider=config["provider"], cloud=cloud,
-                      **usage(adapter), **({"reason": "turn_budget_wrapup"} if wrapup else {}))
+                      purpose=plan.purpose, **usage(adapter), **({"reason": reason} if wrapup else {}))
         row = {"role": "assistant", "text": text, "model": config["model"]}
         rows.append({**row, "wrapup": True} if wrapup else row)
         return stamped(rows)
 
     runtime.audit(broker.folder, case=case_id, session=broker.session, decision="forge_chat_started", role=role,
-                  provider=config["provider"], cloud=cloud, operator=operator, via="forge")
+                  provider=config["provider"], cloud=cloud, operator=operator, via="forge", purpose=plan.purpose)
+    stop = None
     try:
         for _ in range(MAX_TURNS):
             broker.current_scope()
+            stop = plan.interrupt() if plan.interrupt else None
+            if stop:
+                break
             text, calls = adapter.step()
             if not calls:
                 return finish(text or "(no answer)")
@@ -545,16 +583,18 @@ def converse(state, case_id, config, settings, history, message, operator):
                 pairs.append((call, model_text))
                 rows.append(tool_row(call["safe_name"], shown, call["error"], extra.get("request")))
             adapter.results(pairs)
-        # The budget is spent: one last step with no tools. Code dispatches nothing from it.
+        # The budget is spent, or the plan said stop: one last step with no tools. Code dispatches nothing from it.
         broker.current_scope()
         adapter.user(WRAPUP)
         text, _ = adapter.step(final=True)
-        return finish(text or "(The model wrote no wrap-up.)", wrapup=True)
+        return finish(text or "(The model wrote no wrap-up.)", wrapup=True,
+                      reason=stop if stop else "turn_budget_wrapup")
     except Exception:
+        measure()
         try:
             runtime.audit(broker.folder, case=case_id, session=broker.session, decision="forge_chat_failed",
                           role=role, operator=operator, via="forge", reason="forge_chat_session_failed",
-                          provider=config["provider"], cloud=cloud, **usage(adapter))
+                          provider=config["provider"], cloud=cloud, purpose=plan.purpose, **usage(adapter))
         except (OSError, runtime.RuntimeFailure):
             pass
         raise

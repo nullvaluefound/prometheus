@@ -175,7 +175,7 @@ def store_path(state, case_id):
 
 def empty():
     return {"version": 1, "questions": [], "leads": [], "observations": [], "plan": None, "candidates": [],
-            "counters": {"Q": 0, "L": 0, "O": 0, "C": 0}}
+            "run": None, "runs": [], "counters": {"Q": 0, "L": 0, "O": 0, "C": 0, "R": 0}}
 
 
 def load(state, case_id):
@@ -578,9 +578,38 @@ def add_verdict(state, case_id, candidate_id, verdict):
     return update(state, case_id, change)
 
 
+def propose_answer(state, case_id, run_id, question_id, candidate_ids, stamp):
+    """Mark a run question answer_proposed, only with proposals whose check passed and that cite its artifacts.
+
+    The marker is advice to the operator: it records no finding, labels no proposal, and only the operator closes
+    the question.
+    """
+    def change(data):
+        run = data.get("run")
+        if not run or run.get("id") != run_id:
+            raise InvestigationError("unknown_run")
+        if question_id not in run.get("questions", []):
+            raise InvestigationError("question_not_in_run")
+        question = find(data["questions"], question_id, "unknown_question")
+        if question["state"] not in ("open", "answer_proposed"):
+            raise InvestigationError("question_not_open")
+        named = set(question.get("artifacts") or [])
+        for candidate_id in candidate_ids:
+            row = find(data["candidates"], candidate_id, "unknown_candidate")
+            if row.get("state") == "rejected" or (row.get("check") or {}).get("result") != "passed":
+                raise InvestigationError("candidate_check_not_passed")
+            if not named & set(row.get("artifacts") or []):
+                raise InvestigationError("candidate_not_for_question")
+        question["state"] = "answer_proposed"
+        question["answer"] = {"candidates": list(dict.fromkeys(candidate_ids)), "run": run_id, "author": "model",
+                              **stamp, "utc": now()}
+        return dict(question)
+    return update(state, case_id, change)
+
+
 def operator_view(data):
     """Everything, for the signed-in operator. Model-written text is marked as such."""
-    return {key: data[key] for key in ("questions", "leads", "observations", "plan", "candidates")}
+    return {key: data[key] for key in ("questions", "leads", "observations", "plan", "candidates", "run", "runs")}
 
 
 def gate(data, manifest):

@@ -6,6 +6,7 @@ import { Badge, ConfirmButton, Empty, ErrorNote, Loading, Note, Panel, Time } fr
 import { DIGEST, isRecord, list, short, txt } from "../../format";
 import { errorMessage, isTerminal, useResource, useTask } from "../../hooks";
 import type { CaseContext } from "../CaseView";
+import { RunPanel } from "./RunPanel";
 
 const STATE_TONE: Record<string, "ok" | "warn" | "info" | "muted"> = {
   open: "info",
@@ -26,6 +27,7 @@ export function InvestigationTab({ ctx }: { ctx: CaseContext }) {
       {!value && !data.error && <Loading label="Loading the investigation…" />}
       {value && (
         <>
+          <RunPanel ctx={ctx} data={value} reload={data.reload} />
           <QuestionsPanel ctx={ctx} data={value} reload={data.reload} />
           <PlanPanel data={value} />
           <LeadsPanel ctx={ctx} data={value} reload={data.reload} />

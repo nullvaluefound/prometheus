@@ -219,6 +219,20 @@ function WaitingLine({ item, onChange }: { item: WaitingItem; onChange: () => vo
       </>
     );
   }
+  if (item.kind.startsWith("investigation_")) {
+    const label = item.kind === "investigation_waiting" ? "Investigation waiting" : item.kind === "investigation_failed" ? "Investigation failed" : "Investigation exhausted";
+    return (
+      <>
+        <span className={`chip ${item.kind === "investigation_failed" ? "chip-err" : "chip-warn"}`}>{label}</span>
+        <CaseLink id={item.case} href={caseHref(item.case, "investigation")} />
+        <code>{txt(item.id)}</code>
+        {item.need && <span className="muted small">planner: {txt(item.need)}</span>}
+        {item.flagged && <span className="chip chip-warn">need names unverified values</span>}
+        {item.error && <span className="muted small">{txt(item.error)}</span>}
+        <Time utc={item.utc} relative />
+      </>
+    );
+  }
   if (item.kind === "candidate") {
     return (
       <>

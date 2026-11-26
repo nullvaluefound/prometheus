@@ -68,7 +68,8 @@ interface CaseSettings {
 type TaskState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 interface Task {
   id: string;                 // 32 hex
-  kind: "create_case" | "ingest" | "tool" | "chat" | "model_test" | "report" | "split" | "review" | "record_finding";
+  kind: "create_case" | "ingest" | "tool" | "chat" | "model_test" | "report" | "split" | "review" | "record_finding" |
+        "investigate" | "side_question";
   case: string | null;
   title: string;              // human label, e.g. "capa_triage on 3f2a…"
   state: TaskState;
@@ -110,7 +111,9 @@ interface GrantRequest {        // filed by the Forge from a broker denial; only
   note: string | null;         // the operator's note on denial
 }
 interface WaitingItem {
-  kind: "grant_request" | "candidate" | "question_proposed" | "question_answer_proposed" | "task_failed";
+  kind: "grant_request" | "candidate" | "question_proposed" | "question_answer_proposed" | "task_failed" |
+        "investigation_waiting" | "investigation_exhausted" | "investigation_failed";
+  need?: string | null;                                                            // waiting runs; untrusted
   case: string | null; id: string; utc: string;
   title?: string; error?: string | null;                                           // failed tasks
   tool?: string; artifact?: string; audience?: "local" | "mcp"; flagged?: boolean;  // grant requests
@@ -139,8 +142,23 @@ interface Candidate {
               utc: string; operator: string }[];
   finding: string | null; decided_by: string | null; decided_utc: string | null; note: string | null;
 }
+interface InvestigationRun {
+  id: string;                  // R1, R2, ...
+  state: "queued" | "running" | "paused" | "waiting" | "settling" | "answered" | "exhausted" | "failed" | "cancelled";
+  questions: string[];         // the questions it pursues, fixed at start
+  budgets: { calls: number; tokens: number; minutes: number };
+  spent: { calls: number; tokens: number; active_seconds: number }; active_since: number | null;
+  lead_role: "native" | "evidence";
+  message: { text: string; by: string; utc: string } | null;  // for the next lead run
+  need: { text: string; flags: string[]; author?: "model" } | null;  // why it waits on the operator; untrusted
+  summary: { text: string } | null;  // the settle summary; untrusted model text
+  current_lead: string | null; steps: number;
+  history: { from: string | null; to: string; by: string; utc: string }[];
+  started_by: string; created_utc: string; updated_utc: string; error: string | null; acknowledged?: string;
+}
 interface Investigation { questions: Question[]; leads: Lead[]; observations: Observation[];
-                          plan: { items: string[] } | null; candidates: Candidate[]; }
+                          plan: { items: string[] } | null; candidates: Candidate[];
+                          run: InvestigationRun | null; runs: InvestigationRun[]; }
 interface EvidenceEntry {        // the exact reply the broker released, under its content SHA-256
   id: string; tool: string; arguments: Record<string, string | number>; excerpt: boolean;
   audience: "local" | "mcp"; grants: string[]; ticket: string; session: string; utc: string; reply: unknown;
@@ -192,6 +210,9 @@ interface EvidenceEntry {        // the exact reply the broker released, under i
 
 ### Investigation, evidence and proposed findings
 - `GET api/cases/{id}/investigation` returns `Investigation`: everything, for the operator.
+- `POST api/cases/{id}/investigation/start` with `{ lead_role?: "native" | "evidence", budgets?: { calls?, tokens?, minutes? } }` starts a run over the usable questions and queues its first step (kind `investigate`). Budgets default to 160 calls, 600000 tokens and 60 active minutes, and must lie within 8-2000, 10000-20000000 and 5-1440. It returns 409 `no_usable_question` without an open question naming an admitted artifact and an outcome, and 409 `investigation_active` while another run is not finished.
+- `POST api/cases/{id}/investigation/{pause | resume | cancel | acknowledge}` with `{}` returns the `InvestigationRun`. `resume` works from paused or waiting and queues a step. `acknowledge` takes an exhausted or failed run off the waiting list. A move the run's state does not allow returns 409 `invalid_transition`.
+- `POST api/cases/{id}/investigation/message` with `{ text }` (1-1000 characters) leaves a message for the next lead run.
 - `GET api/cases/{id}/outcome` returns the case's outcome card: `{ tools: {tool: {decision: count}}, denials: {reason: count}, grants: {requested, issued, approved, denied}, candidates: {total, passed, failed, not_assessed, proposed, recorded, rejected, reviewed}, questions: {state: count}, leads, observations, tokens: {provider, locality, input, output, sessions}[], model_sessions, first_utc, last_utc }`. It is computed from the audit log and the investigation store, metadata only.
 - `GET api/cases/{id}/evidence` returns `{ evidence: {id, tool, artifact, selector, excerpt, audience, utc}[] }`, newest 200. `GET api/cases/{id}/evidence/{sha256}` returns `EvidenceEntry`, or 404 if it is absent or fails its hash check.
 - `POST api/cases/{id}/questions` with `{ text, outcome, artifacts }` adds an open question. Text is 1–500 characters, outcome up to 300, and up to 8 artifacts, each admitted to the case (400 `artifact_not_admitted` otherwise). `PUT api/cases/{id}/questions/{qid}` takes the same body and returns 409 `question_closed` for a closed question.
@@ -211,7 +232,7 @@ interface EvidenceEntry {        // the exact reply the broker released, under i
 ### Tasks
 - `GET api/tasks?case=<id>` returns `{ tasks: Task[] }`, newest first, at most 100.
 - `GET api/tasks/{id}` returns `Task`.
-- `POST api/tasks/{id}/cancel` returns `Task`. Only queued tasks can be cancelled; any other state returns 409.
+- `POST api/tasks/{id}/cancel` returns `Task`. Only queued tasks can be cancelled; any other state returns 409. A running `investigate` step is the exception: cancelling it cancels its run, which stops at its next broker call.
 - `POST api/tasks/{id}/dismiss` takes a failed task off the waiting list and returns `Task`. A failed task stays on the list for 24 hours unless dismissed. Any other state returns 409 `task_not_failed`.
 
 ### Models (plug and play)
