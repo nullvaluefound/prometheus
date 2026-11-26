@@ -360,6 +360,11 @@ td code { overflow-wrap: anywhere; }
 .evidence-link { margin-left: .3rem; }
 .check-problems { margin: 0; color: var(--err); }
 .stats-compact .stat-value { font-size: 1.5rem; }
+.composer-inline { display: flex; flex-wrap: wrap; align-items: end; gap: .5rem; }
+.composer-inline .field { flex: 1 1 18rem; }
+.side-question { border-top: 1px solid var(--line); padding-top: .5rem; }
+.side-question > summary { cursor: pointer; }
+.request-actions input[type="number"][step] { width: 6rem; }
 .msg-thinking { display: inline-flex; align-items: center; gap: .6rem; color: var(--muted); font-style: italic; }
 .dots { display: inline-flex; gap: .2rem; }
 .dots span { width: .38rem; height: .38rem; border-radius: 50%; background: var(--forge); animation: pulse 1.2s ease-in-out infinite; }

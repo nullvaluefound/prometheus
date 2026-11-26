@@ -14,14 +14,16 @@ from http import HTTPStatus
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from . import (accounts, cli, events, evidence, forge, grant_requests, investigation, local_model, models, policy,
-               outcome, projection, review, runtime, server, skills, tasks)
+from . import (accounts, cli, events, evidence, forge, grant_requests, investigate, investigation, local_model,
+               models, policy,
+               lessons, outcome, projection, review, runtime, server, skills, tasks)
 
 JSON_LIMIT = 64 * 1024
 CHAT_ROWS = 400
 ROLES = tuple(local_model.ROLES)
 SETTINGS_LOCK = threading.Lock()
 CHAT_LOCK = threading.Lock()
+SCHEDULE_LOCK = threading.Lock()  # one step chain per case: the busy check and the submit happen together
 DECIDE_LOCK = threading.Lock()  # one grant per request, even when two operators approve at once
 
 
@@ -204,7 +206,7 @@ def tool_arguments(tool, body):
 
 # ---- Grant requests and the attention queue ---------------------------------------------------------------
 
-COLLECTIONS = ("tools", "grants", "requests", "questions", "candidates", "evidence", "leads")
+COLLECTIONS = ("tools", "grants", "requests", "questions", "candidates", "evidence", "leads", "investigation")
 STATE_MESSAGES = {
     "question_closed": "That question is closed. Reopen it first.",
     "invalid_transition": "That question cannot move to that state from where it is.",
@@ -286,6 +288,14 @@ def waiting(state, cases, task_rows=()):
             if question.get("state") in ("proposed", "answer_proposed"):
                 items.append({"kind": "question_" + question["state"], "case": row["id"], "id": question["id"],
                               "utc": question.get("created_utc")})
+        run = data.get("run")
+        if run and (run.get("state") == "waiting" or
+                    (run.get("state") in ("exhausted", "failed") and not run.get("acknowledged"))):
+            need = run.get("need") if isinstance(run.get("need"), dict) else {}
+            items.append({"kind": "investigation_" + run["state"], "case": row["id"], "id": run["id"],
+                          "need": need.get("text") if run["state"] == "waiting" else None,
+                          "flagged": bool(need.get("flags")), "error": run.get("error"),
+                          "utc": run.get("updated_utc")})
     items.sort(key=lambda item: item.get("utc") or "", reverse=True)
     return {"count": len(items), "items": items[:50]}
 
@@ -323,6 +333,44 @@ class Api:
     def __init__(self, app):
         self.app = app
         self.state = app.state
+        # A restart leaves every live investigation paused for the operator; the heartbeat re-queues running ones.
+        investigate.recover(self.state, case_ids(self.state))
+        self.supervisor = investigate.Supervisor(self.state, self.schedule_step, self.visible_ids).start()
+
+    def visible_ids(self):
+        return [case for case in case_ids(self.state) if not self.app.visible or case in self.app.visible]
+
+    def schedule_step(self, case_id, chained=False):
+        """Queue the next step of a case's run, unless one is already queued. Each step re-reads the case model.
+
+        chained is set only by a step that is finishing, so its own task does not count as busy.
+        """
+        with SCHEDULE_LOCK:
+            if not chained and self.app.tasks.busy(case_id, "investigate"):
+                return None
+            run = investigate.current(self.state, case_id)
+            if not run or run["state"] not in ("queued", *investigate.ACTIVE):
+                return None
+            return self.submit_step(case_id, run)
+
+    def submit_step(self, case_id, run):
+        operator = run.get("started_by") or "forge"
+
+        def job():
+            try:
+                config, settings = self.case_model(case_id)
+            except ApiError as error:
+                latest = investigate.current(self.state, case_id)
+                if latest and latest["state"] in ("queued", *investigate.ACTIVE):
+                    investigate.transition(self.state, case_id, latest["id"], "failed", "forge",
+                                           change=lambda value, _: value.update(error=error.message))
+                raise tasks.TaskError(error.message) from error
+            result = investigate.step(self.state, case_id, config, settings, operator)
+            # Chain to whatever run is current, so a run started while this step worked does not wait a heartbeat.
+            self.schedule_step(case_id, chained=True)
+            return result
+        return self.app.tasks.submit("investigate", case_id, f"Investigation {run['id']} step in {case_id}", operator,
+                                     job)
 
     def dispatch(self, handler, method, path, operator):
         """path is the request path after '<prefix>api/'. Returns (status, body)."""
@@ -362,6 +410,9 @@ class Api:
             ("POST", ("cases", "{}", "candidates", "{}", "review")): self.review_candidate,
             ("POST", ("cases", "{}", "candidates", "{}", "record")): self.record_candidate,
             ("POST", ("cases", "{}", "candidates", "{}", "reject")): self.reject_candidate,
+            ("POST", ("cases", "{}", "investigation", "{}")): self.investigation_action,
+            ("POST", ("cases", "{}", "ask")): self.side_question,
+            ("PUT", ("cases", "{}", "links")): self.set_links,
             ("GET", ("cases", "{}", "chat")): self.chat,
             ("POST", ("cases", "{}", "chat")): self.send_chat,
             ("DELETE", ("cases", "{}", "chat")): self.clear_chat,
@@ -369,6 +420,10 @@ class Api:
             ("GET", ("tasks", "{}")): self.task,
             ("POST", ("tasks", "{}", "cancel")): self.cancel_task,
             ("POST", ("tasks", "{}", "dismiss")): self.dismiss_task,
+            ("GET", ("lessons",)): self.lessons,
+            ("PUT", ("lessons",)): self.set_lessons_mode,
+            ("POST", ("lessons", "extract")): self.extract_lessons,
+            ("POST", ("lessons", "{}", "{}")): self.change_lesson,
             ("GET", ("models",)): self.model_list,
             ("POST", ("models",)): self.create_model,
             ("PUT", ("models", "{}")): self.update_model,
@@ -385,6 +440,8 @@ class Api:
     def variable_positions(parts):
         if not parts:
             return ()
+        if parts[0] == "lessons" and len(parts) == 3:
+            return (1, 2)
         if parts[0] in ("cases", "models", "tasks"):
             if len(parts) >= 2:
                 if parts[0] == "cases" and len(parts) in (4, 5) and parts[2] in COLLECTIONS:
@@ -737,6 +794,106 @@ class Api:
         require_case(self.app, args[0])
         return HTTPStatus.OK, investigation.operator_view(load_investigation(self.state, args[0]))
 
+    def investigation_action(self, handler, operator, args, params):
+        """start, pause, resume, cancel, acknowledge or message the case's investigation run."""
+        case_id, action = args
+        folder, record = require_case(self.app, case_id)
+        body = self.body(handler)
+        if action not in ("start", "pause", "resume", "cancel", "acknowledge", "message"):
+            raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "No such investigation action.")
+        if action in ("start", "resume", "message"):
+            require_open(record)
+            if record["paused"]:
+                raise ApiError(HTTPStatus.CONFLICT, "case_paused", "Resume the case first.")
+        if action == "start":
+            self.case_model(case_id)
+            budgets, role = body.get("budgets"), body.get("lead_role", "evidence")
+            if budgets is not None and not isinstance(budgets, dict):
+                raise bad("Send budgets as an object of calls, tokens and minutes.")
+            try:
+                manifest = forge.case_ledger(record)["artifacts"]
+            except forge.BROWSER_ERRORS as error:
+                raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "ledger_unavailable",
+                               "The case ledger could not be read to check the questions.") from error
+            run = self.run_write(lambda: investigate.start(self.state, case_id, operator, manifest, budgets, role))
+            self.schedule_step(case_id)
+            return HTTPStatus.OK, run
+        text = body.get("text") if action == "message" else None
+        if action == "message" and (not isinstance(text, str) or not 1 <= len(text.strip()) <= 1000):
+            raise bad("Write a message of 1-1000 characters for the next lead.")
+        run = self.run_write(lambda: investigate.operator_action(self.state, case_id, action, operator, text))
+        if action == "resume":
+            self.schedule_step(case_id)
+        return HTTPStatus.OK, run
+
+    def set_links(self, handler, operator, args, params):
+        """Link prior cases. Their recorded findings, not bytes, appear read-only in case_overview, marked inherited."""
+        case_id = args[0]
+        folder, record = require_case(self.app, case_id)
+        require_open(record)
+        links = self.body(handler).get("cases")
+        if (not isinstance(links, list) or len(links) > investigation.MAX_LINKS or
+                not all(isinstance(item, str) and policy.match(item, policy.CASE_ID) for item in links)):
+            raise bad(f"Link up to {investigation.MAX_LINKS} case IDs.")
+        links = list(dict.fromkeys(links))
+        if case_id in links:
+            raise bad("A case cannot link itself.")
+        records = {}
+        for linked in links:
+            _, linked_record = require_case(self.app, linked)
+            if not linked_record.get("initialized"):
+                raise bad("Link only cases that finished setup.")
+            records[linked] = linked_record
+
+        def job():
+            snapshots = {}
+            for linked, linked_record in records.items():
+                try:
+                    snapshots[linked] = investigation.inherited_rows(linked, forge.case_ledger(linked_record))
+                except forge.BROWSER_ERRORS as error:
+                    raise tasks.TaskError(f"The ledger of {linked} could not be read.") from error
+            result = investigation.set_links(self.state, case_id, links, snapshots, operator)
+            forge_audit(self.app, case_id, operator, decision="investigation_write", operation="cases_linked",
+                        linked=links)
+            return result
+        return HTTPStatus.ACCEPTED, {"task": self.app.tasks.submit("link_cases", case_id, f"Link cases to {case_id}",
+                                                                   operator, job)}
+
+    def side_question(self, handler, operator, args, params):
+        """Ask about the last chat or the investigation. Nothing is written to either; the answer is the task result."""
+        case_id = args[0]
+        require_case(self.app, case_id)
+        body = self.body(handler)
+        question, source = body.get("question"), body.get("source")
+        if source not in ("chat", "investigation"):
+            raise bad("Ask about the chat or the investigation.")
+        if not isinstance(question, str) or not 1 <= len(question.strip()) <= 2000:
+            raise bad("Ask a question of 1-2000 characters.")
+        config, settings = self.case_model(case_id)
+        history = read_chat(self.state, case_id) if source == "chat" else []
+
+        def job():
+            return models.side_question(self.state, case_id, config, settings, source, question, history, operator)
+        return HTTPStatus.ACCEPTED, {"task": self.app.tasks.submit("side_question", case_id,
+                                                                   f"Side question in {case_id}", operator, job)}
+
+    def run_write(self, write):
+        try:
+            return write()
+        except investigation.InvestigationError as error:
+            reason = str(error)
+            messages = {"investigation_active": "An investigation is already running for this case.",
+                        "no_usable_question": "Add an open question that names an admitted artifact and a checkable "
+                                              "outcome first.",
+                        "invalid_transition": "The investigation cannot do that from its current state.",
+                        "unknown_run": "This case has no investigation run.",
+                        "invalid_budget": "Budgets: calls 8-2000, tokens 10000-20000000, minutes 5-1440.",
+                        "invalid_role": "The lead role must be native or evidence."}
+            status = (HTTPStatus.NOT_FOUND if reason == "unknown_run" else
+                      HTTPStatus.BAD_REQUEST if reason in ("invalid_budget", "invalid_role") else
+                      HTTPStatus.SERVICE_UNAVAILABLE if reason in UNAVAILABLE else HTTPStatus.CONFLICT)
+            raise ApiError(status, reason, messages.get(reason, "The investigation refused that change.")) from error
+
     def outcome(self, handler, operator, args, params):
         folder, _ = require_case(self.app, args[0])
         return HTTPStatus.OK, outcome.for_case(self.state, args[0], folder)
@@ -802,9 +959,16 @@ class Api:
             raise bad("Set the question to open, closed or withdrawn.")
         if note is not None and (not isinstance(note, str) or len(note) > 300):
             raise bad("Keep the note to 300 characters.")
-        return HTTPStatus.OK, self.state_write(case_id, operator, "question_" + target, lambda: (
+        row = self.state_write(case_id, operator, "question_" + target, lambda: (
             investigation.set_question_state(self.state, case_id, question_id, target, operator,
                                              investigation.clean(note) if note else None)), question=question_id)
+        if target in ("closed", "withdrawn"):
+            # Only the operator closes questions; closing the last one answers the run.
+            try:
+                investigate.check_answered(self.state, case_id, operator)
+            except investigation.InvestigationError:
+                pass
+        return HTTPStatus.OK, row
 
     def split_question(self, handler, operator, args, params):
         case_id, question_id = args
@@ -1030,6 +1194,16 @@ class Api:
         return HTTPStatus.OK, task
 
     def cancel_task(self, handler, operator, args, params):
+        current = self.app.tasks.get(args[0])
+        if current and current["kind"] == "investigate" and current["state"] == "running" and current["case"]:
+            # A running step stops cooperatively: cancelling its run makes the next broker call refuse.
+            self.run_write(lambda: investigate.operator_action(self.state, current["case"], "cancel", operator))
+            return HTTPStatus.OK, self.app.tasks.get(args[0])
+        if current and current["kind"] == "investigate" and current["state"] == "queued" and current["case"]:
+            # Dropping a queued step pauses its run, so the heartbeat does not queue the next one.
+            run = investigate.current(self.state, current["case"])
+            if run and run["state"] in ("queued", *investigate.ACTIVE):
+                self.run_write(lambda: investigate.operator_action(self.state, current["case"], "pause", operator))
         try:
             task = self.app.tasks.cancel(args[0])
         except KeyError as error:
@@ -1037,6 +1211,45 @@ class Api:
         if task is None:
             raise ApiError(HTTPStatus.CONFLICT, "task_started", "Only queued tasks can be cancelled.")
         return HTTPStatus.OK, task
+
+    # -- lessons (Forge-wide; see re_harness/lessons.py) --
+
+    def lessons(self, handler, operator, args, params):
+        return HTTPStatus.OK, lessons.public(lessons.load(self.state))
+
+    def set_lessons_mode(self, handler, operator, args, params):
+        mode = self.body(handler).get("mode")
+        try:
+            lessons.set_mode(self.state, mode)
+        except ValueError as error:
+            raise bad("The mode is off, shadow or inject.") from error
+        return HTTPStatus.OK, lessons.public(lessons.load(self.state))
+
+    def extract_lessons(self, handler, operator, args, params):
+        """Propose lessons from closed cases' reviewed outcomes. Proposed lessons are only ever shadowed."""
+        touched = lessons.extract(self.state, self.visible_ids(), operator)
+        return HTTPStatus.OK, {**lessons.public(lessons.load(self.state)), "touched": touched}
+
+    def change_lesson(self, handler, operator, args, params):
+        lesson_id, action = args
+        if not lessons.valid_id(lesson_id) or action not in ("adopt", "retire"):
+            raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "No such lesson action.")
+        body = self.body(handler)
+        try:
+            if action == "adopt":
+                row = lessons.adopt(self.state, lesson_id, operator, body.get("benchmark"))
+            else:
+                row = lessons.retire(self.state, lesson_id, operator)
+        except KeyError as error:
+            raise ApiError(HTTPStatus.NOT_FOUND, "unknown_lesson", "No such lesson.") from error
+        except ValueError as error:
+            reason = str(error)
+            messages = {"invalid_benchmark": "Give before and after recall and precision, each from 0 to 1.",
+                        "benchmark_regressed": "Benchmarks adopt: the after run lost recall or precision.",
+                        "invalid_transition": "That lesson cannot change that way."}
+            status = HTTPStatus.BAD_REQUEST if reason == "invalid_benchmark" else HTTPStatus.CONFLICT
+            raise ApiError(status, reason, messages.get(reason, "Refused.")) from error
+        return HTTPStatus.OK, row
 
     # -- models --
 

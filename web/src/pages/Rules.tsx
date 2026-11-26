@@ -3,6 +3,7 @@ import { Empty, ErrorNote, Loading, Panel, RefreshButton, Time } from "../compon
 import { fmtBytes, fmtCount, isRecord, list, txt } from "../format";
 import { useDocumentTitle, useResource } from "../hooks";
 import { ToolBadges } from "./case/ToolsTab";
+import { LessonsPanel } from "./LessonsPanel";
 
 export function RulesPage() {
   useDocumentTitle("Rules");
@@ -170,6 +171,7 @@ function PolicyBody({ policy }: { policy: Policy }) {
       </Panel>
 
       <SkillsPanel policy={policy} roleNames={roleNames} />
+      <LessonsPanel />
     </div>
   );
 }

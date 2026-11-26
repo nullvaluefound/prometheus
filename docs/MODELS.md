@@ -59,3 +59,7 @@ Two harnesses measure a model before and after a change. Both use benign or synt
 - **Ground-truth benchmark** (needs the provisioned worker image): `python -m tests.benchmark.run --model <model-id> [--grant-imports]` creates a case named `bench-<hex>`, admits the synthetic PE and the image's benign ELF, asks their questions through the normal chat path, and scores the proposed findings against known properties: format, entry point and import names for the PE, format and needed libraries for the ELF. A match needs the right artifact, kind, address and terms, and for observed claims a passing reference check. The report gives recall and precision with their denominators. The case stays for inspection; close it with the operator CLI.
 
 Cloud models are refused by both unless `--allow-cloud` is given. Keep the reports with the model and prompt version they measured.
+
+### Lessons and benchmarks
+
+The Rules page extracts lessons from closed cases. Run the benchmark once with lessons `off` and once with `inject` and only the candidate lesson adopted, then record both runs' recall and precision when adopting it. The Forge refuses an adoption whose after run lost either. Use `shadow` first to see which sessions a lesson would reach.
